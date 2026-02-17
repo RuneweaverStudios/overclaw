@@ -1,0 +1,7 @@
+{
+  "name": "Chat History Analyzer",
+  "author": "OpenClaw",
+  "version": "1.0.0",
+  "description": "Extracts and analyzes Cursor IDE chat history to identify key discoveries, obstacles, and solutions.",
+  "main": "scripts/chat_history_analyzer.py"
+}
