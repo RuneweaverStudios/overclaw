@@ -32,7 +32,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-WORKSPACE = Path(os.environ.get("OVERCLAW_WORKSPACE", "/Users/ghost/.openclaw/workspace"))
+_SCRIPT_DIR = Path(__file__).resolve().parent
+WORKSPACE = Path(os.environ.get("OVERCLAW_WORKSPACE", str(_SCRIPT_DIR.parent)))
 SKILLS_DIR = WORKSPACE / "skills"
 OVERSTORY_BIN = os.environ.get("OVERSTORY_BIN", os.path.expanduser("~/.bun/bin/overstory"))
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
@@ -255,7 +256,11 @@ async def agents_list(request: Request) -> JSONResponse:
 async def agents_spawn(request: Request) -> JSONResponse:
     """POST /api/agents/spawn — spawn a new overstory agent.
     
-    {"task": "...", "capability": "builder", "name": "optional"}
+    {"task": "...", "capability": "builder", "name": "optional", "force": false}
+
+    overstory hierarchy: coordinator -> lead -> workers (builder/scout/reviewer).
+    Use capability="lead" for top-level spawns, or force=true to bypass.
+    A task-id is auto-generated (overstory requires one for Beads tracking).
     """
     body = await request.json()
     task = body.get("task", "")
@@ -270,16 +275,22 @@ async def agents_spawn(request: Request) -> JSONResponse:
         capability = cap_info["capability"]
 
     name = body.get("name", f"{capability}-{uuid.uuid4().hex[:6]}")
+    task_id = body.get("task_id", f"oc-{uuid.uuid4().hex[:8]}")
 
-    result = await _overstory_run([
-        "sling",
+    args = [
+        "sling", task_id,
         "--capability", capability,
         "--name", name,
-        "--description", task,
-    ], timeout=120)
+    ]
+    if body.get("parent"):
+        args.extend(["--parent", body["parent"]])
+    if body.get("force", False):
+        args.append("--force-hierarchy")
 
+    result = await _overstory_run(args, timeout=120)
     result["agent_name"] = name
     result["capability"] = capability
+    result["task_id"] = task_id
     return JSONResponse(result)
 
 

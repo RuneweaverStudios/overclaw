@@ -36,19 +36,40 @@ User Request
 git clone https://github.com/RuneweaverStudios/overclaw.git
 cd overclaw
 
-# 2. Install dependencies
-brew install ollama tmux
-curl -fsSL https://bun.sh/install | bash
-pip install nanobot-ai  # or: python3 -m venv ~/.nanobot-venv && pip install nanobot-ai
+# 2. Install everything (Ollama, Mistral, tmux, bun, Claude Code CLI,
+#    Python venv, nanobot, overstory, Playwright browsers)
+./scripts/install.sh
 
-# Install overstory
-bun install -g overstory
+# 3. Check what's installed
+./scripts/install.sh --check
 
-# 3. Start everything
+# 4. Start the stack
 ./scripts/start-overclaw.sh
 
-# 4. Check status
+# 5. Verify
 ./scripts/start-overclaw.sh status
+curl http://localhost:18800/health
+```
+
+The install script is idempotent (safe to run multiple times). It detects what's already installed and only adds what's missing.
+
+### Manual Install
+
+If you prefer to install components individually:
+
+```bash
+brew install ollama tmux                      # System deps
+curl -fsSL https://bun.sh/install | bash      # bun runtime
+npm install -g @anthropic-ai/claude-code      # Claude Code CLI
+
+python3 -m venv ~/.overclaw-venv              # Python venv
+source ~/.overclaw-venv/bin/activate
+pip install nanobot-ai starlette uvicorn httpx playwright
+python3 -m playwright install chromium        # Browser for Playwright
+
+bun install -g overstory                      # Agent swarm
+
+ollama pull mistral                           # Orchestrator model
 ```
 
 ## Port Map

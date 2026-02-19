@@ -14,10 +14,16 @@
 
 set -euo pipefail
 
-WORKSPACE="/Users/ghost/.openclaw/workspace"
-NANOBOT_VENV="/Users/ghost/.nanobot-venv"
-OVERSTORY_BIN="$HOME/.bun/bin/overstory"
-OLLAMA_BIN="/opt/homebrew/bin/ollama"
+# Resolve paths relative to this script (portable — works on any machine)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WORKSPACE="$(cd "$SCRIPT_DIR/.." && pwd)"
+NANOBOT_VENV="${NANOBOT_VENV:-$HOME/.nanobot-venv}"
+# Also check overclaw-venv (from install.sh)
+if [ ! -d "$NANOBOT_VENV" ] && [ -d "$HOME/.overclaw-venv" ]; then
+    NANOBOT_VENV="$HOME/.overclaw-venv"
+fi
+OVERSTORY_BIN="${OVERSTORY_BIN:-$(command -v overstory 2>/dev/null || echo "$HOME/.bun/bin/overstory")}"
+OLLAMA_BIN="${OLLAMA_BIN:-$(command -v ollama 2>/dev/null || echo "/opt/homebrew/bin/ollama")}"
 LOG_DIR="$WORKSPACE/.overstory/logs"
 GATEWAY_SCRIPT="$WORKSPACE/scripts/overclaw_gateway.py"
 
@@ -49,7 +55,7 @@ check_status() {
     # Ollama
     if pgrep -x "ollama" > /dev/null 2>&1; then
         ok "Ollama: running"
-        if "$OLLAMA_BIN" list 2>/dev/null | grep -q "mistral"; then
+        if "$OLLAMA_BIN" list 2>/dev/null | grep -iq "mistral" || curl -sf http://localhost:11434/api/tags 2>/dev/null | grep -q "mistral"; then
             ok "  Mistral model: available"
         else
             warn "  Mistral model: not pulled (run: ollama pull mistral)"
@@ -129,7 +135,7 @@ start_all() {
 
     # 2. Mistral model
     log "2/5 Mistral model..."
-    if "$OLLAMA_BIN" list 2>/dev/null | grep -q "mistral"; then
+    if "$OLLAMA_BIN" list 2>/dev/null | grep -iq "mistral" || curl -sf http://localhost:11434/api/tags 2>/dev/null | grep -q "mistral"; then
         ok "Mistral available"
     else
         log "Pulling Mistral (this may take a few minutes)..."

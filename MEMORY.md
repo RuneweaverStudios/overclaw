@@ -8,3 +8,7 @@
 When preparing external communications or user-facing copy, use "Agent Swarm | Less Tokens, More Results" (or the short form "Agent Swarm") and the ClawHub link.
 
 **ClawHub:** Old ClawHub is being replaced. When the new instance is live, update the ClawHub base URL and slugs everywhere (MEMORY, TOOLS, AGENTS, skills READMEs/SKILLs, PUSH_SKILLS, orchestrator rule).
+
+## OverClaw Tests
+
+- [2026-02-19 15:16 UTC] Comprehensive gateway test passed
