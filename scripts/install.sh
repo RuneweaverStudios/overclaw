@@ -93,6 +93,13 @@ check_only() {
     # bun
     if has_cmd bun; then ok "bun"; else err "bun — not found"; all_ok=false; fi
 
+    # beads (bd CLI)
+    if has_cmd bd; then
+        ok "beads (bd CLI) — $(bd --version 2>&1 | head -1 | grep -o 'version [0-9.]*' || echo 'installed')"
+    else
+        err "beads (bd CLI) — not found"; all_ok=false
+    fi
+
     # Claude Code CLI
     if has_cmd claude; then
         ok "Claude Code CLI ($(claude --version 2>&1 | head -1))"
@@ -121,8 +128,9 @@ check_only() {
     elif [ -f "$VENV_DIR/bin/python3" ]; then venv_python="$VENV_DIR/bin/python3"; fi
 
     if [ -n "$venv_python" ]; then
-        for pkg in starlette uvicorn httpx playwright; do
-            if "$venv_python" -c "import $pkg" 2>/dev/null; then
+        for pkg in starlette uvicorn httpx playwright flask flask_cors; do
+            pkg_import=$(echo "$pkg" | sed 's/-/_/g')
+            if "$venv_python" -c "import $pkg_import" 2>/dev/null; then
                 ok "  Python: $pkg"
             else
                 warn "  Python: $pkg — missing"; all_ok=false
@@ -165,15 +173,15 @@ install_all() {
 
     # 1. Homebrew (macOS)
     if [[ "$OS" == "Darwin" ]]; then
-        log "1/15 Homebrew..."
+        log "1/16 Homebrew..."
         install_brew_if_needed
         ok "Homebrew ready"
     else
-        log "1/15 Skipping Homebrew (not macOS)"
+        log "1/16 Skipping Homebrew (not macOS)"
     fi
 
     # 2. Ollama
-    log "2/15 Ollama..."
+    log "2/16 Ollama..."
     if has_cmd ollama; then
         ok "Ollama already installed"
     else
@@ -186,7 +194,7 @@ install_all() {
     fi
 
     # 3. tmux
-    log "3/15 tmux..."
+    log "3/16 tmux..."
     if has_cmd tmux; then
         ok "tmux already installed"
     else
@@ -201,7 +209,7 @@ install_all() {
     fi
 
     # 4. bun
-    log "4/15 bun..."
+    log "4/16 bun..."
     if has_cmd bun; then
         ok "bun already installed"
     else
@@ -210,8 +218,46 @@ install_all() {
         ok "bun installed"
     fi
 
+    # 4b. beads (bd CLI)
+    log "4b/16 beads (bd CLI)..."
+    if has_cmd bd; then
+        ok "beads (bd CLI) already installed ($(bd --version 2>&1 | head -1 | grep -o 'version [0-9.]*' || echo 'installed'))"
+    else
+        if [[ "$OS" == "Darwin" ]]; then
+            # Try Homebrew first
+            if has_cmd brew; then
+                brew install beads 2>/dev/null || {
+                    # If brew link fails due to npm symlink conflict, remove it and retry
+                    if [ -L /opt/homebrew/bin/bd ] && [ ! -f "$(readlink /opt/homebrew/bin/bd)" ]; then
+                        rm /opt/homebrew/bin/bd 2>/dev/null || true
+                        brew link --overwrite beads 2>/dev/null || true
+                    fi
+                }
+                ok "beads installed via Homebrew"
+            else
+                # Fallback to install script
+                curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+                ok "beads installed via install script"
+            fi
+        else
+            # Linux: use install script
+            curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+            ok "beads installed via install script"
+        fi
+    fi
+
+    # Initialize beads if not already initialized
+    if [ ! -d "$WORKSPACE/.beads" ]; then
+        log "  Initializing beads in workspace..."
+        cd "$WORKSPACE"
+        bd init > /dev/null 2>&1 || warn "beads init failed (may already be initialized)"
+        ok "beads initialized"
+    else
+        ok "beads already initialized"
+    fi
+
     # 5. Claude Code CLI
-    log "5/15 Claude Code CLI..."
+    log "5/16 Claude Code CLI..."
     if has_cmd claude; then
         ok "Claude Code already installed ($(claude --version 2>&1 | head -1))"
     else
@@ -228,7 +274,7 @@ install_all() {
     fi
 
     # 6. Python venv + nanobot + gateway deps
-    log "6/15 Python venv + nanobot + dependencies..."
+    log "6/16 Python venv + nanobot + dependencies..."
     local use_venv="$VENV_DIR"
     if [ -f "$NANOBOT_VENV/bin/nanobot" ]; then
         use_venv="$NANOBOT_VENV"
@@ -261,9 +307,9 @@ install_all() {
         ok "nanobot already installed"
     fi
 
-    # Gateway deps (starlette, uvicorn, httpx, playwright)
+    # Gateway deps (starlette, uvicorn, httpx, playwright, flask, flask-cors)
     log "  Installing gateway dependencies..."
-    pip install starlette uvicorn httpx playwright --quiet
+    pip install starlette uvicorn httpx playwright flask flask-cors --quiet
     ok "Gateway dependencies installed"
 
     # Playwright browsers
@@ -276,7 +322,7 @@ install_all() {
     deactivate 2>/dev/null || true
 
     # 7. overstory
-    log "7/15 overstory..."
+    log "7/16 overstory..."
     if has_cmd overstory || [ -f "$HOME/.bun/bin/overstory" ]; then
         ok "overstory already installed"
     else
@@ -294,7 +340,7 @@ install_all() {
     fi
 
     # 8. Ollama Mistral model
-    log "8/15 Ollama Mistral model..."
+    log "8/16 Ollama Mistral model..."
     if ! pgrep -x "ollama" > /dev/null 2>&1; then
         log "  Starting Ollama..."
         ollama serve > /dev/null 2>&1 &
@@ -309,7 +355,7 @@ install_all() {
     fi
 
     # 9. overstory init + manifests
-    log "9/15 Workspace initialization..."
+    log "9/16 Workspace initialization..."
     cd "$WORKSPACE"
     if [ ! -d "$WORKSPACE/.overstory" ]; then
         "$HOME/.bun/bin/overstory" init 2>/dev/null || overstory init 2>/dev/null || warn "overstory init failed"
@@ -369,7 +415,7 @@ NBCFG
     fi
 
     # 10. Bundled skills: verify local + install external
-    log "10/15 Bundled skills..."
+    log "10/16 Bundled skills..."
     LOCAL_SKILLS=(nanobot-overstory-bridge overstory-integration skills-compat agent-swarm creative-agents playwright-mcp remotion-video goals)
     for skill in "${LOCAL_SKILLS[@]}"; do
         if [ -d "$WORKSPACE/skills/$skill" ]; then
@@ -404,7 +450,7 @@ NBCFG
     fi
 
     # 11. Skill dependencies (requirements.txt for bundled skills)
-    log "11/15 Skill dependencies..."
+    log "11/16 Skill dependencies..."
     BUNDLED_SKILLS=(nanobot-overstory-bridge overstory-integration skills-compat agent-swarm creative-agents playwright-mcp remotion-video goals last30days humanizer)
     for skill in "${BUNDLED_SKILLS[@]}"; do
         req_file="$WORKSPACE/skills/$skill/requirements.txt"
@@ -417,7 +463,7 @@ NBCFG
     ok "Skill dependencies done"
 
     # 12. Verify system tools (Bun for remotion-video)
-    log "12/15 System tools..."
+    log "12/16 System tools..."
     if has_cmd bun; then
         ok "  Bun available for remotion-video: $(bun --version 2>/dev/null || true)"
     else
@@ -426,7 +472,7 @@ NBCFG
     fi
 
     # 13. Messaging channel setup (optional)
-    log "13/15 Messaging channels (optional)..."
+    log "13/16 Messaging channels (optional)..."
     if [ -t 0 ] && read -p "Configure Discord bot? (y/n) " -n 1 -r 2>/dev/null; then
         echo ""
         if [[ "$REPLY" =~ ^[Yy]$ ]]; then
@@ -441,7 +487,7 @@ NBCFG
     fi
 
     # 14. Gateway verification (non-blocking)
-    log "14/15 Gateway verification..."
+    log "14/16 Gateway verification..."
     if curl -sf http://localhost:18800/health > /dev/null 2>&1; then
         ok "  Gateway already responding on 18800"
     else
@@ -456,7 +502,7 @@ NBCFG
     done
 
     # 15. Regenerate manifests (includes all 10 bundled skills)
-    log "15/15 Regenerating manifests..."
+    log "15/16 Regenerating manifests..."
     source "$use_venv/bin/activate"
     NANOBOT_WORKSPACE="$WORKSPACE" NANOBOT_SKILLS_DIR="$WORKSPACE/skills" python3 "$WORKSPACE/skills/nanobot-overstory-bridge/scripts/generate_agent_context.py" \
         --output "$WORKSPACE/.overstory/gateway-context.md" \
