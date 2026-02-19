@@ -1,0 +1,17 @@
+{
+  "name": "playwright-commander",
+  "displayName": "Playwright Commander",
+  "description": "A skill to interact with web browsers using Playwright for advanced UI automation, analysis, and debugging.",
+  "triggerRules": [
+    "when a user asks for web automation, browser control, or UI testing",
+    "when analyzing web applications or converting web dashboards to desktop apps",
+    "when diagnosing browser-related issues"
+  ],
+  "supportedModels": [
+    "*"
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  }
+}

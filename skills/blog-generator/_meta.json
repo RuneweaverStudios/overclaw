@@ -1,0 +1,10 @@
+{
+  "schema": "openclaw.skill.v1",
+  "name": "blog-generator",
+  "version": "1.0.0",
+  "displayName": "Blog Generator",
+  "description": "Analyzes journal entries and chat history to identify high-value topics and automatically generate blog posts.",
+  "author": "OpenClaw",
+  "tags": ["blog", "content", "journal", "openclaw"],
+  "platform": "openclaw"
+}

@@ -1,0 +1,12 @@
+{
+  "schema": "openclaw.skill.v1",
+  "name": "funclip-commander",
+  "version": "0.1.0",
+  "displayName": "Funclip Commander",
+  "description": "Integrates OpenClaw with the FunClip AI video editor to enable AI-powered video recognition and clipping via command line.",
+  "author": "OpenClaw",
+  "tags": ["video", "funclip", "clipping", "openclaw"],
+  "platform": "openclaw",
+  "icon": "🎬",
+  "color": "#FF5733"
+}

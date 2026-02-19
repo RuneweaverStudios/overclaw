@@ -1,0 +1,19 @@
+{
+  "name": "playwright-mcp",
+  "displayName": "Playwright MCP Server",
+  "description": "MCP server for Playwright browser automation",
+  "version": "1.0.0",
+  "author": "ghost",
+  "tags": ["mcp", "playwright", "browser", "automation"],
+  "mcp": true,
+  "tools": [
+    "playwright_navigate",
+    "playwright_screenshot",
+    "playwright_get_content",
+    "playwright_click",
+    "playwright_fill",
+    "playwright_execute_script",
+    "playwright_get_attribute",
+    "playwright_wait_for"
+  ]
+}

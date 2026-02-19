@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.openclaw.what-just-happened</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/bin/env</string>
+		<string>python3</string>
+		<string>OPENCLAW_WATCHER_SCRIPT</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>OPENCLAW_HOME</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>OPENCLAW_HOME</key>
+		<string>OPENCLAW_HOME</string>
+		<key>OPENCLAW_BIN</key>
+		<string>OPENCLAW_BIN</string>
+		<key>PATH</key>
+		<string>PATH_PLACEHOLDER</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>15</integer>
+	<key>StandardOutPath</key>
+	<string>OPENCLAW_HOME/logs/what-just-happened.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>OPENCLAW_HOME/logs/what-just-happened.err.log</string>
+</dict>
+</plist>

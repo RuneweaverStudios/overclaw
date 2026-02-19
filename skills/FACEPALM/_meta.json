@@ -1,0 +1,11 @@
+{
+  "schema": "openclaw.skill.v1",
+  "name": "FACEPALM",
+  "version": "1.0.0",
+  "displayName": "FACEPALM",
+  "slogan": "Crosscheck console logs with chat history to troubleshoot issues intelligently.",
+  "description": "FACEPALM analyzes OpenClaw console logs and chat history from the last 5 minutes, then uses Codex 5.3 to diagnose and troubleshoot issues. Can be invoked when troubleshooting is needed (e.g. after Agent Swarm or manual trigger).",
+  "author": "Austin",
+  "tags": ["troubleshooting", "debugging", "diagnostics", "codex"],
+  "platform": "openclaw"
+}

@@ -1,0 +1,1 @@
+{"schema":"openclaw.skill.v1","name":"gateway-watchdog","version":"1.0.0","description":"Check and recover OpenClaw gateway (auth mismatch, disconnects). Optional daemon for automatic recovery. Requires gateway-guard skill.","author":"OpenClaw","tags":["gateway","auth","watchdog","openclaw"],"platform":"openclaw"}

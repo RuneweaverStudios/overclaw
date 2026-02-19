@@ -1,0 +1,25 @@
+{
+  "id": "ship_feature",
+  "name": "Ship feature",
+  "description": "PM scopes tasks, Dev implements, Editor writes docs/changelog.",
+  "steps": [
+    {
+      "id": "scope",
+      "agent": "pm",
+      "task_template": "Scope and break down the feature into tasks: {{ user_input }}",
+      "input_from": "user_input"
+    },
+    {
+      "id": "implement",
+      "agent": "dev",
+      "task_template": "Implement the following scope and run tests: {{ scope_output }}",
+      "input_from": "scope_output"
+    },
+    {
+      "id": "docs",
+      "agent": "editor",
+      "task_template": "Write user-facing docs and changelog for this feature: {{ implement_output }}",
+      "input_from": "implement_output"
+    }
+  ]
+}

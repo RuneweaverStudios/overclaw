@@ -1,0 +1,9 @@
+{
+  "name": "nanobot-overstory-bridge",
+  "displayName": "nanobot-overstory Bridge",
+  "description": "Seamless bidirectional bridge between nanobot and overstory",
+  "version": "1.0.0",
+  "author": "ghost",
+  "tags": ["bridge", "orchestration", "nanobot", "overstory"],
+  "tools": ["overstory_spawn", "overstory_status", "overstory_mail", "memory_sync"]
+}

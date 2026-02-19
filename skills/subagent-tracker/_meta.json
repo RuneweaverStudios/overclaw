@@ -1,0 +1,10 @@
+{
+  "schema": "openclaw.skill.v1",
+  "name": "subagent-tracker",
+  "version": "1.2.0",
+  "displayName": "Subagent Tracker",
+  "description": "Say \"agent status\" and get updates on all subagent progress. Track subagent actions while they run; list active subagents, status, and tail transcripts. Install for power users using the agent swarm.",
+  "author": "OpenClaw",
+  "tags": ["subagent", "status", "tracking", "openclaw"],
+  "platform": "openclaw"
+}

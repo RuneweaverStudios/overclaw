@@ -1,0 +1,10 @@
+{
+  "schema": "openclaw.skill.v1",
+  "name": "doppleganger",
+  "version": "1.0.0",
+  "displayName": "Doppleganger",
+  "description": "Prevents duplicate subagent sessions running the same task. Saves tokens and reduces lag—no more \"multiple Spidermen\" doing the same work.",
+  "author": "OpenClaw",
+  "tags": ["subagent", "deduplication", "openclaw"],
+  "platform": "openclaw"
+}

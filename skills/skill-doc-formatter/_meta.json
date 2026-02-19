@@ -1,0 +1,10 @@
+{
+  "schema": "openclaw.skill.v1",
+  "name": "skill-doc-formatter",
+  "version": "1.0.0",
+  "displayName": "Skill Doc Formatter | ClawHub",
+  "description": "Formats SKILL.md (OpenClaw/Cursor skill docs) for optimal display on ClawHub. Produces a consistent structure—Description, Installation, Usage with benefit-focused examples, and Commands.",
+  "author": "OpenClaw",
+  "tags": ["clawhub", "docs", "formatting", "openclaw"],
+  "platform": "openclaw"
+}

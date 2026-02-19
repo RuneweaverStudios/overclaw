@@ -1,0 +1,17 @@
+{
+  "name": "claw-canvas",
+  "displayName": "Claw Canvas",
+  "description": "A virtual canvas for OpenClaw to output content and visualize its thinking during development.",
+  "triggerRules": [
+    "when visualizing output is beneficial",
+    "when displaying progress or intermediate results",
+    "when a user asks to see the agent's thinking or data visually"
+  ],
+  "supportedModels": [
+    "*"
+  ],
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  }
+}

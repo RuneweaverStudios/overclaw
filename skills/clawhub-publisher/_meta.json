@@ -1,0 +1,1 @@
+{"schema":"openclaw.skill.v1","name":"clawhub-publisher","version":"1.0.0","description":"Sync OpenClaw skills to ClawHub; filter by user GitHub, check versions, publish with rate-limit delays.","author":"OpenClaw","tags":["clawhub","publish","cron","openclaw"],"platform":"openclaw"}

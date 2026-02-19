@@ -1,0 +1,12 @@
+{
+  "schema": "openclaw.skill.v1",
+  "name": "tweet-crafter",
+  "version": "0.1.0",
+  "displayName": "Tweet Crafter for OpenClaw",
+  "description": "Drafts engaging tweets in copy-paste friendly code blocks and generates companion blog posts for various OpenClaw projects and announcements. Integrates with Agent Swarm and enforces ClawHub link best practices.",
+  "author": "OpenClaw",
+  "tags": ["twitter", "content", "social", "openclaw"],
+  "platform": "openclaw",
+  "icon": "🐦",
+  "color": "#1DA1F2"
+}

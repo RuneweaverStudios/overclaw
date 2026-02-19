@@ -1,0 +1,10 @@
+{
+  "schema": "openclaw.skill.v1",
+  "name": "gateway-guard",
+  "version": "1.0.1",
+  "description": "Ensures OpenClaw gateway auth consistency and can auto-prompt continue on run errors. Use when checking or fixing gateway token/password mismatch.",
+  "author": "OpenClaw",
+  "tags": ["gateway", "auth", "openclaw"],
+  "platform": "openclaw",
+  "always": false
+}

@@ -1,0 +1,10 @@
+{
+  "schema": "openclaw.skill.v1",
+  "name": "composio-composer-xskill",
+  "version": "1.0.0",
+  "displayName": "Composio Composer X Skill",
+  "description": "Enables posting tweets to Twitter/X through Composio's integration platform. Uses HTTP requests to interact with Composio's web interface, providing a post_tweet function callable from OpenClaw.",
+  "author": "OpenClaw",
+  "tags": ["twitter", "composio", "integration", "openclaw"],
+  "platform": "openclaw"
+}

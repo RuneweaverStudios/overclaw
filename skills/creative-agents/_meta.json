@@ -1,0 +1,10 @@
+{
+  "schema": "openclaw.skill.v1",
+  "name": "creative-agents",
+  "version": "1.0.0",
+  "displayName": "Creative Agents",
+  "description": "Integration scripts for the creative agent swarm: researcher, social media manager, blogger, and scribe. Powers agent definitions with research, OAuth, Playwright automation, humanization, log analysis, and memory curation.",
+  "author": "OpenClaw",
+  "tags": ["agents", "creative", "research", "social-media", "blog", "scribe", "memory"],
+  "platform": "openclaw"
+}

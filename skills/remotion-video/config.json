@@ -1,0 +1,9 @@
+{
+  "projectPath": "",
+  "nodePath": "",
+  "lambda": {
+    "enabled": false,
+    "region": "",
+    "s3Bucket": ""
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "schema": "openclaw.skill.v1",
+  "name": "remotion-video",
+  "displayName": "Remotion Video",
+  "description": "Create and render programmatic videos with Remotion (React-based MP4/PNG). Scaffold projects, run Studio, render locally or via Lambda.",
+  "version": "1.0.0",
+  "author": "OpenClaw",
+  "icon": "🎬",
+  "color": "#6366f1",
+  "tags": ["video", "remotion", "react", "render", "mp4", "programmatic", "lambda"],
+  "platform": "openclaw",
+  "dependencies": ["node"],
+  "skills": []
+}

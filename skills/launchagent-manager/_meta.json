@@ -1,0 +1,1 @@
+{"schema":"openclaw.skill.v1","name":"launchagent-manager","version":"1.0.0","description":"List and prune macOS LaunchAgents; keep only OpenClaw-related, remove others.","author":"OpenClaw","tags":["launchd","launchagents","macos","openclaw"],"platform":"openclaw"}

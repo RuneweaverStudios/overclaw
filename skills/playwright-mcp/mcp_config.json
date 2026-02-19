@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "python3",
+      "args": ["/Users/ghost/.openclaw/workspace/skills/playwright-mcp/scripts/playwright_mcp_server.py"],
+      "env": {},
+      "transport": "stdio"
+    }
+  }
+}

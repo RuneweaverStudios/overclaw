@@ -1,0 +1,10 @@
+{
+  "schema": "openclaw.skill.v1",
+  "name": "subagent-dashboard",
+  "version": "1.0.0",
+  "displayName": "Subagent Dashboard",
+  "description": "Web dashboard for real-time monitoring and management of OpenClaw subagents.",
+  "author": "OpenClaw",
+  "tags": ["subagent", "dashboard", "monitoring", "openclaw"],
+  "platform": "openclaw"
+}

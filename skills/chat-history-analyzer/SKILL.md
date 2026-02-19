@@ -7,22 +7,20 @@ version: 1.0.0
 
 # Chat History Analyzer | OpenClaw Skill
 
+## Description
+
+Extracts and analyzes Cursor IDE chat history to identify key discoveries, obstacles, and solutions, saving findings to the journal.
+
+# Chat History Analyzer | OpenClaw Skill
+
 Extracts chat history from Cursor IDE's local SQLite databases, analyzes the last hour of conversations for key discoveries, obstacles, and solutions, and saves structured findings to the OpenClaw journal directory.
 
-## What this skill does
 
-- **Extracts** chat history from Cursor's SQLite databases (global and workspace-specific)
-- **Analyzes** the last hour of messages for patterns indicating discoveries, obstacles, and solutions
-- **Saves** structured findings to `/Users/ghost/.openclaw/journal/` as markdown files
-- **Runs** automatically via cron job every hour
-
-## When to use
+## Usage
 
 - As a scheduled cron job to continuously track insights from chat history
 - Manually to analyze recent chat activity
 - To identify recurring patterns, problems, or solutions in your workflow
-
-## Commands (use absolute path for exec)
 
 ```bash
 # Combined log and chat history analysis (for cron jobs)
@@ -37,6 +35,15 @@ python3 /Users/ghost/.openclaw/workspace/skills/chat-history-analyzer/scripts/ch
 # Output JSON format
 python3 /Users/ghost/.openclaw/workspace/skills/chat-history-analyzer/scripts/analyze_logs.py --json
 ```
+
+
+## What this skill does
+
+- **Extracts** chat history from Cursor's SQLite databases (global and workspace-specific)
+- **Analyzes** the last hour of messages for patterns indicating discoveries, obstacles, and solutions
+- **Saves** structured findings to `/Users/ghost/.openclaw/journal/` as markdown files
+- **Runs** automatically via cron job every hour
+
 
 ## Integration as a Cron Job
 
@@ -73,6 +80,7 @@ This skill is designed to run hourly via OpenClaw cron. The `analyze_logs.py` sc
 0 * * * * /Users/ghost/.openclaw/workspace/skills/chat-history-analyzer/scripts/analyze_logs.py --json >> /Users/ghost/.openclaw/logs/analyze_logs.log 2>&1
 ```
 
+
 ## Output Format
 
 Findings are saved to `/Users/ghost/.openclaw/journal/chat_analysis_YYYY-MM-DD_HHMMSS.md` with sections for:
@@ -81,11 +89,13 @@ Findings are saved to `/Users/ghost/.openclaw/journal/chat_analysis_YYYY-MM-DD_H
 - **Obstacles Encountered**: Errors, failures, and blockers
 - **Solutions Found**: Fixes, workarounds, and resolutions
 
+
 ## Requirements
 
 - Cursor IDE installed with chat history stored locally
 - SQLite3 available (usually pre-installed on macOS)
 - OpenClaw journal directory writable
+
 
 ## How it works
 

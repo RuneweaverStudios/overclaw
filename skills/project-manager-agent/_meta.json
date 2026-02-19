@@ -1,0 +1,10 @@
+{
+  "schema": "openclaw.skill.v1",
+  "name": "project-manager-agent",
+  "version": "0.1.0",
+  "displayName": "Project Manager Agent",
+  "description": "Monitors active sub-agents, detects stalls, and provides status updates. Can be configured to automatically steer stuck agents.",
+  "author": "OpenClaw",
+  "tags": ["monitoring", "automation", "subagent", "project-management", "openclaw"],
+  "platform": "openclaw"
+}

@@ -1,0 +1,10 @@
+{
+  "schema": "openclaw.skill.v1",
+  "name": "scribe",
+  "version": "1.0.0",
+  "displayName": "Scribe",
+  "description": "Scans OpenClaw logs, config files, chat history, cursor history, behavior, desires, tastes, and drafts to take comprehensive daily and weekly notes with summaries.",
+  "author": "OpenClaw",
+  "tags": ["notes", "journal", "logs", "openclaw"],
+  "platform": "openclaw"
+}

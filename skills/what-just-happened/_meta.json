@@ -1,0 +1,1 @@
+{"schema":"openclaw.skill.v1","name":"what-just-happened","version":"1.1.0","description":"When the gateway comes back online, check recent logs and post a short message about what happened.","author":"OpenClaw","tags":["gateway","logs","reconnect","openclaw"],"platform":"openclaw"}

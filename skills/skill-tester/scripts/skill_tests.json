@@ -1,0 +1,15 @@
+{
+  "agent-swarm": [{"name": "router spawn --json", "cmd": ["python3", "scripts/router.py", "spawn", "--json", "hello"], "expect_exit": 0, "expect_json_keys": ["task", "model"], "timeout": 15}, {"name": "router classify", "cmd": ["python3", "scripts/router.py", "classify", "fix the bug"], "expect_exit": 0, "timeout": 10}],
+  "agent-swarm-local": [{"name": "router spawn --json (local)", "cmd": ["python3", "scripts/router.py", "spawn", "--json", "check server status"], "expect_exit": 0, "expect_json_keys": ["task", "model"], "timeout": 15}, {"name": "router default", "cmd": ["python3", "scripts/router.py", "default", "--json"], "expect_exit": 0, "expect_json_keys": ["model"], "timeout": 10}, {"name": "router classify", "cmd": ["python3", "scripts/router.py", "classify", "fix the bug", "--json"], "expect_exit": 0, "expect_json_keys": ["tier", "model"], "timeout": 10}, {"name": "router cost (local)", "cmd": ["python3", "scripts/router.py", "cost", "check status", "--json"], "expect_exit": 0, "expect_json_keys": ["cost", "is_local"], "timeout": 10}],
+  "gateway-guard": [{"name": "status --json", "cmd": ["python3", "scripts/gateway_guard.py", "status", "--json"], "expect_exit": 0, "expect_json_keys": ["ok", "configPath", "gatewayPort"], "timeout": 10}],
+  "gateway-watchdog": [{"name": "script compiles", "cmd": ["python3", "-m", "py_compile", "scripts/gateway_watchdog.py"], "expect_exit": 0, "timeout": 5}],
+  "subagent-tracker": [{"name": "list --json", "cmd": ["python3", "scripts/subagent_tracker.py", "list", "--active", "1", "--json"], "expect_exit": 0, "timeout": 10}],
+  "doppleganger": [{"name": "check --json", "cmd": ["python3", "scripts/doppleganger.py", "check", "test task", "--json"], "expect_exit": 0, "expect_json_keys": ["duplicate"], "timeout": 15}],
+  "what-just-happened": [{"name": "report --json", "cmd": ["python3", "scripts/report_recent_logs.py", "--minutes", "1", "--json"], "expect_exit": 0, "timeout": 10}],
+  "subagent-dashboard": [{
+      "name": "dashboard.py existence",
+      "cmd": ["ls", "scripts/dashboard.py"],
+      "cwd": "/Users/ghost/.openclaw/workspace/skills/subagent-dashboard",
+      "expect_exit": 0
+    }]
+}

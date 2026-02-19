@@ -1,0 +1,1 @@
+{"schema":"openclaw.skill.v1","name":"skill-tester","version":"1.0.0","description":"Run local tests for each OpenClaw skill before publishing to ClawHub.","author":"OpenClaw","tags":["testing","skills","clawhub","openclaw"],"platform":"openclaw"}

@@ -1,0 +1,10 @@
+{
+  "schema": "openclaw.skill.v1",
+  "name": "skill-doctor",
+  "version": "1.0.0",
+  "displayName": "Skill Doctor | OpenClaw Skill",
+  "description": "Scans the skills folder to detect new, unused, or missing dependencies, fix them, and test a skill in or out of sandbox.",
+  "author": "OpenClaw",
+  "tags": ["skills", "dependencies", "testing", "openclaw"],
+  "platform": "openclaw"
+}
