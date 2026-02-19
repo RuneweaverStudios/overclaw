@@ -200,6 +200,29 @@ start_all() {
         --manifest "$WORKSPACE/.overstory/skills-manifest.json" 2>/dev/null
     ok "Skills manifest generated"
 
+    # Gateway verification: ensure all expected endpoints respond
+    log "Verifying gateway endpoints..."
+    local vfail=0
+    for endpoint in /health /api/status /api/skills /api/tools; do
+        if curl -sf "http://localhost:18800$endpoint" > /dev/null 2>&1; then
+            ok "  $endpoint"
+        else
+            warn "  $endpoint not responding"
+            vfail=$((vfail + 1))
+        fi
+    done
+    if [ -f "$WORKSPACE/.overstory/skills-manifest.json" ]; then
+        ok "  skills-manifest.json present"
+    else
+        warn "  skills-manifest.json missing"
+        vfail=$((vfail + 1))
+    fi
+    if [ "$vfail" -gt 0 ]; then
+        warn "Gateway verification had $vfail issue(s) — check logs"
+    else
+        ok "Gateway verification passed"
+    fi
+
     echo ""
     log "OverClaw is running!"
     echo ""

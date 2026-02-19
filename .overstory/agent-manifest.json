@@ -151,6 +151,78 @@
 				"read-only",
 				"no-worktree"
 			]
+		},
+		"researcher": {
+			"file": "researcher.md",
+			"model": "sonnet",
+			"tools": [
+				"Read",
+				"Glob",
+				"Grep",
+				"Bash"
+			],
+			"capabilities": [
+				"research",
+				"research-web",
+				"explore-web"
+			],
+			"canSpawn": false,
+			"constraints": []
+		},
+		"blogger": {
+			"file": "blogger.md",
+			"model": "sonnet",
+			"tools": [
+				"Read",
+				"Write",
+				"Edit",
+				"Glob",
+				"Grep",
+				"Bash"
+			],
+			"capabilities": [
+				"content",
+				"blog",
+				"write"
+			],
+			"canSpawn": false,
+			"constraints": []
+		},
+		"scribe": {
+			"file": "scribe.md",
+			"model": "sonnet",
+			"tools": [
+				"Read",
+				"Write",
+				"Edit",
+				"Glob",
+				"Grep",
+				"Bash"
+			],
+			"capabilities": [
+				"log-analysis",
+				"memory-curation",
+				"documentation"
+			],
+			"canSpawn": false,
+			"constraints": []
+		},
+		"social-media-manager": {
+			"file": "social-media-manager.md",
+			"model": "sonnet",
+			"tools": [
+				"Read",
+				"Glob",
+				"Grep",
+				"Bash"
+			],
+			"capabilities": [
+				"social",
+				"post",
+				"social-media"
+			],
+			"canSpawn": false,
+			"constraints": []
 		}
 	},
 	"capabilityIndex": {
@@ -158,7 +230,8 @@
 			"scout"
 		],
 		"research": [
-			"scout"
+			"scout",
+			"researcher"
 		],
 		"implement": [
 			"builder",
@@ -202,6 +275,39 @@
 		],
 		"patrol": [
 			"monitor"
+		],
+		"research-web": [
+			"researcher"
+		],
+		"explore-web": [
+			"researcher"
+		],
+		"content": [
+			"blogger"
+		],
+		"blog": [
+			"blogger"
+		],
+		"write": [
+			"blogger"
+		],
+		"log-analysis": [
+			"scribe"
+		],
+		"memory-curation": [
+			"scribe"
+		],
+		"documentation": [
+			"scribe"
+		],
+		"social": [
+			"social-media-manager"
+		],
+		"post": [
+			"social-media-manager"
+		],
+		"social-media": [
+			"social-media-manager"
 		]
 	}
 }

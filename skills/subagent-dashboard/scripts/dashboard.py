@@ -10,6 +10,8 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from flask import Flask, jsonify, render_template_string, request
@@ -24,6 +26,8 @@ RUNS_JSON = OPENCLAW_HOME / "agents" / "main" / "subagents" / "runs.json"
 # Legacy path some gateways use (GATEWAY-INTEGRATION.md: subagents/runs.json)
 RUNS_JSON_LEGACY = OPENCLAW_HOME / "subagents" / "runs.json"
 DELEGATIONS_LOG = OPENCLAW_HOME / "logs" / "agent-swarm-delegations.jsonl"
+# OverClaw gateway URL for Overstory agent list (GET /api/agents)
+GATEWAY_URL = os.environ.get("OVERCLAW_GATEWAY_URL", "http://localhost:18800")
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
@@ -281,6 +285,10 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             background: var(--text-secondary);
             color: var(--bg-dark);
         }
+        .role-badge.overstory {
+            background: var(--accent-purple);
+            color: var(--bg-primary);
+        }
         .agent-header {
             display: flex;
             justify-content: space-between;
@@ -355,13 +363,25 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             gap: 6px;
             margin-top: 15px;
         }
-        .agent-actions button {
+        .agent-actions button,
+        .agent-actions a.btn-inspect {
             flex: 1 1 0;
             min-width: 0;
             font-size: 11px;
             padding: 4px 8px;
             border-radius: 8px;
             line-height: 1.1;
+        }
+        .agent-actions a.btn-inspect {
+            display: inline-block;
+            text-align: center;
+            text-decoration: none;
+            color: var(--accent-blue);
+            background: var(--bg-glass);
+            border: 1px solid var(--border-color);
+        }
+        .agent-actions a.btn-inspect:hover {
+            background: var(--bg-glass-hover);
         }
         .transcript-panel {
             background: var(--bg-glass);
@@ -951,6 +971,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     return [];
                 }
                 const data = JSON.parse(text);
+                if (data.gateway_url) window.gatewayUrl = data.gateway_url;
                 return Array.isArray(data.subagents) ? data.subagents : [];
             } catch (error) {
                 console.error('Error fetching subagents:', error);
@@ -1073,7 +1094,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             const heartbeat = getHeartbeatMeta(agent);
             const consoleText = getConsoleText(agent);
             
-            const roleBadge = agent.role === 'main' ? '<span class="role-badge main">Main</span>' : agent.role === 'cron' ? '<span class="role-badge cron">Cron</span>' : '';
+            const roleBadge = agent.role === 'main' ? '<span class="role-badge main">Main</span>' : agent.role === 'cron' ? '<span class="role-badge cron">Cron</span>' : (agent.source === 'overstory' ? '<span class="role-badge overstory">Overstory</span>' : '');
             return `
                 <div class="${cardClass}" id="agent-${agent.sessionId}" data-role="${agent.role || 'subagent'}">
                     <div class="agent-header">
@@ -1111,6 +1132,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     ${(agent.completed && lane !== 'cancelled') ? `<div style="font-size: 11px; color: #4caf50; margin-top: 8px; padding: 6px; background: #0a0e27; border-radius: 4px; border-left: 3px solid #4caf50;">✅ Task completed successfully (session still active - may need cleanup)</div>` : ''}
                     ${getStalledReason(agent, isStalled)}
                     <div class="agent-actions">
+                        ${agent.source === 'overstory' ? (window.gatewayUrl ? `<a href="${window.gatewayUrl.replace(/\/$/, '')}/api/agents/${encodeURIComponent(agent.sessionId)}" target="_blank" rel="noopener" class="btn-inspect">🔍 Inspect</a>` : '') : ''}
                         <button onclick="viewTranscript('${agent.sessionId}')">📋 Transcript</button>
                         <button class="btn-resume" onclick="resumeAgent('${agent.sessionId}', '', event)">▶️ Resume</button>
                         <button class="btn-restart" onclick="restartAgent('${agent.sessionId}')">🔄 Restart</button>
@@ -1151,7 +1173,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 grid.innerHTML = `
                     <div class="empty-state">
                         <h2>No Active Subagents</h2>
-                        <p>No sessions found. Main and subagents appear here when listed from sessions.json.</p>
+                        <p>No sessions found. Main and subagents (sessions.json) and gateway-triggered Overstory agents appear here.</p>
                     </div>
                 `;
                 return;
@@ -1811,6 +1833,70 @@ def run_tracker(command, *args, json_output=True):
     except Exception as e:
         return {"error": str(e)}
 
+
+def _query_overstory_agents(timeout_sec=10):
+    """Fetch Overstory agent list from OverClaw gateway GET /api/agents. Returns list of agent dicts or [] on error."""
+    url = f"{GATEWAY_URL.rstrip('/')}/api/agents"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            data = json.loads(resp.read().decode())
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError, ValueError) as e:
+        print(f"Overstory agents fetch failed: {e}", file=sys.stderr)
+        return []
+    if isinstance(data, dict) and data.get("error"):
+        return []
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and "agents" in data:
+        return data["agents"] if isinstance(data["agents"], list) else []
+    for key in ("agents", "agent", "items", "result"):
+        if key in data and isinstance(data[key], list):
+            return data[key]
+    return []
+
+
+def _overstory_agents_to_dashboard_format(agents_list):
+    """Convert Overstory agent list to dashboard session-like format. Each item gets source='overstory'."""
+    now_ms = int(time.time() * 1000)
+    out = []
+    for a in agents_list:
+        if not isinstance(a, dict):
+            continue
+        name = a.get("name") or a.get("agent") or a.get("id") or ""
+        if not name:
+            continue
+        session_id = str(name)
+        key = f"overstory:{session_id}"
+        task = a.get("task") or a.get("description") or a.get("task_id") or ""
+        capability = a.get("capability") or a.get("model") or "overstory"
+        status = (a.get("status") or "").lower()
+        updated_at = a.get("updatedAt") or a.get("updated_at") or a.get("start_time") or now_ms
+        if isinstance(updated_at, (int, float)):
+            updated_at_ms = int(updated_at * 1000) if updated_at < 1e12 else int(updated_at)
+        else:
+            updated_at_ms = now_ms
+        age_ms = max(0, now_ms - updated_at_ms)
+        out.append({
+            "key": key,
+            "sessionId": session_id,
+            "role": "subagent",
+            "source": "overstory",
+            "updatedAt": updated_at_ms,
+            "ageMs": age_ms,
+            "model": capability,
+            "task": task if isinstance(task, str) else str(task) if task else "",
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "taskIndex": None,
+            "totalTasks": None,
+            "completed": status in ("completed", "failed", "terminated"),
+            "outcomeStatus": status if status in ("completed", "failed", "terminated") else None,
+            "displayName": name,
+        })
+    return out
+
+
 @app.route('/')
 def index():
     """Serve the dashboard HTML."""
@@ -2112,10 +2198,25 @@ def get_subagents():
                     "outcomeMessage": outcome.get("message"),
                 })
         
-        return jsonify({"subagents": agents})
+        # Merge Overstory agents (gateway-triggered) so they appear in the same view
+        overstory_raw = _query_overstory_agents()
+        overstory_agents = _overstory_agents_to_dashboard_format(overstory_raw)
+        for i, ov in enumerate(overstory_agents):
+            ov["agentIndex"] = len(agents) + i + 1
+            agents.append(ov)
+        
+        return jsonify({"subagents": agents, "gateway_url": GATEWAY_URL})
     except Exception as e:
         print(f"get_subagents error: {e}", file=sys.stderr)
         return jsonify({"error": str(e), "subagents": []}), 500
+
+
+@app.route('/api/overstory-agents')
+def get_overstory_agents():
+    """Get Overstory agents from gateway (raw). For debugging or alternate consumers."""
+    raw = _query_overstory_agents()
+    return jsonify({"overstory_agents": raw})
+
 
 @app.route('/api/subagent/<session_id>/status')
 def get_subagent_status(session_id):

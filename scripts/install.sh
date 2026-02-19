@@ -165,15 +165,15 @@ install_all() {
 
     # 1. Homebrew (macOS)
     if [[ "$OS" == "Darwin" ]]; then
-        log "1/9 Homebrew..."
+        log "1/15 Homebrew..."
         install_brew_if_needed
         ok "Homebrew ready"
     else
-        log "1/9 Skipping Homebrew (not macOS)"
+        log "1/15 Skipping Homebrew (not macOS)"
     fi
 
     # 2. Ollama
-    log "2/9 Ollama..."
+    log "2/15 Ollama..."
     if has_cmd ollama; then
         ok "Ollama already installed"
     else
@@ -186,7 +186,7 @@ install_all() {
     fi
 
     # 3. tmux
-    log "3/9 tmux..."
+    log "3/15 tmux..."
     if has_cmd tmux; then
         ok "tmux already installed"
     else
@@ -201,7 +201,7 @@ install_all() {
     fi
 
     # 4. bun
-    log "4/9 bun..."
+    log "4/15 bun..."
     if has_cmd bun; then
         ok "bun already installed"
     else
@@ -211,7 +211,7 @@ install_all() {
     fi
 
     # 5. Claude Code CLI
-    log "5/9 Claude Code CLI..."
+    log "5/15 Claude Code CLI..."
     if has_cmd claude; then
         ok "Claude Code already installed ($(claude --version 2>&1 | head -1))"
     else
@@ -228,7 +228,7 @@ install_all() {
     fi
 
     # 6. Python venv + nanobot + gateway deps
-    log "6/9 Python venv + nanobot + dependencies..."
+    log "6/15 Python venv + nanobot + dependencies..."
     local use_venv="$VENV_DIR"
     if [ -f "$NANOBOT_VENV/bin/nanobot" ]; then
         use_venv="$NANOBOT_VENV"
@@ -276,7 +276,7 @@ install_all() {
     deactivate 2>/dev/null || true
 
     # 7. overstory
-    log "7/9 overstory..."
+    log "7/15 overstory..."
     if has_cmd overstory || [ -f "$HOME/.bun/bin/overstory" ]; then
         ok "overstory already installed"
     else
@@ -294,7 +294,7 @@ install_all() {
     fi
 
     # 8. Ollama Mistral model
-    log "8/9 Ollama Mistral model..."
+    log "8/15 Ollama Mistral model..."
     if ! pgrep -x "ollama" > /dev/null 2>&1; then
         log "  Starting Ollama..."
         ollama serve > /dev/null 2>&1 &
@@ -309,7 +309,7 @@ install_all() {
     fi
 
     # 9. overstory init + manifests
-    log "9/9 Workspace initialization..."
+    log "9/15 Workspace initialization..."
     cd "$WORKSPACE"
     if [ ! -d "$WORKSPACE/.overstory" ]; then
         "$HOME/.bun/bin/overstory" init 2>/dev/null || overstory init 2>/dev/null || warn "overstory init failed"
@@ -368,9 +368,97 @@ NBCFG
         ok "nanobot config exists"
     fi
 
-    # Generate manifests
+    # 10. Bundled skills: verify local + install external
+    log "10/15 Bundled skills..."
+    LOCAL_SKILLS=(nanobot-overstory-bridge overstory-integration skills-compat agent-swarm creative-agents playwright-mcp remotion-video goals)
+    for skill in "${LOCAL_SKILLS[@]}"; do
+        if [ -d "$WORKSPACE/skills/$skill" ]; then
+            ok "  Found local skill: $skill"
+        else
+            err "  Local skill not found: $skill (expected in $WORKSPACE/skills/)"
+            exit 1
+        fi
+    done
+
+    if [ ! -d "$WORKSPACE/skills/last30days" ]; then
+        log "  Installing last30days from GitHub..."
+        git clone --depth 1 https://github.com/mvanhorn/last30days-skill.git "$WORKSPACE/skills/last30days" 2>/dev/null || {
+            err "  Failed to clone last30days — run: git clone https://github.com/mvanhorn/last30days-skill.git $WORKSPACE/skills/last30days"
+            MISSING+=("last30days")
+        }
+        [ -d "$WORKSPACE/skills/last30days" ] && ok "  last30days installed"
+    else
+        ok "  last30days already present"
+    fi
+
+    if [ ! -d "$WORKSPACE/skills/humanizer" ]; then
+        log "  Installing humanizer (ClawHub: biostartechnology/humanizer)..."
+        if git clone --depth 1 https://github.com/biostartechnology/humanizer.git "$WORKSPACE/skills/humanizer" 2>/dev/null; then
+            ok "  humanizer installed from GitHub"
+        else
+            warn "  humanizer not found at GitHub — install manually from https://clawhub.ai/biostartechnology/humanizer into $WORKSPACE/skills/humanizer"
+            MISSING+=("humanizer")
+        fi
+    else
+        ok "  humanizer already present"
+    fi
+
+    # 11. Skill dependencies (requirements.txt for bundled skills)
+    log "11/15 Skill dependencies..."
+    BUNDLED_SKILLS=(nanobot-overstory-bridge overstory-integration skills-compat agent-swarm creative-agents playwright-mcp remotion-video goals last30days humanizer)
+    for skill in "${BUNDLED_SKILLS[@]}"; do
+        req_file="$WORKSPACE/skills/$skill/requirements.txt"
+        if [ -f "$req_file" ]; then
+            source "$use_venv/bin/activate"
+            pip install -r "$req_file" --quiet 2>/dev/null && ok "  Dependencies for $skill" || warn "  Some deps failed for $skill"
+            deactivate 2>/dev/null || true
+        fi
+    done
+    ok "Skill dependencies done"
+
+    # 12. Verify system tools (Bun for remotion-video)
+    log "12/15 System tools..."
+    if has_cmd bun; then
+        ok "  Bun available for remotion-video: $(bun --version 2>/dev/null || true)"
+    else
+        err "  Bun required for remotion-video — install: curl -fsSL https://bun.sh/install | bash"
+        MISSING+=("bun")
+    fi
+
+    # 13. Messaging channel setup (optional)
+    log "13/15 Messaging channels (optional)..."
+    if [ -t 0 ] && read -p "Configure Discord bot? (y/n) " -n 1 -r 2>/dev/null; then
+        echo ""
+        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+            read -p "  Discord bot token (or leave empty to skip): " -r DISCORD_TOKEN
+            if [ -n "$DISCORD_TOKEN" ]; then
+                export DISCORD_BOT_TOKEN="$DISCORD_TOKEN"
+                ok "  Discord token set (add to ~/.nanobot/config.json or env)"
+            fi
+        fi
+    else
+        ok "  Skipped (non-interactive)"
+    fi
+
+    # 14. Gateway verification (non-blocking)
+    log "14/15 Gateway verification..."
+    if curl -sf http://localhost:18800/health > /dev/null 2>&1; then
+        ok "  Gateway already responding on 18800"
+    else
+        warn "  Gateway not running — start with: ./scripts/start-overclaw.sh"
+    fi
+    for endpoint in /health /api/status /api/skills /api/tools; do
+        if curl -sf "http://localhost:18800$endpoint" > /dev/null 2>&1; then
+            ok "  Endpoint $endpoint OK"
+        else
+            warn "  Endpoint $endpoint not available (start gateway first)"
+        fi
+    done
+
+    # 15. Regenerate manifests (includes all 10 bundled skills)
+    log "15/15 Regenerating manifests..."
     source "$use_venv/bin/activate"
-    python3 "$WORKSPACE/skills/nanobot-overstory-bridge/scripts/generate_agent_context.py" \
+    NANOBOT_WORKSPACE="$WORKSPACE" NANOBOT_SKILLS_DIR="$WORKSPACE/skills" python3 "$WORKSPACE/skills/nanobot-overstory-bridge/scripts/generate_agent_context.py" \
         --output "$WORKSPACE/.overstory/gateway-context.md" \
         --manifest "$WORKSPACE/.overstory/skills-manifest.json" 2>/dev/null || true
     deactivate 2>/dev/null || true

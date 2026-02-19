@@ -26,6 +26,11 @@ from typing import Any
 
 import httpx
 import uvicorn
+
+try:
+    import yaml
+except ImportError:
+    yaml = None  # Optional dependency
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
@@ -65,6 +70,26 @@ async def _ollama_chat(messages: list[dict], model: str | None = None, stream: b
         })
         resp.raise_for_status()
         return resp.json()
+
+
+async def _run_command(cmd: list[str], timeout: int = 30, cwd: Path | None = None) -> dict:
+    """Run a shell command asynchronously."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(cwd or WORKSPACE),
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return {
+            "returncode": proc.returncode,
+            "stdout": stdout.decode().strip(),
+            "stderr": stderr.decode().strip(),
+        }
+    except asyncio.TimeoutError:
+        proc.kill()
+        return {"returncode": -1, "error": f"Command timed out after {timeout}s"}
 
 
 async def _overstory_run(args: list[str], timeout: int = 60) -> dict:
@@ -277,8 +302,82 @@ async def agents_spawn(request: Request) -> JSONResponse:
     name = body.get("name", f"{capability}-{uuid.uuid4().hex[:6]}")
     task_id = body.get("task_id", f"oc-{uuid.uuid4().hex[:8]}")
 
+    # Create Bead task or spec file before spawning
+    spec_path = None
+    bead_created = False
+    
+    # Check if bd CLI is available
+    bd_available = False
+    try:
+        bd_check = await _run_command(["which", "bd"], timeout=2)
+        bd_available = bd_check.get("returncode") == 0
+    except Exception:
+        pass
+    
+    # Check if beads is enabled in config
+    beads_enabled = False
+    try:
+        if yaml:
+            config_path = WORKSPACE / ".overstory" / "config.yaml"
+            if config_path.exists():
+                with open(config_path) as f:
+                    config = yaml.safe_load(f)
+                    beads_enabled = config.get("beads", {}).get("enabled", False)
+    except Exception:
+        pass  # Default to disabled if we can't read config
+    
+    # Only use beads if enabled AND bd CLI is available
+    use_beads = beads_enabled and bd_available
+    
+    bead_id = None
+    if use_beads:
+        try:
+            # Create Bead task using bd CLI (bd auto-generates the ID)
+            bd_create_result = await _run_command([
+                "bd", "create", task,
+                "--priority", "1",
+                "--type", "task",
+                "--json"
+            ], timeout=10)
+            
+            if bd_create_result.get("returncode") == 0:
+                try:
+                    # Parse the JSON response to get the Bead ID
+                    bd_output = bd_create_result.get("stdout", "").strip()
+                    # bd outputs JSON to stdout (warnings go to stderr)
+                    # JSON may be multi-line, so parse the entire stdout
+                    bd_json = json.loads(bd_output)
+                    bead_id = bd_json.get("id")
+                    if bead_id:
+                        bead_created = True
+                        log.info("Created Bead task %s via bd CLI", bead_id)
+                        # Use the Bead ID as the task_id for sling
+                        task_id = bead_id
+                    else:
+                        log.warning("bd create succeeded but no 'id' in response: %s", bd_json)
+                except json.JSONDecodeError as exc:
+                    log.warning("Failed to parse bd create JSON: %s. Output: %s", exc, bd_output[:500])
+                except (KeyError, IndexError) as exc:
+                    log.warning("Failed to extract Bead ID: %s", exc)
+        except FileNotFoundError:
+            log.warning("bd CLI not found despite check")
+        except Exception as exc:
+            log.warning("Failed to create Bead task: %s", exc)
+    
+    # Always create spec file as well (for --spec flag)
+    spec_dir = WORKSPACE / ".overstory" / "specs"
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    spec_path = spec_dir / f"{task_id}.md"
+    spec_path.write_text(f"# Task: {task}\n\n{task}\n")
+    
+    if not bead_created:
+        log.info("Created spec file for task %s (beads disabled or unavailable)", task_id)
+
+    # Use bead_id if we successfully created a Bead task, otherwise use original task_id
+    sling_task_id = bead_id if bead_created and bead_id else task_id
+    
     args = [
-        "sling", task_id,
+        "sling", sling_task_id,
         "--capability", capability,
         "--name", name,
     ]
@@ -286,11 +385,21 @@ async def agents_spawn(request: Request) -> JSONResponse:
         args.extend(["--parent", body["parent"]])
     if body.get("force", False):
         args.append("--force-hierarchy")
+    
+    # If we created a spec file, add --spec flag (use absolute path)
+    if spec_path and spec_path.exists():
+        args.extend(["--spec", str(spec_path)])
 
     result = await _overstory_run(args, timeout=120)
     result["agent_name"] = name
     result["capability"] = capability
-    result["task_id"] = task_id
+    result["task_id"] = body.get("task_id", task_id)  # Return original task_id from request if provided
+    result["sling_task_id"] = sling_task_id
+    if bead_created and bead_id:
+        result["bead_id"] = bead_id
+        result["bead_created"] = True
+    if spec_path:
+        result["spec_file"] = str(spec_path.relative_to(WORKSPACE))
     return JSONResponse(result)
 
 
