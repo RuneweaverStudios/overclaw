@@ -1,8 +1,10 @@
 {"id":"workspace-306","title":"Test task","status":"open","priority":2,"issue_type":"task","created_at":"2026-02-19T16:02:21Z","created_by":"ghost","updated_at":"2026-02-19T16:02:21Z"}
 {"id":"workspace-3lz","title":"Research trending AI agent frameworks from the last 30 days (one paragraph summary).","status":"in_progress","priority":1,"issue_type":"task","created_at":"2026-02-19T16:04:11Z","created_by":"ghost","updated_at":"2026-02-19T16:04:13Z"}
 {"id":"workspace-4nj","title":"Test task with bd CLI","status":"open","priority":1,"issue_type":"task","created_at":"2026-02-19T16:02:54Z","created_by":"ghost","updated_at":"2026-02-19T16:02:54Z"}
+{"id":"workspace-57e","title":"test task","status":"in_progress","priority":1,"issue_type":"task","created_at":"2026-02-19T16:08:14Z","created_by":"ghost","updated_at":"2026-02-19T16:08:15Z"}
 {"id":"workspace-azt","title":"Write a short blog post (2 sentences) about AI agent frameworks.","status":"in_progress","priority":1,"issue_type":"task","created_at":"2026-02-19T16:04:17Z","created_by":"ghost","updated_at":"2026-02-19T16:04:17Z"}
 {"id":"workspace-cx8","title":"Test from gateway","status":"open","priority":1,"issue_type":"task","created_at":"2026-02-19T16:02:58Z","created_by":"ghost","updated_at":"2026-02-19T16:02:58Z"}
 {"id":"workspace-e8y","title":"Test task with fixed bd parsing","status":"open","priority":1,"issue_type":"task","created_at":"2026-02-19T16:03:25Z","created_by":"ghost","updated_at":"2026-02-19T16:03:25Z"}
 {"id":"workspace-hyp","title":"Final test with proper JSON parsing","status":"in_progress","priority":1,"issue_type":"task","created_at":"2026-02-19T16:04:04Z","created_by":"ghost","updated_at":"2026-02-19T16:04:05Z"}
 {"id":"workspace-kdd","title":"Test async","status":"open","priority":1,"issue_type":"task","created_at":"2026-02-19T16:03:32Z","created_by":"ghost","updated_at":"2026-02-19T16:03:32Z"}
+{"id":"workspace-sg2","title":"Research the latest AI developments, write a blog post about them, and post it to social media","status":"in_progress","priority":1,"issue_type":"task","created_at":"2026-02-19T16:07:59Z","created_by":"ghost","updated_at":"2026-02-19T16:08:00Z"}
