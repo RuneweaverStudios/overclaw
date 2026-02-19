@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-NANOBOT_GATEWAY_URL = os.environ.get("NANOBOT_GATEWAY_URL", "http://localhost:18790")
+NANOBOT_GATEWAY_URL = os.environ.get("NANOBOT_GATEWAY_URL", "http://localhost:18800")
 NANOBOT_WORKSPACE = Path(os.environ.get("NANOBOT_WORKSPACE", "/Users/ghost/.openclaw/workspace"))
 NANOBOT_SKILLS_DIR = Path(os.environ.get("NANOBOT_SKILLS_DIR", "/Users/ghost/.openclaw/workspace/skills"))
 

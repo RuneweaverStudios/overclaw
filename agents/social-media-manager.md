@@ -20,11 +20,11 @@ claude-code
 - Social Playwright (platform-specific automation)
 - File read/write
 
-## nanobot Gateway Tools & Skills
+## OverClaw Gateway Tools & Skills
 
-You have social media and browser automation tool access.
+You have social media and browser automation tool access via the OverClaw gateway (port 18800).
 
-All agents have access to the nanobot gateway tools ecosystem via the `gateway-tools` CLI.
+All agents have access to the OverClaw gateway tools ecosystem via the `gateway-tools` CLI.
 Your environment includes: `$NANOBOT_GATEWAY_URL`, `$NANOBOT_WORKSPACE`, `$NANOBOT_SKILLS_DIR`, `$GATEWAY_TOOLS`.
 
 ### Your Gateway Privileges

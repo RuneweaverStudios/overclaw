@@ -17,11 +17,11 @@ claude-code
 - Web search
 - File read/write
 
-## nanobot Gateway Tools & Skills
+## OverClaw Gateway Tools & Skills
 
-You have research-focused tool access via the nanobot gateway.
+You have research-focused tool access via the OverClaw gateway (port 18800).
 
-All agents have access to the nanobot gateway tools ecosystem via the `gateway-tools` CLI.
+All agents have access to the OverClaw gateway tools ecosystem via the `gateway-tools` CLI.
 Your environment includes: `$NANOBOT_GATEWAY_URL`, `$NANOBOT_WORKSPACE`, `$NANOBOT_SKILLS_DIR`, `$GATEWAY_TOOLS`.
 
 ### Your Gateway Privileges

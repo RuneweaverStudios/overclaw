@@ -21,11 +21,11 @@ claude-code
 - Memory curator (insight extraction and commits)
 - File read/write
 
-## nanobot Gateway Tools & Skills
+## OverClaw Gateway Tools & Skills
 
-You have full log analysis and memory management tool access.
+You have full log analysis and memory management tool access via the OverClaw gateway (port 18800).
 
-All agents have access to the nanobot gateway tools ecosystem via the `gateway-tools` CLI.
+All agents have access to the OverClaw gateway tools ecosystem via the `gateway-tools` CLI.
 Your environment includes: `$NANOBOT_GATEWAY_URL`, `$NANOBOT_WORKSPACE`, `$NANOBOT_SKILLS_DIR`, `$GATEWAY_TOOLS`.
 
 ### Your Gateway Privileges

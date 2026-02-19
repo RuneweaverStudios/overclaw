@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Gateway Tools CLI — lets overstory Claude Code agents access nanobot gateway tools and OpenClaw skills.
+"""Gateway Tools CLI — lets overstory Claude Code agents access OverClaw gateway tools and skills.
 
-Executable as a CLI, importable as a module.
+Part of the OverClaw stack (port 18800). Executable as a CLI, importable as a module.
 Outputs JSON to stdout, logs to stderr.
+
+Env vars: NANOBOT_GATEWAY_URL (default http://localhost:18800),
+          NANOBOT_WORKSPACE, NANOBOT_SKILLS_DIR, GATEWAY_TOOLS.
 """
 from __future__ import annotations
 
@@ -18,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-NANOBOT_GATEWAY_URL = os.environ.get("NANOBOT_GATEWAY_URL", "http://localhost:18790")
+NANOBOT_GATEWAY_URL = os.environ.get("NANOBOT_GATEWAY_URL", "http://localhost:18800")
 NANOBOT_WORKSPACE = Path(os.environ.get("NANOBOT_WORKSPACE", "/Users/ghost/.openclaw/workspace"))
 NANOBOT_SKILLS_DIR = Path(os.environ.get("NANOBOT_SKILLS_DIR", "/Users/ghost/.openclaw/workspace/skills"))
 

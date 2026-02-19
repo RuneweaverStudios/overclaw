@@ -1,13 +1,13 @@
 ---
 name: nanobot-overstory-bridge
-displayName: nanobot-overstory Bridge
-description: Seamless bidirectional bridge between nanobot (Ollama Mistral orchestrator) and overstory (Claude Code agent swarm). Translates tasks, routes to overstory for subagent coordination, syncs memory.
-version: 1.0.0
+displayName: OverClaw Bridge
+description: Seamless bidirectional bridge between nanobot (Ollama Mistral orchestrator) and overstory (Claude Code agent swarm). Routes tasks through the OverClaw gateway (port 18800) to overstory for subagent coordination, syncs memory.
+version: 1.1.0
 ---
 
-# nanobot-overstory Bridge
+# OverClaw Bridge (nanobot-overstory)
 
-The critical integration layer between **nanobot** (lightweight AI backend powered by Ollama Mistral) and **overstory** (Claude Code agent swarm system). nanobot handles task intake and orchestration; overstory handles all subagent creation, coordination, worktree management, and execution.
+The critical integration layer in the **OverClaw** stack. Connects **nanobot** (lightweight AI backend powered by Ollama Mistral) to **overstory** (Claude Code agent swarm system) through the **OverClaw HTTP gateway on port 18800**. nanobot handles task intake and orchestration; overstory handles all subagent creation, coordination, worktree management, and execution.
 
 ## Architecture
 
@@ -136,17 +136,24 @@ python3 scripts/session_bridge.py cleanup --max-age 24 --json
 
 - Python 3.9+
 - `overstory` CLI installed and on PATH (or set `OVERSTORY_BIN` env var)
-- nanobot backend running (Ollama with Mistral)
+- OverClaw gateway running on port 18800 (`scripts/start-overclaw.sh`)
+- Ollama with Mistral model
 - SQLite3 (bundled with Python)
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
+| `NANOBOT_GATEWAY_URL` | `http://localhost:18800` | OverClaw gateway URL |
+| `OVERCLAW_PORT` | `18800` | OverClaw gateway port |
 | `OVERSTORY_BIN` | `overstory` | Path to overstory binary |
-| `NANOBOT_MEMORY_PATH` | `/Users/ghost/.openclaw/workspace/MEMORY.md` | Path to nanobot MEMORY.md |
-| `SESSION_BRIDGE_DB` | `~/.nanobot/session_bridge.db` | Path to session mapping database |
-| `BRIDGE_LOG_LEVEL` | `INFO` | Logging verbosity (DEBUG, INFO, WARNING, ERROR) |
+| `NANOBOT_WORKSPACE` | `/Users/ghost/.openclaw/workspace` | Workspace root |
+| `NANOBOT_SKILLS_DIR` | `<workspace>/skills` | Skills directory |
+| `NANOBOT_MEMORY_PATH` | `<workspace>/MEMORY.md` | Path to MEMORY.md |
+| `SESSION_BRIDGE_DB` | `~/.nanobot/session_bridge.db` | Session mapping database |
+| `BRIDGE_LOG_LEVEL` | `INFO` | Logging verbosity |
+
+> **Note for existing nanobot/OpenClaw users:** OverClaw runs on port **18800**, separate from the legacy OpenClaw gateway (18789) and nanobot default (18790). No conflicts.
 
 ## Integration Flow
 
