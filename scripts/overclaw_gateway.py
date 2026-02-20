@@ -13,6 +13,7 @@ Port 18800 by default (separate from legacy openclaw-gateway on 18789).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sqlite3
 import logging
@@ -225,6 +226,54 @@ def _build_beacon(agent_name: str, capability: str, task_id: str, parent: str | 
     return " — ".join(parts)
 
 
+async def _get_agent_info_for_session(session_name: str) -> dict | None:
+    """Get agent_name, capability, task_id, parent for a tmux session from overstory status --json."""
+    try:
+        status = await _overstory_run(["status", "--json"], timeout=8, cwd=WORKSPACE)
+        if status.get("error"):
+            return None
+        agents = status.get("agents") or []
+        for a in agents:
+            name = a.get("agentName") or a.get("name")
+            if not name:
+                continue
+            tmux = a.get("tmuxSession") or f"overstory-overclaw-{name}"
+            if tmux == session_name or session_name.endswith(name):
+                task_id = a.get("taskId") or a.get("beadId") or a.get("task_id") or name
+                return {
+                    "agent_name": name,
+                    "capability": a.get("capability") or (name.split("-")[0] if "-" in name else "agent"),
+                    "task_id": task_id,
+                    "parent": a.get("parent"),
+                }
+    except Exception as e:
+        log.debug("_get_agent_info_for_session: %s", e)
+    return None
+
+
+async def _send_beacon_after_disclaimer(session_name: str) -> bool:
+    """After disclaimer was accepted, send the startup beacon so the agent is prompted to do its assigned work."""
+    info = await _get_agent_info_for_session(session_name)
+    if not info:
+        # Fallback: derive from session name (e.g. overstory-overclaw-lead-abc123 -> lead-abc123, task_id=lead-abc123)
+        short = session_name.replace("overstory-overclaw-", "") if "overstory-overclaw-" in session_name else session_name
+        info = {"agent_name": short, "capability": short.split("-")[0] if "-" in short else "agent", "task_id": short, "parent": None}
+    await asyncio.sleep(1)  # Let TUI be ready for input
+    beacon = _build_beacon(
+        info["agent_name"],
+        info["capability"],
+        info["task_id"],
+        parent=info.get("parent"),
+    )
+    out = await _send_tmux_keys(session_name, beacon, delay_after_s=0)
+    if out.get("error"):
+        log.debug("Send beacon after disclaimer failed for %s: %s", session_name, out["error"])
+        return False
+    await _send_tmux_keys(session_name, "", delay_after_s=0)  # Submit
+    log.info("Sent startup beacon to %s (task %s)", session_name, info.get("task_id"))
+    return True
+
+
 async def _send_tmux_keys(session_name: str, keys: str, delay_after_s: float = 0.5) -> dict:
     """Send keys to a tmux session (e.g. to accept Claude disclaimer). Appends Enter."""
     proc = await asyncio.create_subprocess_exec(
@@ -297,11 +346,13 @@ async def _sling_agent(
     if result.get("error"):
         return result
     # Overstory sends its beacon at 3s while the agent is still on the disclaimer, so it's lost.
-    # We accept the disclaimer first, then send the beacon ourselves so the agent gets the task.
+    # We accept the disclaimer first (select option 2 "Yes, I accept"), then send the beacon ourselves.
     session_name = _tmux_session_from_sling_result(result)
     if session_name:
         await asyncio.sleep(2)  # Let disclaimer appear
-        await _send_tmux_keys(session_name, "Down", delay_after_s=0)
+        # Down to select 2. Yes, I accept; do NOT send Enter with Down (would confirm option 1).
+        await _send_tmux_keys_only(session_name, "Down")
+        await asyncio.sleep(0.25)
         await _send_tmux_keys(session_name, "", delay_after_s=0)
         await asyncio.sleep(1)  # Let TUI be ready for the beacon
         task_id = result.get("taskId") or result.get("beadId") or sling_task_id
@@ -768,6 +819,34 @@ def _tmux_session_for_agent(agents: list, agent_name: str) -> str | None:
     return None
 
 
+async def _get_agent_session_names() -> list[str]:
+    """Get list of tmux session names for agents. Uses overstory status, or tmux list-sessions if DB locked."""
+    try:
+        status = await _overstory_run(["status", "--json"], timeout=8, cwd=WORKSPACE)
+        if status.get("error"):
+            raise RuntimeError(status.get("error", "unknown"))
+        agents = status.get("agents") or []
+        names = []
+        for a in agents:
+            name = a.get("agentName") or a.get("name")
+            if not name:
+                continue
+            session = _tmux_session_for_agent(agents, name) or f"overstory-overclaw-{name}"
+            names.append(session)
+        return names
+    except Exception:
+        # Fallback: list tmux sessions matching overstory-overclaw-*
+        result = await _run_command(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            timeout=5,
+            cwd=WORKSPACE,
+        )
+        if result.get("returncode") != 0:
+            return []
+        out = (result.get("stdout") or "").strip()
+        return [s.strip() for s in out.splitlines() if s.strip().startswith("overstory-overclaw-")]
+
+
 def _output_has_confirm_prompt(text: str) -> bool:
     """True if terminal output shows a Claude/CLI confirm prompt (Do you want to ... 1. Yes / 2. ... / 3. No)."""
     if not text or "Do you want to" not in text:
@@ -799,36 +878,79 @@ async def _capture_tmux_pane(session_name: str, lines: int = 80) -> str:
     return ""
 
 
+DISCLAIMER_WATCHER_INTERVAL_S = 3.0  # Poll tmux every 3s so disclaimers are accepted as soon as they appear
+
+
+async def _run_disclaimer_accept_once() -> int:
+    """Check all agent tmux panes for Bypass disclaimer; send Down then Enter to each. Returns count accepted."""
+    sessions = await _get_agent_session_names()
+    accepted = 0
+    for session_name in sessions:
+        try:
+            output = await _capture_tmux_pane(session_name, lines=120)
+            if not _output_has_bypass_disclaimer(output):
+                continue
+            # Down to select "2. Yes, I accept"; short delay so TUI updates; then Enter
+            out = await _send_tmux_keys_only(session_name, "Down")
+            if out.get("error"):
+                continue
+            await asyncio.sleep(0.25)
+            out = await _send_tmux_keys(session_name, "", delay_after_s=0)
+            if not out.get("error"):
+                accepted += 1
+                log.info("Disclaimer watcher: accepted for %s", session_name)
+                await _send_beacon_after_disclaimer(session_name)
+        except Exception as e:
+            log.debug("Disclaimer watcher: %s for %s: %s", type(e).__name__, session_name, e)
+    return accepted
+
+
+async def _disclaimer_watcher_loop() -> None:
+    """Background loop: check all agent tmux panes and accept Bypass disclaimer every N seconds. First run immediately."""
+    log.info("Disclaimer watcher started (interval %.1fs)", DISCLAIMER_WATCHER_INTERVAL_S)
+    while True:
+        try:
+            n = await _run_disclaimer_accept_once()
+            if n > 0:
+                log.info("Disclaimer watcher: accepted %d agent(s)", n)
+            await asyncio.sleep(DISCLAIMER_WATCHER_INTERVAL_S)
+        except asyncio.CancelledError:
+            log.info("Disclaimer watcher stopped")
+            break
+        except Exception as e:
+            log.debug("Disclaimer watcher tick: %s", e)
+            await asyncio.sleep(DISCLAIMER_WATCHER_INTERVAL_S)
+
+
 async def agents_auto_accept_prompts(request: Request) -> JSONResponse:
     """POST /api/agents/auto-accept-prompts — for each agent: if Bypass disclaimer → Down+Enter; if generic confirm → Enter."""
     try:
-        status = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
-        if status.get("error"):
-            return JSONResponse({"ok": False, "error": status["error"], "accepted": []})
-        agents = status.get("agents") or []
+        sessions = await _get_agent_session_names()
+        # Map session name back to short name for response (session is overstory-overclaw-NAME)
         accepted = []
-        for a in agents:
-            name = a.get("agentName") or a.get("name")
-            if not name:
-                continue
-            session_name = _tmux_session_for_agent(agents, name) or f"overstory-overclaw-{name}"
-            output = await _capture_tmux_pane(session_name, lines=120)
-            # Bypass Permissions disclaimer: option 2 is "Yes, I accept" — send Down then Enter
-            if _output_has_bypass_disclaimer(output):
-                out = await _send_tmux_keys(session_name, "Down", delay_after_s=0)
+        for session_name in sessions:
+            try:
+                output = await _capture_tmux_pane(session_name, lines=120)
+                if _output_has_bypass_disclaimer(output):
+                    out = await _send_tmux_keys_only(session_name, "Down")
+                    if not out.get("error"):
+                        await asyncio.sleep(0.25)
+                        out = await _send_tmux_keys(session_name, "", delay_after_s=0)
+                    if not out.get("error"):
+                        short = session_name.replace("overstory-overclaw-", "") if "overstory-overclaw-" in session_name else session_name
+                        accepted.append(short)
+                        log.info("Auto-accepted Bypass disclaimer for %s", session_name)
+                        await _send_beacon_after_disclaimer(session_name)
+                    continue
+                if not _output_has_confirm_prompt(output):
+                    continue
+                out = await _send_tmux_keys(session_name, "", delay_after_s=0)
                 if not out.get("error"):
-                    out = await _send_tmux_keys(session_name, "", delay_after_s=0)
-                if not out.get("error"):
-                    accepted.append(name)
-                    log.info("Auto-accepted Bypass disclaimer for agent %s", name)
-                continue
-            # Generic confirm (Do you want to ... 1. Yes): send Enter
-            if not _output_has_confirm_prompt(output):
-                continue
-            out = await _send_tmux_keys(session_name, "", delay_after_s=0)
-            if not out.get("error"):
-                accepted.append(name)
-                log.info("Auto-accepted confirm prompt for agent %s", name)
+                    short = session_name.replace("overstory-overclaw-", "") if "overstory-overclaw-" in session_name else session_name
+                    accepted.append(short)
+                    log.info("Auto-accepted confirm prompt for %s", session_name)
+            except Exception:
+                pass
         return JSONResponse({"ok": True, "accepted": accepted})
     except Exception as e:
         log.exception("agents_auto_accept_prompts failed")
@@ -836,41 +958,38 @@ async def agents_auto_accept_prompts(request: Request) -> JSONResponse:
 
 
 async def agents_accept_disclaimer(request: Request) -> JSONResponse:
-    """POST /api/agents/{name}/accept-disclaimer — Down+Enter to select 'Yes, I accept' on Bypass Permissions disclaimer."""
+    """POST /api/agents/{name}/accept-disclaimer — Down then Enter to select 'Yes, I accept' on Bypass Permissions disclaimer."""
     name = request.path_params["name"]
-    status = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
-    agents = status.get("agents") or []
-    session_name = _tmux_session_for_agent(agents, name) or f"overstory-overclaw-{name}"
-    out = await _send_tmux_keys(session_name, "Down", delay_after_s=0)
+    sessions = await _get_agent_session_names()
+    session_name = next((s for s in sessions if s.endswith(name) or s == f"overstory-overclaw-{name}"), f"overstory-overclaw-{name}")
+    out = await _send_tmux_keys_only(session_name, "Down")
     if out.get("error"):
         return JSONResponse({"ok": False, "agent": name, "error": out["error"], "session_used": session_name}, status_code=500)
+    await asyncio.sleep(0.25)
     out = await _send_tmux_keys(session_name, "", delay_after_s=0)
     if out.get("error"):
         return JSONResponse({"ok": False, "agent": name, "error": out["error"], "session_used": session_name}, status_code=500)
-    return JSONResponse({"ok": True, "agent": name, "message": "Sent Down+Enter (Yes, I accept)."})
+    await _send_beacon_after_disclaimer(session_name)
+    return JSONResponse({"ok": True, "agent": name, "message": "Sent Down+Enter (Yes, I accept) and startup beacon."})
 
 
 async def agents_accept_all_disclaimers(request: Request) -> JSONResponse:
-    """POST /api/agents/accept-all-disclaimers — send Down+Enter to every agent (leads and workers) to accept Bypass disclaimer."""
+    """POST /api/agents/accept-all-disclaimers — for each agent: Down to select option 2 (Yes, I accept), then Enter. Requires gateway running (port 18800)."""
     try:
-        status = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
-        if status.get("error"):
-            return JSONResponse({"ok": False, "error": status["error"], "accepted": []})
-        agents = status.get("agents") or []
+        sessions = await _get_agent_session_names()
         accepted = []
-        for a in agents:
-            name = a.get("agentName") or a.get("name")
-            if not name:
-                continue
-            session_name = _tmux_session_for_agent(agents, name) or f"overstory-overclaw-{name}"
-            out = await _send_tmux_keys(session_name, "Down", delay_after_s=0)
+        for session_name in sessions:
+            short = session_name.replace("overstory-overclaw-", "") if "overstory-overclaw-" in session_name else session_name
+            out = await _send_tmux_keys_only(session_name, "Down")
             if out.get("error"):
                 continue
+            await asyncio.sleep(0.25)
             out = await _send_tmux_keys(session_name, "", delay_after_s=0)
             if not out.get("error"):
-                accepted.append(name)
-                log.info("Accept-all disclaimers: sent Down+Enter for %s", name)
-        return JSONResponse({"ok": True, "accepted": accepted, "message": f"Sent Down+Enter to {len(accepted)} agent(s)."})
+                accepted.append(short)
+                log.info("Accept-all disclaimers: sent Down+Enter for %s", session_name)
+                await _send_beacon_after_disclaimer(session_name)
+        return JSONResponse({"ok": True, "accepted": accepted, "message": f"Sent Down+Enter and startup beacon to {len(accepted)} agent(s)."})
     except Exception as e:
         log.exception("accept_all_disclaimers failed")
         return JSONResponse({"ok": False, "error": str(e), "accepted": []})
@@ -924,9 +1043,10 @@ async def agents_restart_with_skip_permissions(request: Request) -> JSONResponse
             else:
                 restarted.append(name)
                 log.info("Restarted %s with --dangerously-skip-permissions", name)
-            # Wait for disclaimer, then Down+Enter to accept, then "continue"
+            # Wait for disclaimer, then select option 2 (Yes, I accept) and Enter, then "continue"
             await asyncio.sleep(2.5)
             await _send_tmux_keys_only(session_name, "Down")
+            await asyncio.sleep(0.25)
             await _send_tmux_keys(session_name, "", delay_after_s=0)
             await asyncio.sleep(0.5)
             await _send_tmux_keys(session_name, "continue", delay_after_s=0)
@@ -1055,11 +1175,20 @@ async def worktrees_clean(request: Request) -> JSONResponse:
 
 async def zombies_list(request: Request) -> JSONResponse:
     """GET /api/zombies — list agents with state=zombie (from overstory status --json)."""
-    result = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
+    try:
+        result = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
+    except Exception as e:
+        log.exception("zombies_list: overstory run failed")
+        return JSONResponse({"error": str(e), "zombies": [], "count": 0}, status_code=500)
     if result.get("error"):
         return JSONResponse({"error": result["error"], "zombies": [], "count": 0})
     agents = result.get("agents") or []
-    zombies = [a for a in agents if (a.get("state") or "").lower() == "zombie"]
+    zombies = []
+    for a in agents:
+        if not isinstance(a, dict):
+            continue
+        if (a.get("state") or "").lower() == "zombie":
+            zombies.append(a)
     return JSONResponse({"zombies": zombies, "count": len(zombies)})
 
 
@@ -1106,9 +1235,154 @@ async def zombies_slay(request: Request) -> JSONResponse:
     })
 
 
+def _mail_db_path() -> Path:
+    return WORKSPACE / ".overstory" / "mail.db"
+
+
+# Serialize mail.db access to avoid "database is locked" (one writer/reader at a time per process).
+_mail_db_lock: asyncio.Lock | None = None
+
+
+def _mail_db_connection(mail_db: Path):
+    """Open mail.db with WAL and longer timeout to reduce locked errors."""
+    conn = sqlite3.connect(str(mail_db), timeout=15)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=15000")
+    return conn
+
+
+async def _with_mail_db_lock():
+    """Get the mail DB lock (created in lifespan). Use around any mail.db access."""
+    global _mail_db_lock
+    if _mail_db_lock is None:
+        _mail_db_lock = asyncio.Lock()
+    return _mail_db_lock
+
+
+def _fetch_unread_mail_to_lead_supervisor() -> list[dict]:
+    """Read mail.db for ALL unread messages to lead/supervisor/approval-supervisor/coordinator.
+    Matches overstory's expected recipients so the Ollama approval supervisor processes the same mail overstory shows."""
+    mail_db = _mail_db_path()
+    if not mail_db.is_file():
+        return []
+    try:
+        conn = _mail_db_connection(mail_db)
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            """SELECT id, from_agent, to_agent, body FROM messages
+               WHERE read = 0 AND (
+                 to_agent = 'lead' OR to_agent = 'supervisor'
+                 OR to_agent = 'approval-supervisor' OR to_agent = 'coordinator'
+                 OR to_agent LIKE 'lead-%' OR to_agent LIKE 'supervisor-%'
+                 OR to_agent LIKE 'approval-supervisor-%' OR to_agent LIKE 'coordinator-%'
+               ) ORDER BY created_at ASC""",
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        log.debug("_fetch_unread_mail_to_lead_supervisor: %s", e)
+        return []
+
+
+def _mark_mail_read(msg_id: int) -> None:
+    """Mark a message as read in mail.db."""
+    mail_db = _mail_db_path()
+    if not mail_db.is_file():
+        return
+    try:
+        conn = _mail_db_connection(mail_db)
+        conn.execute("UPDATE messages SET read = 1 WHERE id = ?", (msg_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.debug("_mark_mail_read: %s", e)
+
+
+async def _ollama_is_approval_request(body: str) -> bool:
+    """Use Ollama to analyze: is this message a worker requesting approval? Returns True if yes, False otherwise. On failure, treat as approval to avoid missing any."""
+    if not (body or "").strip():
+        return False
+    body = (body or "")[:2000]
+    prompt = f"""Is this message a worker or agent requesting that someone approve their action (e.g. "Need approval", "please approve", "requesting approval", "waiting for approval")? Reply with exactly one word: yes or no.
+
+Message:
+{body[:1500]}"""
+    try:
+        result = await _ollama_chat([{"role": "user", "content": prompt}], model=OLLAMA_MODEL)
+        text = (result.get("message") or {}).get("content") or ""
+        return "yes" in text.lower().strip()[:10]
+    except Exception as e:
+        log.debug("Ollama approval check failed, treating as approval request: %s", e)
+        return True
+
+
+APPROVAL_SUPERVISOR_INTERVAL_S = 1.0
+_approval_supervisor_wake: asyncio.Event | None = None  # Set in lifespan so new mail can wake the loop immediately
+
+
+async def _approval_supervisor_once() -> int:
+    """Analyze every unread mail to lead/supervisor with Ollama; if approval request, approve sender. Ensures no approvals are missed."""
+    lock = await _with_mail_db_lock()
+    async with lock:
+        candidates = _fetch_unread_mail_to_lead_supervisor()
+    approved = 0
+    for row in candidates:
+        msg_id = row.get("id")
+        from_agent = (row.get("from_agent") or "").strip()
+        body = (row.get("body") or "")[:2000]
+        if not from_agent:
+            if msg_id:
+                async with lock:
+                    _mark_mail_read(msg_id)
+            continue
+        if not await _ollama_is_approval_request(body):
+            if msg_id:
+                async with lock:
+                    _mark_mail_read(msg_id)
+            continue
+        try:
+            status = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
+            agents = status.get("agents") or []
+            session_name = _tmux_session_for_agent(agents, from_agent) or f"overstory-overclaw-{from_agent}"
+            out = await _send_tmux_keys(session_name, "Down", delay_after_s=0)
+            if out.get("error"):
+                log.debug("Approval supervisor: approve failed for %s: %s", from_agent, out["error"])
+                continue
+            out = await _send_tmux_keys(session_name, "", delay_after_s=0)
+            if out.get("error"):
+                log.debug("Approval supervisor: Enter failed for %s: %s", from_agent, out["error"])
+                continue
+            approved += 1
+            log.info("Approval supervisor (Ollama): approved %s", from_agent)
+        except Exception as e:
+            log.debug("Approval supervisor: %s for %s: %s", type(e).__name__, from_agent, e)
+        if msg_id:
+            async with lock:
+                _mark_mail_read(msg_id)
+    return approved
+
+
+async def _approval_supervisor_loop() -> None:
+    """Always active: on every new mail (wake) or every 1s, analyze all unread mail to lead/supervisor with Ollama and respond to approval requests."""
+    log.info("Approval supervisor (Ollama) started — trigger on every new mail, interval %.1fs", APPROVAL_SUPERVISOR_INTERVAL_S)
+    while True:
+        try:
+            n = await _approval_supervisor_once()
+            if n:
+                log.info("Approval supervisor: approved %d agent(s)", n)
+        except Exception as e:
+            log.debug("Approval supervisor tick: %s", e)
+        try:
+            await asyncio.wait_for(_approval_supervisor_wake.wait(), timeout=APPROVAL_SUPERVISOR_INTERVAL_S)
+            _approval_supervisor_wake.clear()
+        except asyncio.TimeoutError:
+            pass
+
+
 def _write_mail_to_db(from_agent: str, to_agent: str, message: str, priority: str = "normal") -> None:
     """Persist sent mail to workspace .overstory/mail.db so the dashboard shows it (sent and received)."""
-    mail_db = WORKSPACE / ".overstory" / "mail.db"
+    mail_db = _mail_db_path()
     mail_db.parent.mkdir(parents=True, exist_ok=True)
     schema = """
     CREATE TABLE IF NOT EXISTS messages (
@@ -1123,12 +1397,13 @@ def _write_mail_to_db(from_agent: str, to_agent: str, message: str, priority: st
         created_at REAL NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_msg_to ON messages(to_agent);
+    CREATE INDEX IF NOT EXISTS idx_msg_read ON messages(read);
     """
     now = time.time()
     subject = (message.strip().split("\n")[0][:200]) if message.strip() else "No subject"
     body_text = (message or "").strip() or "(no body)"
     try:
-        conn = sqlite3.connect(str(mail_db), timeout=5)
+        conn = _mail_db_connection(mail_db)
         conn.executescript(schema)
         conn.execute(
             "INSERT INTO messages (from_agent, to_agent, subject, body, priority, created_at) VALUES (?,?,?,?,?,?)",
@@ -1141,8 +1416,12 @@ def _write_mail_to_db(from_agent: str, to_agent: str, message: str, priority: st
 
 
 async def _send_mail_to_agent(from_agent: str, to_agent: str, message: str, priority: str = "normal") -> None:
-    """Persist to mail.db and send via overstory (uses --subject and --body)."""
-    _write_mail_to_db(from_agent, to_agent, message, priority)
+    """Persist to mail.db and send via overstory (uses --subject and --body). Wakes approval supervisor so it analyzes and responds immediately."""
+    lock = await _with_mail_db_lock()
+    async with lock:
+        _write_mail_to_db(from_agent, to_agent, message, priority)
+    if _approval_supervisor_wake:
+        _approval_supervisor_wake.set()
     subject = (message.strip().split("\n")[0][:200]) if message.strip() else "No subject"
     body_text = (message or "").strip()[:2000] or "(no body)"
     await _overstory_run([
@@ -1222,6 +1501,16 @@ async def tools_exec(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 # Route: Memory
 # ---------------------------------------------------------------------------
+
+async def debug_approval_supervisor_run(request: Request) -> JSONResponse:
+    """POST /api/debug/approval-supervisor-run — run approval supervisor once (for tests). Returns {approved: n}."""
+    try:
+        n = await _approval_supervisor_once()
+        return JSONResponse({"ok": True, "approved": n})
+    except Exception as e:
+        log.exception("debug_approval_supervisor_run failed")
+        return JSONResponse({"ok": False, "error": str(e), "approved": 0})
+
 
 async def memory_read(request: Request) -> JSONResponse:
     """GET /api/memory?section=... — read MEMORY.md."""
@@ -1312,9 +1601,33 @@ routes = [
     Route("/api/memory", memory_write, methods=["POST"]),
     Route("/api/settings", settings_get, methods=["GET"]),
     Route("/api/settings", settings_put, methods=["POST"]),
+    Route("/api/debug/approval-supervisor-run", debug_approval_supervisor_run, methods=["POST"]),
 ]
 
-app = Starlette(routes=routes)
+@contextlib.asynccontextmanager
+async def lifespan(app: Starlette):
+    """Start background disclaimer watcher and Ollama approval supervisor (always active, trigger on every new mail)."""
+    global _approval_supervisor_wake, _mail_db_lock
+    _approval_supervisor_wake = asyncio.Event()
+    _mail_db_lock = asyncio.Lock()
+    watcher = asyncio.create_task(_disclaimer_watcher_loop())
+    approval_supervisor = asyncio.create_task(_approval_supervisor_loop())
+    try:
+        yield
+    finally:
+        watcher.cancel()
+        approval_supervisor.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+        try:
+            await approval_supervisor
+        except asyncio.CancelledError:
+            pass
+
+
+app = Starlette(routes=routes, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

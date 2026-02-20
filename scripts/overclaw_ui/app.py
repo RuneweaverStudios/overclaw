@@ -155,17 +155,44 @@ CLAUDE_BIN = os.environ.get("CLAUDE_CLI_BIN", "claude")
 
 
 def overstory_status():
-    """Run overstory status and return parsed data for dashboard."""
+    """Run overstory status and return parsed data for dashboard. Retries on database locked."""
+    result = None
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                [OVERSTORY_BIN, "status"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                cwd=str(WORKSPACE),
+            )
+            if result.returncode == 0:
+                break
+            err = (result.stderr or result.stdout or "")
+            last_error = result.stderr or "overstory status failed"
+            if "database is locked" in err.lower() or "locked" in err.lower() or "sqlite" in err.lower():
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                return {
+                    "error": "Agents temporarily unavailable (database busy). Try again in a moment.",
+                    "agents": [],
+                    "raw": "",
+                }
+            return {"error": last_error, "agents": [], "raw": result.stdout}
+        except subprocess.TimeoutExpired:
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            return {"error": "Status timed out. Try again.", "agents": [], "raw": ""}
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            return {"error": str(e), "agents": [], "raw": ""}
+    if not result or result.returncode != 0:
+        return {"error": "overstory status failed", "agents": [], "raw": ""}
     try:
-        result = subprocess.run(
-            [OVERSTORY_BIN, "status"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            cwd=str(WORKSPACE),
-        )
-        if result.returncode != 0:
-            return {"error": result.stderr or "overstory status failed", "agents": [], "raw": result.stdout}
         raw = result.stdout
         agents = []
         mail_count = 0
@@ -212,7 +239,7 @@ def overstory_status():
                     merge_count = int(line.split(":")[1].strip().split()[0])
                 except (IndexError, ValueError):
                     pass
-        
+
         # If no agents from table but we have worktrees, show agents from worktrees (overstory may report "0 active" while worktrees exist)
         if not agents and worktrees:
             seen = set()
@@ -233,7 +260,7 @@ def overstory_status():
                             "duration": "—",
                             "tmux": "○",
                         })
-        
+
         # Calculate average duration
         avg_duration = "0s"
         if agents:
@@ -251,7 +278,7 @@ def overstory_status():
                             seconds += int(part[:-1]) * 60
                         elif part.endswith("s"):
                             seconds += int(part[:-1])
-                    total_seconds += seconds
+                        total_seconds += seconds
                 except (ValueError, AttributeError):
                     pass
             if total_seconds > 0:
@@ -260,7 +287,7 @@ def overstory_status():
                     avg_duration = f"{int(avg_seconds)}s"
                 else:
                     avg_duration = f"{int(avg_seconds // 60)}m {int(avg_seconds % 60)}s"
-        
+
         return {
             "raw": raw,
             "agents": agents,
@@ -280,7 +307,9 @@ def get_mail_items(limit: int = 50) -> List[Dict[str, any]]:
         return mail_items
 
     try:
-        conn = sqlite3.connect(str(MAIL_DB_PATH), timeout=5)
+        conn = sqlite3.connect(str(MAIL_DB_PATH), timeout=15)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=15000")
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
             "SELECT from_agent, to_agent, subject, body, created_at FROM messages "
@@ -328,7 +357,9 @@ def get_mail_unread_count() -> int:
     if not MAIL_DB_PATH.exists():
         return 0
     try:
-        conn = sqlite3.connect(str(MAIL_DB_PATH), timeout=5)
+        conn = sqlite3.connect(str(MAIL_DB_PATH), timeout=15)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=15000")
         n = conn.execute("SELECT COUNT(*) FROM messages WHERE read = 0").fetchone()[0]
         conn.close()
         return n
@@ -490,6 +521,14 @@ def api_mail():
 SKILLS_DIR = WORKSPACE / "skills"
 LAST30DAYS_STORE = _resolve_last30days_store()
 
+# Backend cache for GitHub auth and repos (avoids hitting gh on every dropdown open)
+_GITHUB_AUTH_CACHE: Optional[Dict[str, any]] = None
+_GITHUB_AUTH_CACHE_TIME: float = 0
+_GITHUB_REPOS_CACHE: Optional[List[str]] = None
+_GITHUB_REPOS_CACHE_TIME: float = 0
+GITHUB_AUTH_CACHE_TTL_S = 60
+GITHUB_REPOS_CACHE_TTL_S = 300
+
 
 def get_workspace_info() -> Dict[str, any]:
     """Current project folder, git root, GitHub remote URL, branch (uses effective project folder from settings)."""
@@ -649,11 +688,17 @@ def api_workspace():
     return jsonify(get_workspace_info())
 
 
-def get_github_auth_status() -> Dict[str, any]:
-    """Check gh auth and return user login + avatar if logged in."""
+def get_github_auth_status(force_refresh: bool = False) -> Dict[str, any]:
+    """Check gh auth and return user login + avatar if logged in. Uses backend cache (TTL 60s) unless force_refresh."""
+    global _GITHUB_AUTH_CACHE, _GITHUB_AUTH_CACHE_TIME
+    now = time.time()
+    if not force_refresh and _GITHUB_AUTH_CACHE is not None and (now - _GITHUB_AUTH_CACHE_TIME) < GITHUB_AUTH_CACHE_TTL_S:
+        return _GITHUB_AUTH_CACHE
     out = {"logged_in": False, "login": None, "avatar_url": None, "name": None}
     gh = shutil.which("gh")
     if not gh:
+        _GITHUB_AUTH_CACHE = out
+        _GITHUB_AUTH_CACHE_TIME = now
         return out
     try:
         r = subprocess.run(
@@ -663,6 +708,8 @@ def get_github_auth_status() -> Dict[str, any]:
             timeout=5,
         )
         if r.returncode != 0:
+            _GITHUB_AUTH_CACHE = out
+            _GITHUB_AUTH_CACHE_TIME = now
             return out
         r2 = subprocess.run(
             [gh, "api", "user", "--jq", "{\"login\": .login, \"avatar_url\": .avatar_url, \"name\": .name}"],
@@ -671,6 +718,8 @@ def get_github_auth_status() -> Dict[str, any]:
             timeout=10,
         )
         if r2.returncode != 0 or not r2.stdout.strip():
+            _GITHUB_AUTH_CACHE = out
+            _GITHUB_AUTH_CACHE_TIME = now
             return out
         data = json.loads(r2.stdout)
         out["logged_in"] = True
@@ -679,13 +728,16 @@ def get_github_auth_status() -> Dict[str, any]:
         out["name"] = data.get("name") or out["login"]
     except (json.JSONDecodeError, subprocess.TimeoutExpired, Exception):
         pass
+    _GITHUB_AUTH_CACHE = out
+    _GITHUB_AUTH_CACHE_TIME = now
     return out
 
 
 @app.route("/api/github-auth")
 def api_github_auth():
-    """GET: gh auth status and user info (login, avatar_url) for topbar."""
-    return jsonify(get_github_auth_status())
+    """GET: gh auth status and user info (login, avatar_url) for topbar. ?refresh=1 bypasses cache."""
+    force = request.args.get("refresh") == "1"
+    return jsonify(get_github_auth_status(force_refresh=force))
 
 
 @app.route("/api/github-auth/login", methods=["POST"])
@@ -714,13 +766,18 @@ def api_github_auth_login():
     return jsonify(out)
 
 
-@app.route("/api/github-repos")
-def api_github_repos():
-    """List user's GitHub repos (full_name, clone_url) when gh is logged in. Limit 100."""
-    out = {"repos": []}
+def get_github_repos(force_refresh: bool = False) -> List[str]:
+    """List user's GitHub repos (full_name) when gh is logged in. Limit 100. Uses backend cache (TTL 5min) unless force_refresh."""
+    global _GITHUB_REPOS_CACHE, _GITHUB_REPOS_CACHE_TIME
+    now = time.time()
+    if not force_refresh and _GITHUB_REPOS_CACHE is not None and (now - _GITHUB_REPOS_CACHE_TIME) < GITHUB_REPOS_CACHE_TTL_S:
+        return _GITHUB_REPOS_CACHE
+    repos: List[str] = []
     gh = shutil.which("gh")
     if not gh:
-        return jsonify(out)
+        _GITHUB_REPOS_CACHE = repos
+        _GITHUB_REPOS_CACHE_TIME = now
+        return repos
     try:
         r = subprocess.run(
             [gh, "auth", "status"],
@@ -729,7 +786,9 @@ def api_github_repos():
             timeout=5,
         )
         if r.returncode != 0:
-            return jsonify(out)
+            _GITHUB_REPOS_CACHE = repos
+            _GITHUB_REPOS_CACHE_TIME = now
+            return repos
         r2 = subprocess.run(
             [gh, "api", "user/repos", "--paginate", "--jq", ".[].full_name"],
             capture_output=True,
@@ -737,12 +796,23 @@ def api_github_repos():
             timeout=15,
         )
         if r2.returncode != 0 or not r2.stdout.strip():
-            return jsonify(out)
+            _GITHUB_REPOS_CACHE = repos
+            _GITHUB_REPOS_CACHE_TIME = now
+            return repos
         names = [n.strip() for n in r2.stdout.strip().split("\n") if n.strip()][:100]
-        out["repos"] = names
+        repos = names
     except (subprocess.TimeoutExpired, Exception):
         pass
-    return jsonify(out)
+    _GITHUB_REPOS_CACHE = repos
+    _GITHUB_REPOS_CACHE_TIME = now
+    return repos
+
+
+@app.route("/api/github-repos")
+def api_github_repos():
+    """List user's GitHub repos (full_name). Limit 100. Backend cached 5min. ?refresh=1 bypasses cache."""
+    force = request.args.get("refresh") == "1"
+    return jsonify({"repos": get_github_repos(force_refresh=force)})
 
 
 def _open_project_path(path_val: str) -> Optional[Path]:
@@ -1283,6 +1353,12 @@ def api_zombies():
         with httpx.Client(timeout=10.0) as client:
             r = client.get(f"{GATEWAY_URL.rstrip('/')}/api/zombies")
             return jsonify(r.json()), r.status_code
+    except httpx.ConnectError as e:
+        return jsonify({
+            "error": f"Gateway unreachable at {GATEWAY_URL}. Is it running?",
+            "zombies": [],
+            "count": 0,
+        }), 502
     except Exception as e:
         return jsonify({"error": str(e), "zombies": [], "count": 0}), 500
 
@@ -1459,12 +1535,33 @@ INDEX_HTML = """<!DOCTYPE html>
       background: #21262d;
       border: 1px solid #30363d;
       border-radius: 6px;
-      color: #8b949e;
+      color: #e6edf3;
       font-size: 12px;
       cursor: pointer;
+      max-width: 220px;
     }
     .open-folder-btn:hover { background: #30363d; color: #e6edf3; }
-    .open-folder-btn svg { width: 16px; height: 16px; }
+    .open-folder-btn svg { width: 16px; height: 16px; flex-shrink: 0; }
+    .open-folder-btn .repo-dropdown-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .open-folder-btn .repo-dropdown-chevron { margin-left: 2px; opacity: 0.7; font-size: 10px; }
+    .of-loading { padding: 12px; font-size: 12px; color: #8b949e; text-align: center; }
+    .of-loading::after { content: ''; display: inline-block; width: 14px; height: 14px; margin-left: 8px; vertical-align: middle; border: 2px solid #30363d; border-top-color: #58a6ff; border-radius: 50%; animation: of-spin 0.7s linear infinite; }
+    @keyframes of-spin { to { transform: rotate(360deg); } }
+    .of-signin-btn {
+      display: block;
+      width: 100%;
+      padding: 10px 12px;
+      margin: 4px 0;
+      background: #238636;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      text-align: center;
+    }
+    .of-signin-btn:hover { background: #2ea043; color: #fff; }
     .open-folder-dropdown {
       display: none;
       position: absolute;
@@ -1674,7 +1771,6 @@ INDEX_HTML = """<!DOCTYPE html>
     #leftPanelMail .panel-body { height: 72px; max-height: 72px; overflow: auto; }
     #leftPanelMerge .panel-body { height: 40px; max-height: 40px; overflow: hidden; }
     #leftPanelMetrics .panel-body { height: 40px; max-height: 40px; overflow: hidden; }
-    #leftPanelZombie { flex: 0 0 auto; margin-bottom: 12px; }
     #leftPanelTerminalLog { flex: 0 0 auto; height: 200px; max-height: 200px; margin-bottom: 12px; overflow: hidden; }
     #leftPanelTerminalLog .panel-body { height: 172px; max-height: 172px; overflow: auto; }
     #leftPanelBunLog { flex: 0 0 auto; height: 56px; max-height: 56px; overflow: hidden; }
@@ -1901,12 +1997,15 @@ INDEX_HTML = """<!DOCTYPE html>
       border-top: 1px solid #30363d;
       padding: 4px 12px;
       display: flex;
-      justify-content: space-between;
       align-items: center;
       font-size: 11px;
       color: #8b949e;
       min-height: 24px;
+      gap: 12px;
     }
+    .footer-left { flex-shrink: 0; }
+    .footer-center { flex: 1; display: flex; justify-content: center; align-items: center; min-width: 0; }
+    .footer-right { flex-shrink: 0; display: flex; align-items: center; gap: 12px; margin-left: auto; }
     .footer-tokens {
       display: flex;
       align-items: center;
@@ -1915,9 +2014,29 @@ INDEX_HTML = """<!DOCTYPE html>
     .footer-tokens span { color: #e6edf3; }
     .footer-tokens .token-in { color: #58a6ff; }
     .footer-tokens .token-out { color: #7ee787; }
-    .footer-gateway { margin-right: 12px; }
     .footer-gateway.ok { color: #7ee787; }
     .footer-gateway.not-ok { color: #f85149; }
+    .footer-zombie {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 11px;
+      color: #8b949e;
+    }
+    .footer-zombie .footer-zombie-label { margin-right: 2px; }
+    .footer-zombie .footer-zombie-value { color: #7ee787; font-weight: 600; }
+    .footer-zombie .footer-zombie-detected { color: #f85149; }
+    .footer-zombie .footer-zombie-btn {
+      padding: 2px 8px;
+      font-size: 10px;
+      background: #21262d;
+      color: #f85149;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .footer-zombie .footer-zombie-btn:hover { background: #30363d; color: #ff7b72; }
     .footer-settings-btn {
       background: transparent;
       border: 1px solid #30363d;
@@ -2008,9 +2127,10 @@ INDEX_HTML = """<!DOCTYPE html>
           </div>
         </div>
         <div class="open-folder-wrap">
-          <button type="button" class="open-folder-btn" id="openFolderBtn" title="Open folder or clone repo">
+          <button type="button" class="open-folder-btn" id="openFolderBtn" title="Switch repo or open folder">
             <svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1L5.875 1.5A1.75 1.75 0 004.25 1H1.75z"/></svg>
-            Open Folder
+            <span class="repo-dropdown-label" id="repoDropdownLabel">Open folder or repo</span>
+            <span class="repo-dropdown-chevron">▾</span>
           </button>
           <div id="openFolderDropdown" class="open-folder-dropdown">
             <button type="button" class="of-item" id="openFolderBrowse">Browse folders…</button>
@@ -2097,17 +2217,6 @@ INDEX_HTML = """<!DOCTYPE html>
           <div class="panel-body" id="metricsBody">Total sessions: 0 | Avg duration: 0s</div>
         </div>
       </div>
-      <div id="leftPanelZombie" class="panel zombie-hunter-panel" style="border: 1px solid #30363d; border-radius: 6px; background: linear-gradient(180deg, #1a1f26 0%, #0d1117 100%);">
-        <div class="panel-header" style="color: #7ee787; padding: 6px 10px; font-size: 11px;">🧟 Zombie Hunter</div>
-        <div class="panel-body" style="padding: 6px 10px; font-size: 11px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
-          <span>Slayed: <span id="zombiesSlayedCount" style="color: #7ee787; font-weight: 600;">0</span></span>
-          <span>|</span>
-          <span>Detected: <span id="zombiesDetectedCount" style="color: #f85149; font-weight: 600;">0</span></span>
-          <span>|</span>
-          <span>Next slay: <span id="zombieCountdown" style="color: #58a6ff; font-weight: 600;">5:00</span></span>
-          <button type="button" id="bloodRitualBtn" style="margin-left: auto; padding: 4px 10px; background: #21262d; color: #f85149; border: 1px solid #30363d; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 11px;">Slay</button>
-        </div>
-      </div>
       <div id="leftPanelTerminalLog" class="panel">
         <div class="panel-header">Terminal Log</div>
         <div class="panel-body terminal-output" id="leftTerminalLog" style="overflow: auto; font-size: 11px;">[Loading terminal log...]</div>
@@ -2175,14 +2284,27 @@ INDEX_HTML = """<!DOCTYPE html>
     </div>
   </div>
   <div class="footer" id="footerBar">
-    <div class="footer-tokens" id="footerTokens">
-      <span>Session tokens:</span>
-      <span class="token-in" id="footerTokenIn">0</span> in
-      <span class="token-out" id="footerTokenOut">0</span> out
-      <span id="footerTokenTotal" style="color: #8b949e;">(0 total)</span>
+    <div class="footer-left">
+      <div class="footer-tokens" id="footerTokens">
+        <span>Session tokens:</span>
+        <span class="token-in" id="footerTokenIn">0</span> in
+        <span class="token-out" id="footerTokenOut">0</span> out
+        <span id="footerTokenTotal" style="color: #8b949e;">(0 total)</span>
+      </div>
     </div>
-    <span id="footerGatewayStatus" class="footer-gateway" title="Gateway health">Gateway —</span>
-    <button type="button" class="footer-settings-btn" id="footerSettingsBtn" title="Settings and customization">&#9881; Settings</button>
+    <div class="footer-center">
+      <div id="footerZombie" class="footer-zombie">
+        <span class="footer-zombie-label">🧟</span>
+        <span>Slayed: <span id="zombiesSlayedCount" class="footer-zombie-value">0</span></span>
+        <span>Detected: <span id="zombiesDetectedCount" class="footer-zombie-value footer-zombie-detected">0</span></span>
+        <span>Next: <span id="zombieCountdown" class="footer-zombie-value">5:00</span></span>
+        <button type="button" id="bloodRitualBtn" class="footer-zombie-btn" title="Slay zombie agents">Slay</button>
+      </div>
+    </div>
+    <div class="footer-right">
+      <span id="footerGatewayStatus" class="footer-gateway" title="Gateway health">Gateway —</span>
+      <button type="button" class="footer-settings-btn" id="footerSettingsBtn" title="Settings and customization">&#9881; Settings</button>
+    </div>
   </div>
   <div id="settingsModal" class="settings-modal">
     <div class="settings-panel" style="position: relative;">
@@ -2253,8 +2375,19 @@ INDEX_HTML = """<!DOCTYPE html>
       if (el1) { const s = el1.querySelector('span'); if (s) s.textContent = pathDisplay; el1.title = pathDisplay; }
       if (el2) { const s = el2.querySelector('span'); if (s) s.textContent = pathDisplay; el2.title = pathDisplay; }
     }
+    function repoLabelFromWorkspace(workspaceData) {
+      if (!workspaceData) return 'Open folder or repo';
+      var url = workspaceData.github_url || workspaceData.remote_url || '';
+      if (url && url.indexOf('github.com') !== -1) {
+        var match = url.match(/github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?\/?$/);
+        if (match) return match[1];
+      }
+      return (workspaceData.folder || workspaceData.path || '').split('/').pop() || 'Open folder or repo';
+    }
     function updateGitHubButton(workspaceData, ghData) {
       const btn = document.getElementById('githubBtn');
+      const repoLabelEl = document.getElementById('repoDropdownLabel');
+      if (repoLabelEl) repoLabelEl.textContent = repoLabelFromWorkspace(workspaceData);
       if (workspaceData) {
         updateCurrentPath(workspaceData.path || '');
       }
@@ -2311,7 +2444,7 @@ INDEX_HTML = """<!DOCTYPE html>
       var refreshBtn = document.getElementById('githubLoginRefreshBtn');
       if (refreshBtn) refreshBtn.addEventListener('click', function() {
         modal.classList.remove('visible');
-        loadWorkspace();
+        fetch('/api/github-auth?refresh=1').then(function() { loadWorkspace(); }).catch(function() { loadWorkspace(); });
       });
     }
 
@@ -2346,12 +2479,29 @@ INDEX_HTML = """<!DOCTYPE html>
           e.stopPropagation();
           dropdown.classList.toggle('visible');
           if (dropdown.classList.contains('visible')) {
-            reposList.innerHTML = '';
+            reposHead.style.display = 'block';
+            reposList.innerHTML = '<div class="of-loading">Loading repos</div>';
             fetch('/api/github-auth').then(function(r) { return r.json(); }).then(function(gh) {
-              if (!gh.logged_in) { reposHead.style.display = 'none'; return; }
+              if (!gh.logged_in) {
+                reposHead.style.display = 'none';
+                reposList.innerHTML = '';
+                var signInBtn = document.createElement('button');
+                signInBtn.type = 'button';
+                signInBtn.className = 'of-signin-btn';
+                signInBtn.textContent = 'Sign in with GitHub';
+                signInBtn.title = 'Run gh auth login';
+                signInBtn.addEventListener('click', function() {
+                  dropdown.classList.remove('visible');
+                  var modal = document.getElementById('githubLoginModal');
+                  if (modal) modal.classList.add('visible');
+                });
+                reposList.appendChild(signInBtn);
+                return;
+              }
               reposHead.style.display = 'block';
               fetch('/api/github-repos').then(function(r) { return r.json(); }).then(function(data) {
                 var repos = data.repos || [];
+                reposList.innerHTML = '';
                 repos.forEach(function(fullName) {
                   var el = document.createElement('button');
                   el.type = 'button';
@@ -2365,7 +2515,11 @@ INDEX_HTML = """<!DOCTYPE html>
                   reposList.appendChild(el);
                 });
                 if (repos.length === 0) reposList.innerHTML = '<div class="of-head" style="padding:8px 12px;">No repos</div>';
+              }).catch(function() {
+                reposList.innerHTML = '<div class="of-head" style="padding:8px 12px; color:#f85149;">Failed to load repos</div>';
               });
+            }).catch(function() {
+              reposList.innerHTML = '<div class="of-head" style="padding:8px 12px; color:#f85149;">Failed to load</div>';
             });
           }
         });
@@ -3287,7 +3441,7 @@ INDEX_HTML = """<!DOCTYPE html>
         refreshSessionUsage();
         refreshTick++;
         if (refreshTick % 3 === 0) refreshAgentTerminals();
-        if (refreshTick > 0 && refreshTick % 15 === 0) {
+        if (refreshTick > 0 && refreshTick % 5 === 0) {
           fetch('/api/agents/auto-accept-prompts', { method: 'POST' }).catch(function(){});
         }
       }, REFRESH_INTERVAL);
