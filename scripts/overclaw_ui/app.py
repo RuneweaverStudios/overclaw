@@ -24,9 +24,44 @@ from flask import Flask, Response, jsonify, render_template_string, request
 
 # Paths
 SCRIPT_DIR = Path(__file__).resolve().parent
-# Overstory workspace (root); project folder defaults to this and is changeable in settings
-ROOT_WORKSPACE = Path(os.environ.get("OVERCLAW_WORKSPACE", SCRIPT_DIR.parent.parent))
+
+
+def _resolve_root_workspace() -> Path:
+    """Resolve workspace root: OVERCLAW_WORKSPACE if set and has skills/, else walk up from script to find skills/."""
+    env_ws = os.environ.get("OVERCLAW_WORKSPACE", "").strip()
+    if env_ws:
+        p = Path(env_ws).resolve()
+        if p.is_dir() and (p / "skills").is_dir():
+            return p
+    candidate = SCRIPT_DIR
+    for _ in range(10):
+        skills_dir = candidate / "skills"
+        if skills_dir.is_dir():
+            return candidate
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+    return SCRIPT_DIR.parent.parent  # fallback: parent of scripts
+
+
+ROOT_WORKSPACE = _resolve_root_workspace()
 WORKSPACE = ROOT_WORKSPACE  # kept for compatibility; effective project folder from get_effective_project_folder()
+
+
+def _resolve_last30days_store() -> Path:
+    """Resolve path to last30days store.py by walking up until we find skills/last30days/scripts/store.py."""
+    store_name = Path("skills") / "last30days" / "scripts" / "store.py"
+    candidate = ROOT_WORKSPACE
+    for _ in range(10):
+        p = candidate / store_name
+        if p.is_file():
+            return p
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+    return ROOT_WORKSPACE / store_name  # fallback to default
 OVERSTORY_BIN = os.environ.get("OVERSTORY_BIN", "overstory")
 GATEWAY_URL = os.environ.get("OVERCLAW_GATEWAY_URL", "http://localhost:18800")
 MAIL_DB_PATH = ROOT_WORKSPACE / ".overstory" / "mail.db"
@@ -44,6 +79,8 @@ _DEFAULT_UI_SETTINGS = {
     "default_project_folder": "overstory",  # "overstory" = ROOT_WORKSPACE; or absolute path under root
     "current_project_folder": "",           # "" = use default; or path (must be under ROOT_WORKSPACE)
     "create_project_on_next_prompt": False, # when True, next chat message creates a new folder from prompt
+    "refresh_interval_ms": 1000,            # dashboard poll interval (500, 1000, 2000, 5000)
+    "sidebar_collapsed_default": False,    # start with sidebar collapsed
 }
 
 
@@ -451,7 +488,7 @@ def api_mail():
 # ---------------------------------------------------------------------------
 
 SKILLS_DIR = WORKSPACE / "skills"
-LAST30DAYS_STORE = WORKSPACE / "skills" / "last30days" / "scripts" / "store.py"
+LAST30DAYS_STORE = _resolve_last30days_store()
 
 
 def get_workspace_info() -> Dict[str, any]:
@@ -574,20 +611,35 @@ def get_skills_installed() -> List[Dict[str, any]]:
 def get_skills_trending() -> List[Dict[str, any]]:
     """Trending topics from last30days skill (store.py trending --days 30)."""
     if not LAST30DAYS_STORE.is_file():
+        app.logger.warning("Trending: store script not found at %s", LAST30DAYS_STORE)
         return []
+    # Run from the workspace that contains the store (skills/last30days/scripts/store.py -> 4 levels up)
+    store_workspace = LAST30DAYS_STORE.parent.parent.parent.parent
     try:
         r = subprocess.run(
             [sys.executable, str(LAST30DAYS_STORE), "trending", "--days", "30"],
             capture_output=True,
             text=True,
             timeout=15,
-            cwd=str(WORKSPACE),
+            cwd=str(store_workspace),
         )
         if r.returncode != 0:
+            app.logger.warning(
+                "Trending: store.py exited %s stderr=%s",
+                r.returncode,
+                (r.stderr or "").strip() or r.stdout[:200],
+            )
             return []
         data = json.loads(r.stdout)
         return data.get("trending", [])
-    except Exception:
+    except subprocess.TimeoutExpired:
+        app.logger.warning("Trending: store.py timed out")
+        return []
+    except json.JSONDecodeError as e:
+        app.logger.warning("Trending: store.py invalid JSON %s", e)
+        return []
+    except Exception as e:
+        app.logger.warning("Trending: %s", e)
         return []
 
 
@@ -662,23 +714,161 @@ def api_github_auth_login():
     return jsonify(out)
 
 
+@app.route("/api/github-repos")
+def api_github_repos():
+    """List user's GitHub repos (full_name, clone_url) when gh is logged in. Limit 100."""
+    out = {"repos": []}
+    gh = shutil.which("gh")
+    if not gh:
+        return jsonify(out)
+    try:
+        r = subprocess.run(
+            [gh, "auth", "status"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode != 0:
+            return jsonify(out)
+        r2 = subprocess.run(
+            [gh, "api", "user/repos", "--paginate", "--jq", ".[].full_name"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r2.returncode != 0 or not r2.stdout.strip():
+            return jsonify(out)
+        names = [n.strip() for n in r2.stdout.strip().split("\n") if n.strip()][:100]
+        out["repos"] = names
+    except (subprocess.TimeoutExpired, Exception):
+        pass
+    return jsonify(out)
+
+
+def _open_project_path(path_val: str) -> Optional[Path]:
+    """Resolve path under ROOT_WORKSPACE and set as current project. Returns path or None."""
+    candidate = _path_under_root(path_val)
+    if candidate is None:
+        return None
+    s = _load_ui_settings()
+    s["current_project_folder"] = str(candidate)
+    _save_ui_settings(s)
+    return candidate
+
+
+def _open_project_repo(repo_full_name: str) -> Dict[str, any]:
+    """Ensure repo exists in workspace (clone if not), set as current project. Returns { path, cloned, error? }."""
+    out = {"path": None, "cloned": False}
+    if not repo_full_name or "/" not in repo_full_name:
+        out["error"] = "Invalid repo: use owner/name"
+        return out
+    gh = shutil.which("gh")
+    if not gh:
+        out["error"] = "GitHub CLI (gh) not installed"
+        return out
+    # Prefer folder name = repo name (no owner prefix) so owner/repo -> repo
+    repo_name = repo_full_name.split("/")[-1]
+    target = ROOT_WORKSPACE / repo_name
+    if target.is_dir():
+        # Already exists; set as current
+        s = _load_ui_settings()
+        s["current_project_folder"] = str(target)
+        _save_ui_settings(s)
+        out["path"] = str(target)
+        return out
+    try:
+        subprocess.run(
+            [gh, "repo", "clone", repo_full_name, str(target)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=str(ROOT_WORKSPACE),
+        )
+        if not target.is_dir():
+            out["error"] = "Clone failed or path missing"
+            return out
+        s = _load_ui_settings()
+        s["current_project_folder"] = str(target)
+        _save_ui_settings(s)
+        out["path"] = str(target)
+        out["cloned"] = True
+    except subprocess.TimeoutExpired:
+        out["error"] = "Clone timed out"
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
+@app.route("/api/project/open", methods=["POST"])
+def api_project_open():
+    """Open a folder by path (under workspace) or by repo owner/name (clone if not exists). Then set current project and return path."""
+    data = request.get_json() or {}
+    path_val = (data.get("path") or "").strip()
+    repo = (data.get("repo") or "").strip()
+    if path_val:
+        p = _open_project_path(path_val)
+        if p is None:
+            return jsonify({"error": "Invalid or inaccessible path"}), 400
+        return jsonify({"path": str(p), "cloned": False})
+    if repo:
+        result = _open_project_repo(repo)
+        if result.get("error"):
+            return jsonify(result), 400
+        return jsonify(result)
+    return jsonify({"error": "Provide path or repo"}), 400
+
+
 @app.route("/api/ui-settings", methods=["GET", "POST"])
 def api_ui_settings():
-    """Get or set UI-only settings: default_project_folder, current_project_folder, create_project_on_next_prompt."""
+    """Get or set UI-only settings: default_project_folder, current_project_folder, create_project_on_next_prompt, refresh_interval_ms, sidebar_collapsed_default."""
     if request.method == "GET":
         s = _load_ui_settings()
         s["root_workspace"] = str(ROOT_WORKSPACE)
         return jsonify(s)
     data = request.get_json() or {}
     s = _load_ui_settings()
-    for key in ("default_project_folder", "current_project_folder", "create_project_on_next_prompt"):
+    for key in ("default_project_folder", "current_project_folder", "create_project_on_next_prompt", "refresh_interval_ms", "sidebar_collapsed_default"):
         if key in data:
-            if key == "create_project_on_next_prompt":
+            if key == "create_project_on_next_prompt" or key == "sidebar_collapsed_default":
                 s[key] = bool(data[key])
+            elif key == "refresh_interval_ms":
+                v = data[key]
+                if isinstance(v, int) and v in (500, 1000, 2000, 5000):
+                    s[key] = v
             else:
                 s[key] = data[key] if isinstance(data[key], str) else str(data[key] or "")
     _save_ui_settings(s)
     return jsonify(_load_ui_settings())
+
+
+def _sessions_json_path() -> Optional[Path]:
+    """Path to OpenClaw sessions.json (agent token usage)."""
+    openclaw_home = Path(os.environ.get("OPENCLAW_HOME", str(Path.home() / ".openclaw")))
+    p = openclaw_home / "agents" / "main" / "sessions" / "sessions.json"
+    return p if p.is_file() else None
+
+
+@app.route("/api/session-usage")
+def api_session_usage():
+    """Aggregate input/output token usage from OpenClaw sessions.json (all sessions)."""
+    out = {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0, "sessions": 0}
+    path = _sessions_json_path()
+    if not path:
+        return jsonify(out)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return jsonify(out)
+        for key, session in data.items():
+            if not key.startswith("agent:"):
+                continue
+            out["sessions"] += 1
+            out["inputTokens"] += int(session.get("inputTokens") or 0)
+            out["outputTokens"] += int(session.get("outputTokens") or 0)
+        out["totalTokens"] = out["inputTokens"] + out["outputTokens"]
+    except (json.JSONDecodeError, OSError):
+        pass
+    return jsonify(out)
 
 
 @app.route("/api/file-tree")
@@ -893,6 +1083,46 @@ def api_chat():
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 
+@app.route("/api/message", methods=["POST"])
+def api_message():
+    """Unified entry: proxy to gateway /api/message. Mistral analyzes; direct answer, follow-up questions, or handoff to route (spawn)."""
+    data = request.get_json() or {}
+    message = data.get("message", "").strip()
+    if not message:
+        return jsonify({"error": "message is required"}), 400
+    s = _load_ui_settings()
+    history = data.get("history") or []
+    has_history = bool(history)
+    if not has_history and (s.get("current_project_folder") or "").strip() == "" and (s.get("default_project_folder") or "overstory").strip() == "overstory":
+        s["create_project_on_next_prompt"] = True
+        _save_ui_settings(s)
+    created_path = _ensure_create_project_from_prompt(message)
+    gateway_url = f"{GATEWAY_URL.rstrip('/')}/api/message"
+    try:
+        with httpx.Client(timeout=120.0) as client:
+            r = client.post(
+                gateway_url,
+                json={
+                    "message": message,
+                    "history": history,
+                    "route_to_agents": data.get("route_to_agents", False),
+                    "follow_up_answers": data.get("follow_up_answers"),
+                    "context": data.get("context", {}),
+                },
+            )
+            r.raise_for_status()
+            out = r.json()
+            if created_path is not None:
+                out["created_project"] = created_path.name
+            return jsonify(out)
+    except httpx.ConnectError as e:
+        return jsonify({"error": f"Gateway connection failed: {str(e)}"}), 502
+    except httpx.HTTPStatusError as e:
+        return jsonify({"error": f"Gateway {e.response.status_code}", "detail": (e.response.text or "")[:500]}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/route", methods=["POST"])
 def api_route():
     """Proxy route/spawn to gateway. Gateway expects { task, spawn?, context? }. Creates project from task when no folder selected."""
@@ -933,14 +1163,21 @@ def api_route():
 
 @app.route("/api/agents/<name>/terminal")
 def api_agent_terminal(name):
-    """Proxy to gateway: get agent tmux terminal output."""
+    """Proxy to gateway: get agent tmux terminal output. Always return 200 so frontend can show error in body."""
     try:
         lines = request.args.get("lines", "100")
         with httpx.Client(timeout=10.0) as client:
             r = client.get(f"{GATEWAY_URL.rstrip('/')}/api/agents/{name}/terminal?lines={lines}")
-            return jsonify(r.json()), r.status_code
+            try:
+                body = r.json()
+            except Exception:
+                body = {"output": "", "session": f"overstory-overclaw-{name}", "source": "error", "error": r.text or f"HTTP {r.status_code}"}
+            # Return 200 so UI can render body; put gateway error in body if 5xx
+            if r.status_code >= 400:
+                body["error"] = body.get("error") or f"Gateway returned {r.status_code}"
+            return jsonify(body), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"output": "", "session": f"overstory-overclaw-{name}", "source": "error", "error": str(e)}), 200
 
 
 @app.route("/api/agents/<name>/accept-disclaimer", methods=["POST"])
@@ -1000,6 +1237,23 @@ def api_agents_auto_accept_prompts():
     try:
         with httpx.Client(timeout=25.0) as client:
             r = client.post(f"{GATEWAY_URL.rstrip('/')}/api/agents/auto-accept-prompts")
+            body = r.json() if r.content else {}
+            if r.status_code != 200 and "error" not in body:
+                body["ok"] = False
+                body["error"] = body.get("error") or f"Gateway returned {r.status_code}"
+            return jsonify(body), 200
+    except httpx.ConnectError:
+        return jsonify({"ok": False, "error": "Gateway unreachable", "accepted": []}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "accepted": []}), 200
+
+
+@app.route("/api/agents/accept-all-disclaimers", methods=["POST"])
+def api_agents_accept_all_disclaimers():
+    """Proxy to gateway: send Down+Enter to every agent (leads + workers) to accept Bypass disclaimer."""
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            r = client.post(f"{GATEWAY_URL.rstrip('/')}/api/agents/accept-all-disclaimers")
             body = r.json() if r.content else {}
             if r.status_code != 200 and "error" not in body:
                 body["ok"] = False
@@ -1142,21 +1396,6 @@ INDEX_HTML = """<!DOCTYPE html>
       align-items: center;
       gap: 6px;
     }
-    .repo-dropdown {
-      min-width: 180px;
-      padding: 6px 10px;
-      background: #0d1117;
-      border: 1px solid #30363d;
-      border-radius: 6px;
-      color: #e6edf3;
-      font-size: 12px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .repo-dropdown:hover { border-color: #58a6ff; }
-    .repo-dropdown svg { width: 14px; height: 14px; flex-shrink: 0; }
     .github-btn {
       display: inline-flex;
       align-items: center;
@@ -1211,6 +1450,76 @@ INDEX_HTML = """<!DOCTYPE html>
     .github-login-actions button:hover { background: #2ea043; }
     .github-login-close { position: absolute; top: 12px; right: 12px; background: none; border: none; color: #8b949e; cursor: pointer; font-size: 18px; padding: 0; line-height: 1; }
     .github-login-close:hover { color: #e6edf3; }
+    .open-folder-wrap { position: relative; display: inline-block; }
+    .open-folder-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      background: #21262d;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      color: #8b949e;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .open-folder-btn:hover { background: #30363d; color: #e6edf3; }
+    .open-folder-btn svg { width: 16px; height: 16px; }
+    .open-folder-dropdown {
+      display: none;
+      position: absolute;
+      top: 100%;
+      left: 0;
+      margin-top: 4px;
+      min-width: 220px;
+      max-height: 320px;
+      overflow-y: auto;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+      z-index: 1000;
+    }
+    .open-folder-dropdown.visible { display: block; }
+    .open-folder-dropdown .of-item {
+      display: block;
+      width: 100%;
+      padding: 8px 12px;
+      text-align: left;
+      background: none;
+      border: none;
+      color: #e6edf3;
+      font-size: 12px;
+      cursor: pointer;
+      border-radius: 0;
+    }
+    .open-folder-dropdown .of-item:hover { background: #21262d; }
+    .open-folder-dropdown .of-divider { height: 1px; background: #30363d; margin: 4px 0; }
+    .open-folder-dropdown .of-head { padding: 6px 12px; font-size: 10px; color: #8b949e; text-transform: uppercase; }
+    .browse-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.6);
+      z-index: 9999;
+      align-items: center;
+      justify-content: center;
+    }
+    .browse-modal.visible { display: flex; }
+    .browse-modal-panel {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 16px;
+      width: 90%;
+      max-width: 400px;
+      max-height: 70vh;
+      display: flex;
+      flex-direction: column;
+    }
+    .browse-modal-panel h3 { margin-bottom: 12px; font-size: 14px; color: #e6edf3; }
+    .browse-modal-tree { flex: 1; min-height: 200px; overflow: auto; margin-bottom: 12px; }
+    .browse-modal-tree .tree-item { cursor: pointer; }
     .sidebar {
       width: 260px;
       min-width: 260px;
@@ -1576,18 +1885,111 @@ INDEX_HTML = """<!DOCTYPE html>
     .terminal-input-row { display: flex; gap: 8px; margin-top: 8px; flex-shrink: 0; }
     .terminal-input { flex: 1; padding: 8px 12px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d; border-radius: 4px; font-family: inherit; font-size: 13px; }
     .terminal-input:focus { outline: none; border-color: #58a6ff; }
+    .terminal-current-path {
+      font-size: 11px;
+      color: #8b949e;
+      padding: 4px 0 6px 0;
+      margin: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .terminal-current-path span { color: #58a6ff; }
+    .footer {
+      flex-shrink: 0;
+      background: #161b22;
+      border-top: 1px solid #30363d;
+      padding: 4px 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11px;
+      color: #8b949e;
+      min-height: 24px;
+    }
+    .footer-tokens {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .footer-tokens span { color: #e6edf3; }
+    .footer-tokens .token-in { color: #58a6ff; }
+    .footer-tokens .token-out { color: #7ee787; }
+    .footer-gateway { margin-right: 12px; }
+    .footer-gateway.ok { color: #7ee787; }
+    .footer-gateway.not-ok { color: #f85149; }
+    .footer-settings-btn {
+      background: transparent;
+      border: 1px solid #30363d;
+      color: #8b949e;
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 11px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .footer-settings-btn:hover { background: #21262d; color: #e6edf3; }
+    .settings-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.6);
+      z-index: 9999;
+      align-items: center;
+      justify-content: center;
+    }
+    .settings-modal.visible { display: flex; }
+    .settings-panel {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 20px;
+      max-width: 420px;
+      width: 90%;
+      max-height: 85vh;
+      overflow-y: auto;
+    }
+    .settings-panel h3 { margin-bottom: 16px; font-size: 14px; color: #58a6ff; }
+    .settings-section { margin-bottom: 16px; }
+    .settings-section-title { font-size: 11px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+    .settings-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+    .settings-row label { font-size: 12px; color: #e6edf3; flex: 1; }
+    .settings-row select, .settings-row input[type="number"] {
+      padding: 6px 10px;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      color: #e6edf3;
+      font-size: 12px;
+      min-width: 100px;
+    }
+    .settings-panel .settings-close {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      background: none;
+      border: none;
+      color: #8b949e;
+      cursor: pointer;
+      font-size: 18px;
+      padding: 0;
+      line-height: 1;
+    }
+    .settings-panel .settings-close:hover { color: #e6edf3; }
+    .settings-panel .settings-actions { margin-top: 16px; display: flex; gap: 8px; justify-content: flex-end; }
+    .settings-panel .settings-actions button { padding: 6px 14px; font-size: 12px; }
+    .settings-panel .settings-actions button.secondary { background: #21262d; color: #8b949e; border: 1px solid #30363d; }
+    .settings-panel .settings-actions button.secondary:hover { background: #30363d; color: #e6edf3; }
   </style>
 </head>
 <body>
   <div class="header">
     <div class="header-left">
       <div class="repo-dropdown-wrap">
-        <button type="button" class="repo-dropdown" id="repoDropdown" title="Current project folder">
-          <span id="repoDropdownLabel">—</span>
-          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M4.427 7.427l3.396 3.396a.25.25 0 00.354 0l3.396-3.396A.25.25 0 0011.396 7H4.604a.25.25 0 00-.177.427z"/></svg>
-        </button>
         <span id="githubBtnWrap">
-          <a href="#" id="githubBtn" class="github-btn" target="_blank" rel="noopener" title="GitHub">
+          <a href="javascript:void(0)" id="githubBtn" class="github-btn" rel="noopener" title="GitHub">
             <svg class="github-icon" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
             <span id="githubBtnLabel">GitHub</span>
           </a>
@@ -1605,12 +2007,32 @@ INDEX_HTML = """<!DOCTYPE html>
             </div>
           </div>
         </div>
+        <div class="open-folder-wrap">
+          <button type="button" class="open-folder-btn" id="openFolderBtn" title="Open folder or clone repo">
+            <svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1L5.875 1.5A1.75 1.75 0 004.25 1H1.75z"/></svg>
+            Open Folder
+          </button>
+          <div id="openFolderDropdown" class="open-folder-dropdown">
+            <button type="button" class="of-item" id="openFolderBrowse">Browse folders…</button>
+            <div class="of-divider"></div>
+            <div class="of-head" id="openFolderReposHead">Your repos</div>
+            <div id="openFolderReposList"></div>
+          </div>
+        </div>
+        <div id="browseModal" class="browse-modal">
+          <div class="browse-modal-panel">
+            <h3>Select folder</h3>
+            <div class="browse-modal-tree" id="browseModalTree"><ul id="browseModalTreeRoot"></ul></div>
+            <button type="button" class="secondary" id="browseModalClose" style="align-self:flex-end;">Cancel</button>
+          </div>
+        </div>
       </div>
       <span class="header-title">overstory dashboard v0.2.0</span>
       <span class="header-time" id="currentTime">12:55:31 PM</span>
       <span class="header-refresh">refresh: <span id="refreshInterval">1000ms</span></span>
     </div>
     <div class="header-controls">
+      <button id="acceptAllDisclaimersBtn" title="Send Down+Enter to every agent (leads and workers) to accept Bypass Permissions disclaimer">Accept all disclaimers</button>
       <button id="restartWithSkipPermsBtn" title="Enable skip-permissions, send Ctrl+C twice to all agent tmux, then start claude --dangerously-skip-permissions in each">Restart agents (skip perms)</button>
       <button id="pruneWorktreesBtn" title="Prune completed worktrees (overstory worktree clean --completed)">Prune completed</button>
       <button onclick="refreshNow()" title="Refresh">↻</button>
@@ -1620,19 +2042,6 @@ INDEX_HTML = """<!DOCTYPE html>
     <aside class="sidebar" id="sidebar">
       <button type="button" class="sidebar-toggle" id="sidebarToggle" title="Toggle sidebar">◀</button>
       <div class="sidebar-content">
-        <div class="sidebar-section">
-          <div class="sidebar-section-title">Explorer</div>
-          <div class="file-tree" id="fileTree"><ul id="fileTreeRoot"></ul></div>
-        </div>
-        <div class="sidebar-section">
-          <div class="sidebar-section-title">Skills</div>
-          <div class="skills-browser-tabs">
-            <button type="button" class="skills-tab active" data-tab="installed">Installed</button>
-            <button type="button" class="skills-tab" data-tab="trending">Trending (last 30d)</button>
-          </div>
-          <div id="skillsInstalledList" class="skills-list"></div>
-          <div id="skillsTrendingList" class="skills-list" style="display:none;"></div>
-        </div>
         <div class="sidebar-section">
           <div class="sidebar-section-title">Project</div>
           <div class="project-settings">
@@ -1646,8 +2055,20 @@ INDEX_HTML = """<!DOCTYPE html>
             <div id="customProjectPathWrap" class="project-setting-row" style="display:none;">
               <input type="text" id="customProjectPath" class="project-path-input" placeholder="Path under workspace">
             </div>
-            <button type="button" id="newProjectBtn" class="project-new-btn">New project (from next message)</button>
           </div>
+        </div>
+        <div class="sidebar-section">
+          <div class="sidebar-section-title">Explorer</div>
+          <div class="file-tree" id="fileTree"><ul id="fileTreeRoot"></ul></div>
+        </div>
+        <div class="sidebar-section">
+          <div class="sidebar-section-title">Skills</div>
+          <div class="skills-browser-tabs">
+            <button type="button" class="skills-tab active" data-tab="installed">Installed</button>
+            <button type="button" class="skills-tab" data-tab="trending">Trending (last 30d)</button>
+          </div>
+          <div id="skillsInstalledList" class="skills-list"></div>
+          <div id="skillsTrendingList" class="skills-list" style="display:none;"></div>
         </div>
       </div>
     </aside>
@@ -1710,6 +2131,7 @@ INDEX_HTML = """<!DOCTYPE html>
       <div id="tabChat" class="tab-content active chat-tab-split" style="flex-direction: column; min-height: 0; padding: 0;">
         <div class="chat-top-half" style="flex: 0 0 50%; min-height: 0; display: flex; flex-direction: column; border-bottom: 1px solid #30363d;">
           <div class="panel-header" style="margin: 0; border-radius: 0;">Agent Terminals (live tmux output)</div>
+          <div id="agentTerminalsCurrentPath" class="terminal-current-path" title="Current project path">Path: <span>—</span></div>
           <div id="agentTerminalsList" class="agent-terminals-scroll" style="flex: 1; min-height: 0; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 8px; background: #0d1117;">
             <div style="color: #8b949e; font-size: 12px;">[Loading agents...]</div>
           </div>
@@ -1727,6 +2149,7 @@ INDEX_HTML = """<!DOCTYPE html>
       <div id="tabTerminal" class="tab-content" style="flex-direction: column;">
         <div class="claude-cli-section">
           <div class="claude-cli-header">Integrated terminal — Claude CLI (agents use this)</div>
+          <div id="integratedTerminalCurrentPath" class="terminal-current-path" title="Current project path">Path: <span>—</span></div>
           <label class="route-toggle"><input type="checkbox" id="dangerouslySkipPermissions"> Add <code>--dangerously-skip-permissions</code> (integrated terminal + spawned agents)</label>
           <p class="claude-cli-note">Opening this tab auto-starts Claude CLI below. Type in the input and press Enter to send. Toggle applies on next start (restart page to change).</p>
         </div>
@@ -1751,10 +2174,67 @@ INDEX_HTML = """<!DOCTYPE html>
     </div>
     </div>
   </div>
+  <div class="footer" id="footerBar">
+    <div class="footer-tokens" id="footerTokens">
+      <span>Session tokens:</span>
+      <span class="token-in" id="footerTokenIn">0</span> in
+      <span class="token-out" id="footerTokenOut">0</span> out
+      <span id="footerTokenTotal" style="color: #8b949e;">(0 total)</span>
+    </div>
+    <span id="footerGatewayStatus" class="footer-gateway" title="Gateway health">Gateway —</span>
+    <button type="button" class="footer-settings-btn" id="footerSettingsBtn" title="Settings and customization">&#9881; Settings</button>
+  </div>
+  <div id="settingsModal" class="settings-modal">
+    <div class="settings-panel" style="position: relative;">
+      <button type="button" class="settings-close" id="settingsModalClose" aria-label="Close">&times;</button>
+      <h3>Settings</h3>
+      <div class="settings-section">
+        <div class="settings-section-title">Dashboard</div>
+        <div class="settings-row">
+          <label for="settingRefreshInterval">Refresh interval</label>
+          <select id="settingRefreshInterval">
+            <option value="500">500 ms</option>
+            <option value="1000" selected>1 s</option>
+            <option value="2000">2 s</option>
+            <option value="5000">5 s</option>
+          </select>
+        </div>
+        <div class="settings-row">
+          <label for="settingSidebarCollapsed">Sidebar collapsed by default</label>
+          <input type="checkbox" id="settingSidebarCollapsed">
+        </div>
+      </div>
+      <div class="settings-section">
+        <div class="settings-section-title">Project</div>
+        <div class="settings-row">
+          <label for="settingDefaultFolder">Default project folder</label>
+          <select id="settingDefaultFolder">
+            <option value="overstory">Overstory workspace</option>
+            <option value="__custom__">Custom path…</option>
+          </select>
+        </div>
+        <div class="settings-row" id="settingCustomPathWrap" style="display: none;">
+          <label for="settingCustomPath">Custom path</label>
+          <input type="text" id="settingCustomPath" placeholder="Path under workspace" style="flex: 1;">
+        </div>
+      </div>
+      <div class="settings-section">
+        <div class="settings-section-title">Agent / Terminal</div>
+        <div class="settings-row">
+          <label for="settingSkipPermissions">Dangerously skip permissions (agents + integrated terminal)</label>
+          <input type="checkbox" id="settingSkipPermissions">
+        </div>
+      </div>
+      <div class="settings-actions">
+        <button type="button" class="secondary" id="settingsCancelBtn">Cancel</button>
+        <button type="button" id="settingsSaveBtn">Save</button>
+      </div>
+    </div>
+  </div>
   <script>
     const GATEWAY_URL = {{ gateway_url|tojson }};
     let refreshIntervalId = null;
-    const REFRESH_INTERVAL = 1000; // 1s — frequent updates for agent states
+    let REFRESH_INTERVAL = 1000; // 1s default; overridden from ui-settings
     let zombiesSlayedTotal = 0;
     const ZOMBIE_CHECK_INTERVAL_MS = 300000; // 5 minutes
     let zombieCountdownSeconds = 300; // 5 minutes
@@ -1766,28 +2246,36 @@ INDEX_HTML = """<!DOCTYPE html>
 
     // --- Topbar: repo dropdown + GitHub (icon, login / avatar+username) | Sidebar: file tree + skills ---
     const GITHUB_ICON_SVG = '<svg class="github-icon" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>';
+    function updateCurrentPath(pathStr) {
+      const pathDisplay = pathStr || '—';
+      const el1 = document.getElementById('agentTerminalsCurrentPath');
+      const el2 = document.getElementById('integratedTerminalCurrentPath');
+      if (el1) { const s = el1.querySelector('span'); if (s) s.textContent = pathDisplay; el1.title = pathDisplay; }
+      if (el2) { const s = el2.querySelector('span'); if (s) s.textContent = pathDisplay; el2.title = pathDisplay; }
+    }
     function updateGitHubButton(workspaceData, ghData) {
-      const label = document.getElementById('repoDropdownLabel');
       const btn = document.getElementById('githubBtn');
       if (workspaceData) {
-        label.textContent = workspaceData.folder || '—';
-        document.getElementById('repoDropdown').title = workspaceData.path || 'Current project folder';
+        updateCurrentPath(workspaceData.path || '');
       }
       if (!btn) return;
       const repoUrl = (workspaceData && workspaceData.github_url) || '';
       if (ghData && ghData.logged_in) {
         btn.href = repoUrl || ('https://github.com/' + (ghData.login || ''));
+        btn.setAttribute('target', '_blank');
         btn.classList.add('connected');
         btn.title = repoUrl ? 'Open repo on GitHub' : ('@' + (ghData.login || ''));
         btn.innerHTML = GITHUB_ICON_SVG + (ghData.avatar_url ? '<img class="github-avatar" src="' + ghData.avatar_url + '" alt="">' : '') + '<span class="github-username">' + (ghData.login || 'GitHub') + '</span>';
         btn.onclick = null;
       } else {
-        btn.href = '#';
+        btn.href = 'javascript:void(0)';
+        btn.removeAttribute('target');
         btn.classList.remove('connected');
         btn.title = 'Log in to GitHub';
         btn.innerHTML = GITHUB_ICON_SVG + '<span id="githubBtnLabel">Login</span>';
         btn.onclick = function(e) { e.preventDefault(); document.getElementById('githubLoginModal').classList.add('visible'); };
       }
+      if (!workspaceData) updateCurrentPath('—');
     }
     function loadWorkspace() {
       fetch('/api/workspace').then(r => r.json()).then(workspaceData => {
@@ -1803,6 +2291,10 @@ INDEX_HTML = """<!DOCTYPE html>
       const closeBtn = document.getElementById('githubLoginClose');
       const tmuxBtn = document.getElementById('githubLoginTmuxBtn');
       const copyBtn = document.getElementById('githubLoginCopyBtn');
+      const githubBtn = document.getElementById('githubBtn');
+      if (githubBtn) githubBtn.addEventListener('click', function(e) {
+        if (!this.classList.contains('connected')) { e.preventDefault(); e.stopPropagation(); if (modal) modal.classList.add('visible'); }
+      }, true);
       if (closeBtn) closeBtn.addEventListener('click', function() { modal.classList.remove('visible'); });
       if (modal) modal.addEventListener('click', function(e) { if (e.target === modal) modal.classList.remove('visible'); });
       if (tmuxBtn) tmuxBtn.addEventListener('click', async function() {
@@ -1821,6 +2313,97 @@ INDEX_HTML = """<!DOCTYPE html>
         modal.classList.remove('visible');
         loadWorkspace();
       });
+    }
+
+    // --- Open Folder: dropdown (Browse + GitHub repos), clone if needed, cd terminals ---
+    function cdTerminalTo(path) {
+      if (!path) return;
+      fetch('/api/terminal/input', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ line: 'cd ' + path }) }).catch(function(){});
+    }
+    function openProjectThenRefresh(payload) {
+      fetch('/api/project/open', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+        .then(function(r) { return r.ok ? r.json() : Promise.reject(new Error('Open failed')); })
+        .then(function(data) {
+          if (data.path) {
+            cdTerminalTo(data.path);
+            if (window.refreshProjectUI) window.refreshProjectUI();
+          }
+        })
+        .catch(function(e) { alert(e.message || 'Failed to open project'); });
+    }
+    function initOpenFolder() {
+      var btn = document.getElementById('openFolderBtn');
+      var dropdown = document.getElementById('openFolderDropdown');
+      var browseBtn = document.getElementById('openFolderBrowse');
+      var reposList = document.getElementById('openFolderReposList');
+      var reposHead = document.getElementById('openFolderReposHead');
+      var browseModal = document.getElementById('browseModal');
+      var browseTreeRoot = document.getElementById('browseModalTreeRoot');
+      var browseClose = document.getElementById('browseModalClose');
+
+      if (btn && dropdown) {
+        btn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          dropdown.classList.toggle('visible');
+          if (dropdown.classList.contains('visible')) {
+            reposList.innerHTML = '';
+            fetch('/api/github-auth').then(function(r) { return r.json(); }).then(function(gh) {
+              if (!gh.logged_in) { reposHead.style.display = 'none'; return; }
+              reposHead.style.display = 'block';
+              fetch('/api/github-repos').then(function(r) { return r.json(); }).then(function(data) {
+                var repos = data.repos || [];
+                repos.forEach(function(fullName) {
+                  var el = document.createElement('button');
+                  el.type = 'button';
+                  el.className = 'of-item';
+                  el.textContent = fullName;
+                  el.dataset.repo = fullName;
+                  el.addEventListener('click', function() {
+                    dropdown.classList.remove('visible');
+                    openProjectThenRefresh({ repo: this.dataset.repo });
+                  });
+                  reposList.appendChild(el);
+                });
+                if (repos.length === 0) reposList.innerHTML = '<div class="of-head" style="padding:8px 12px;">No repos</div>';
+              });
+            });
+          }
+        });
+        document.addEventListener('click', function() { dropdown.classList.remove('visible'); });
+      }
+      if (browseBtn) browseBtn.addEventListener('click', function() {
+        dropdown.classList.remove('visible');
+        browseModal.classList.add('visible');
+        fetch('/api/ui-settings').then(function(r) { return r.json(); }).then(function(s) {
+          var root = s.root_workspace || '';
+          fetch('/api/file-tree?root=' + encodeURIComponent(root) + '&depth=5').then(function(r) { return r.json(); }).then(function(nodes) {
+            browseTreeRoot.innerHTML = '';
+            function addNode(node, ul) {
+              var li = document.createElement('li');
+              var isDir = node.type === 'dir';
+              var span = document.createElement('span');
+              span.className = 'tree-item' + (isDir ? ' dir' : '');
+              span.innerHTML = '<span class="tree-arrow"></span>' + (node.name || '');
+              span.dataset.path = node.path || '';
+              if (isDir) {
+                span.addEventListener('click', function(e) {
+                  e.stopPropagation();
+                  openProjectThenRefresh({ path: this.dataset.path });
+                  browseModal.classList.remove('visible');
+                });
+                var subUl = document.createElement('ul');
+                (node.children || []).forEach(function(c) { addNode(c, subUl); });
+                li.appendChild(span);
+                if (subUl.children.length) li.appendChild(subUl);
+              } else li.appendChild(span);
+              ul.appendChild(li);
+            }
+            (nodes || []).forEach(function(n) { addNode(n, browseTreeRoot); });
+          });
+        });
+      });
+      if (browseClose) browseClose.addEventListener('click', function() { browseModal.classList.remove('visible'); });
+      if (browseModal) browseModal.addEventListener('click', function(e) { if (e.target === browseModal) browseModal.classList.remove('visible'); });
     }
     function renderFileTree(nodes, ul) {
       ul.innerHTML = '';
@@ -1850,21 +2433,31 @@ INDEX_HTML = """<!DOCTYPE html>
       });
     }
     function loadFileTree() {
-      fetch('/api/file-tree').then(r => r.json()).then(nodes => {
-        renderFileTree(nodes, document.getElementById('fileTreeRoot'));
-      }).catch(() => {
-        document.getElementById('fileTreeRoot').innerHTML = '<li class="tree-item">Failed to load</li>';
+      const rootEl = document.getElementById('fileTreeRoot');
+      if (!rootEl) return;
+      fetch('/api/file-tree').then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); }).then(nodes => {
+        renderFileTree(nodes || [], rootEl);
+      }).catch(function(err) {
+        rootEl.innerHTML = '<li class="tree-item" style="color:#f85149">Failed to load file tree</li>';
       });
     }
     function loadSkills() {
-      fetch('/api/skills/installed').then(r => r.json()).then(items => {
-        const el = document.getElementById('skillsInstalledList');
-        el.innerHTML = items.length ? items.map(s => '<div class="skill-item"><span class="skill-name">' + (s.name || '') + '</span><br><span style="font-size:10px;color:#6e7681">' + (s.description || '').slice(0, 60) + '</span></div>').join('') : '<div class="skill-item">No skills found</div>';
-      }).catch(() => {});
-      fetch('/api/skills/trending').then(r => r.json()).then(items => {
-        const el = document.getElementById('skillsTrendingList');
-        el.innerHTML = items.length ? items.map(t => '<div class="trending-item"><span class="trending-name">' + (t.name || '') + '</span><br><span style="font-size:10px">' + (t.new_findings || 0) + ' findings</span></div>').join('') : '<div class="trending-item">No trending data (last30days)</div>';
-      }).catch(() => {});
+      const installedEl = document.getElementById('skillsInstalledList');
+      const trendingEl = document.getElementById('skillsTrendingList');
+      if (installedEl) {
+        fetch('/api/skills/installed').then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); }).then(items => {
+          installedEl.innerHTML = items.length ? items.map(s => '<div class="skill-item"><span class="skill-name">' + (s.name || '') + '</span><br><span style="font-size:10px;color:#6e7681">' + (s.description || '').slice(0, 60) + '</span></div>').join('') : '<div class="skill-item">No skills found</div>';
+        }).catch(function() {
+          installedEl.innerHTML = '<div class="skill-item" style="color:#f85149">Failed to load skills</div>';
+        });
+      }
+      if (trendingEl) {
+        fetch('/api/skills/trending').then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); }).then(items => {
+          trendingEl.innerHTML = items.length ? items.map(t => '<div class="trending-item"><span class="trending-name">' + (t.name || '') + '</span><br><span style="font-size:10px">' + (t.new_findings || 0) + ' findings</span></div>').join('') : '<div class="trending-item">No trending data. Add topics in last30days and run research to see trending.</div>';
+        }).catch(function() {
+          trendingEl.innerHTML = '<div class="trending-item" style="color:#a371f7">Could not load trending</div>';
+        });
+      }
     }
     function initSidebar() {
       const sidebar = document.getElementById('sidebar');
@@ -1888,16 +2481,16 @@ INDEX_HTML = """<!DOCTYPE html>
         });
       });
       initGitHubLoginModal();
+      initOpenFolder();
       loadWorkspace();
       loadFileTree();
       loadSkills();
-      window.refreshProjectUI = function() { loadWorkspace(); loadFileTree(); };
+      window.refreshProjectUI = function() { loadWorkspace(); loadFileTree(); loadSkills(); };
       // Project settings: default folder + New project
       (async function initProjectSettings() {
         const sel = document.getElementById('defaultProjectFolder');
         const customWrap = document.getElementById('customProjectPathWrap');
         const customInput = document.getElementById('customProjectPath');
-        const newBtn = document.getElementById('newProjectBtn');
         if (!sel) return;
         try {
           const r = await fetch('/api/ui-settings');
@@ -1918,14 +2511,6 @@ INDEX_HTML = """<!DOCTYPE html>
         });
         customInput.addEventListener('change', function() {
           saveProjectSetting('default_project_folder', this.value.trim() || 'overstory');
-        });
-        newBtn.addEventListener('click', async function() {
-          try {
-            await fetch('/api/ui-settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ create_project_on_next_prompt: true, current_project_folder: '' }) });
-            newBtn.textContent = 'Next message creates folder';
-            loadWorkspace();
-            setTimeout(function() { newBtn.textContent = 'New project (from next message)'; }, 3000);
-          } catch (_) {}
         });
         function saveProjectSetting(key, value) {
           fetch('/api/ui-settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ [key]: value }) }).then(function() { loadWorkspace(); loadFileTree(); }).catch(function(){});
@@ -2061,6 +2646,27 @@ INDEX_HTML = """<!DOCTYPE html>
       const ok = await runPruneCompletedWorktrees(false);
       btn.textContent = ok ? 'Pruned' : 'Error';
       setTimeout(() => { btn.disabled = false; btn.textContent = 'Prune completed'; }, 2000);
+    });
+
+    document.getElementById('acceptAllDisclaimersBtn').addEventListener('click', async function() {
+      const btn = this;
+      btn.disabled = true;
+      btn.textContent = '…';
+      try {
+        const r = await fetch('/api/agents/accept-all-disclaimers', { method: 'POST' });
+        const data = await r.json().catch(function() { return {}; });
+        if (r.ok && data.ok) {
+          btn.textContent = data.accepted && data.accepted.length ? 'Sent to ' + data.accepted.length : 'Done';
+          if (data.accepted && data.accepted.length) refreshAgentTerminals();
+        } else {
+          btn.textContent = 'Error';
+          alert(data.error || 'Failed');
+        }
+      } catch (e) {
+        btn.textContent = 'Error';
+        alert(e.message || 'Failed');
+      }
+      setTimeout(function() { btn.disabled = false; btn.textContent = 'Accept all disclaimers'; }, 2500);
     });
 
     document.getElementById('restartWithSkipPermsBtn').addEventListener('click', async function() {
@@ -2299,6 +2905,49 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }
 
+    // Gateway health (bottom bar)
+    async function refreshGatewayHealth() {
+      const el = document.getElementById('footerGatewayStatus');
+      if (!el) return;
+      try {
+        const r = await fetch('/api/gateway/health', { cache: 'no-store' });
+        const data = await r.json().catch(function() { return { ok: false }; });
+        const ok = r.ok && (data.ok === true || data.status === 'ok');
+        el.textContent = ok ? 'Gateway OK' : 'Gateway NOT OK';
+        el.className = 'footer-gateway ' + (ok ? 'ok' : 'not-ok');
+        el.title = ok ? 'Gateway is reachable' : (data.error || 'Gateway unreachable');
+      } catch (_) {
+        el.textContent = 'Gateway NOT OK';
+        el.className = 'footer-gateway not-ok';
+        el.title = 'Gateway unreachable';
+      }
+    }
+
+    // Session token usage (bottom bar)
+    function formatTokens(n) {
+      if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+      if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+      return String(n);
+    }
+    var lastSessionUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+    async function refreshSessionUsage() {
+      try {
+        const r = await fetch('/api/session-usage');
+        const data = await r.json();
+        const inT = data.inputTokens || 0;
+        const outT = data.outputTokens || 0;
+        const total = data.totalTokens || inT + outT;
+        if (inT === lastSessionUsage.inputTokens && outT === lastSessionUsage.outputTokens) return;
+        lastSessionUsage = { inputTokens: inT, outputTokens: outT, totalTokens: total };
+        const elIn = document.getElementById('footerTokenIn');
+        const elOut = document.getElementById('footerTokenOut');
+        const elTotal = document.getElementById('footerTokenTotal');
+        if (elIn) elIn.textContent = formatTokens(inT);
+        if (elOut) elOut.textContent = formatTokens(outT);
+        if (elTotal) elTotal.textContent = '(' + formatTokens(total) + ' total)';
+      } catch (_) {}
+    }
+
     // Refresh functions
     function refreshNow() {
       refreshDashboard();
@@ -2307,10 +2956,13 @@ INDEX_HTML = """<!DOCTYPE html>
       refreshTerminal();
       refreshAgentTerminals();
       checkZombies();
+      refreshSessionUsage();
+      refreshGatewayHealth();
     }
 
     // Initial zombie check
     checkZombies();
+    refreshGatewayHealth();
 
     // Overstory dashboard polling — update only changed values to avoid jitter
     var lastAgentsSnapshot = '';
@@ -2429,12 +3081,13 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }
 
-    // Chat functionality
+    // Chat functionality (unified /api/message: Mistral analyzes → direct answer / follow-up / handoff)
     const chatHistory = document.getElementById('chatHistory');
     const chatInput = document.getElementById('chatInput');
     const sendBtn = document.getElementById('sendBtn');
     const chatStatus = document.getElementById('chatStatus');
     let chatHistoryList = [];
+    let pendingFollowUp = null;  // { original_message, questions } when need_follow_up returned
 
     function appendChat(role, text, isError) {
       chatHistoryList.push({ role, text, isError });
@@ -2462,21 +3115,38 @@ INDEX_HTML = """<!DOCTYPE html>
     }
 
     async function sendMessage() {
-      const message = chatInput.value.trim();
-      if (!message) return;
       const routeToAgents = document.getElementById('routeToAgents').checked;
+      let message = chatInput.value.trim();
+      let followUpAnswers = null;
+
+      if (pendingFollowUp) {
+        const userReply = message;
+        followUpAnswers = userReply.split(/\\n+/).map(s => s.trim()).filter(Boolean);
+        if (followUpAnswers.length === 0) { sendBtn.disabled = false; return; }
+        message = pendingFollowUp.original_message;
+        pendingFollowUp = null;
+      }
+      if (!message) return;
+
       chatInput.value = '';
-      appendChat('user', message);
+      if (!followUpAnswers) appendChat('user', message);
+      else appendChat('user', 'Follow-up: ' + (followUpAnswers.join('; ')));
       sendBtn.disabled = true;
       chatStatus.textContent = routeToAgents ? 'Routing to agents…' : 'Agent is working…';
       chatStatus.classList.add('thinking');
       showThinking();
+
+      const history = chatHistoryList.filter(m => !m.isError).slice(-20).map(m => ({ role: m.role, content: m.text }));
+
       try {
-        const url = routeToAgents ? '/api/route' : '/api/chat';
-        const body = routeToAgents
-          ? { task: message, spawn: true }
-          : { message, history: chatHistoryList.filter(m => !m.isError).slice(-20).map(m => ({ role: m.role, content: m.text })) };
-        const r = await fetch(url, {
+        const body = {
+          message: message,
+          history: history,
+          route_to_agents: routeToAgents,
+        };
+        if (followUpAnswers && followUpAnswers.length) body.follow_up_answers = followUpAnswers;
+
+        const r = await fetch('/api/message', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body)
@@ -2484,6 +3154,7 @@ INDEX_HTML = """<!DOCTYPE html>
         hideThinking();
         chatStatus.textContent = '';
         chatStatus.classList.remove('thinking');
+
         if (!r.ok) {
           let errorText = `HTTP ${r.status}`;
           try {
@@ -2498,7 +3169,13 @@ INDEX_HTML = """<!DOCTYPE html>
           if (data.created_project && typeof window.refreshProjectUI === 'function') window.refreshProjectUI();
           if (data.error) {
             appendChat('assistant', data.error + (data.detail ? ': ' + data.detail : ''), true);
-          } else if (routeToAgents) {
+          } else if (data.need_follow_up && Array.isArray(data.questions)) {
+            pendingFollowUp = { original_message: data.original_message || message, questions: data.questions };
+            const qText = 'I need a bit more context:\\n' + data.questions.map((q, i) => (i + 1) + '. ' + q).join('\\n') + '\\n\\nReply with your answers (one per line if multiple).';
+            appendChat('assistant', qText);
+          } else if (data.response !== undefined) {
+            appendChat('assistant', data.response);
+          } else if (data.spawned !== undefined || data.capability) {
             const spawned = data.spawned || data.spawn_result;
             const summary = spawned ? 'Task routed; agent spawned.' : (data.capability ? `Routed (${data.capability}).` : 'Routed.');
             appendChat('assistant', summary + (data.message ? ' ' + data.message : '') + (data.spawn_error ? ' Spawn error: ' + data.spawn_error : '') + (data.created_project ? ' Project folder: ' + data.created_project : ''));
@@ -2528,24 +3205,116 @@ INDEX_HTML = """<!DOCTYPE html>
     setupScrollPause(document.getElementById('bunLog'));
     setupScrollPause(document.getElementById('terminalOutput'));
 
-    // Initial refresh
-    refreshNow();
-    
-    // Set up auto-refresh (dashboard 1s; agent terminals every 3s to match Overstory and reduce gateway load)
-    var refreshTick = 0;
-    if (refreshIntervalId) clearInterval(refreshIntervalId);
-    refreshIntervalId = setInterval(function() {
-      refreshDashboard();
-      refreshMail();
-      refreshBunLog();
-      refreshTerminal();
-      refreshTick++;
-      if (refreshTick % 3 === 0) refreshAgentTerminals();
-      // Auto-accept confirm prompts for all agents (Do you want to ... 1. Yes) every 15s
-      if (refreshTick > 0 && refreshTick % 15 === 0) {
-        fetch('/api/agents/auto-accept-prompts', { method: 'POST' }).catch(function(){});
+    // Settings modal: open/close, load, save
+    (function initSettingsModal() {
+      const modal = document.getElementById('settingsModal');
+      const closeBtn = document.getElementById('settingsModalClose');
+      const cancelBtn = document.getElementById('settingsCancelBtn');
+      const saveBtn = document.getElementById('settingsSaveBtn');
+      const footerSettingsBtn = document.getElementById('footerSettingsBtn');
+      const refreshSelect = document.getElementById('settingRefreshInterval');
+      const sidebarCollapsedCb = document.getElementById('settingSidebarCollapsed');
+      const defaultFolderSel = document.getElementById('settingDefaultFolder');
+      const customPathWrap = document.getElementById('settingCustomPathWrap');
+      const customPathInput = document.getElementById('settingCustomPath');
+      const skipPermsCb = document.getElementById('settingSkipPermissions');
+
+      function openModal() {
+        modal.classList.add('visible');
+        loadSettingsIntoForm();
       }
-    }, REFRESH_INTERVAL);
+      function closeModal() { modal.classList.remove('visible'); }
+
+      async function loadSettingsIntoForm() {
+        try {
+          const [uiR, gwR] = await Promise.all([fetch('/api/ui-settings'), fetch('/api/settings')]);
+          const ui = await uiR.json();
+          const gw = await gwR.json().catch(function() { return {}; });
+          REFRESH_INTERVAL = parseInt(ui.refresh_interval_ms, 10) || 1000;
+          if (refreshSelect) {
+            refreshSelect.value = String(REFRESH_INTERVAL);
+            if (![500, 1000, 2000, 5000].includes(REFRESH_INTERVAL)) refreshSelect.value = '1000';
+          }
+          if (sidebarCollapsedCb) sidebarCollapsedCb.checked = !!ui.sidebar_collapsed_default;
+          if (defaultFolderSel) {
+            const def = (ui.default_project_folder || 'overstory').trim();
+            defaultFolderSel.value = def && def !== 'overstory' ? '__custom__' : 'overstory';
+            customPathWrap.style.display = defaultFolderSel.value === '__custom__' ? 'block' : 'none';
+            if (customPathInput) customPathInput.value = def !== 'overstory' ? def : '';
+          }
+          if (skipPermsCb) skipPermsCb.checked = !!gw.dangerously_skip_permissions;
+        } catch (_) {}
+      }
+
+      async function saveSettings() {
+        try {
+          const payload = {
+            refresh_interval_ms: parseInt(refreshSelect.value, 10) || 1000,
+            sidebar_collapsed_default: !!sidebarCollapsedCb.checked,
+            default_project_folder: defaultFolderSel.value === '__custom__' ? (customPathInput.value || '').trim() || 'overstory' : 'overstory'
+          };
+          await fetch('/api/ui-settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+          await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dangerously_skip_permissions: !!skipPermsCb.checked }) });
+          REFRESH_INTERVAL = payload.refresh_interval_ms;
+          localStorage.setItem('overclaw_sidebar_collapsed', payload.sidebar_collapsed_default ? '1' : '0');
+          var refEl = document.getElementById('refreshInterval');
+          if (refEl) refEl.textContent = REFRESH_INTERVAL + 'ms';
+          if (refreshIntervalId) clearInterval(refreshIntervalId);
+          startRefreshLoop();
+          if (typeof window.refreshProjectUI === 'function') window.refreshProjectUI();
+        } catch (e) { alert('Save failed: ' + (e.message || 'Unknown error')); }
+        closeModal();
+      }
+
+      if (footerSettingsBtn) footerSettingsBtn.addEventListener('click', openModal);
+      if (closeBtn) closeBtn.addEventListener('click', closeModal);
+      if (cancelBtn) cancelBtn.addEventListener('click', closeModal);
+      if (saveBtn) saveBtn.addEventListener('click', saveSettings);
+      if (modal) modal.addEventListener('click', function(e) { if (e.target === modal) closeModal(); });
+      if (defaultFolderSel) defaultFolderSel.addEventListener('change', function() {
+        customPathWrap.style.display = this.value === '__custom__' ? 'block' : 'none';
+      });
+    })();
+
+    function startRefreshLoop() {
+      var refreshTick = 0;
+      if (refreshIntervalId) clearInterval(refreshIntervalId);
+      refreshIntervalId = setInterval(function() {
+        refreshDashboard();
+        refreshMail();
+        refreshBunLog();
+        refreshTerminal();
+        refreshSessionUsage();
+        refreshTick++;
+        if (refreshTick % 3 === 0) refreshAgentTerminals();
+        if (refreshTick > 0 && refreshTick % 15 === 0) {
+          fetch('/api/agents/auto-accept-prompts', { method: 'POST' }).catch(function(){});
+        }
+      }, REFRESH_INTERVAL);
+    }
+
+    // Initial load: ui-settings for refresh interval and sidebar default, then refresh and start loop
+    (async function initRefreshAndSidebar() {
+      try {
+        const r = await fetch('/api/ui-settings');
+        const s = await r.json();
+        REFRESH_INTERVAL = parseInt(s.refresh_interval_ms, 10) || 1000;
+        var refEl = document.getElementById('refreshInterval');
+        if (refEl) refEl.textContent = REFRESH_INTERVAL + 'ms';
+        if (localStorage.getItem('overclaw_sidebar_collapsed') === null && s.sidebar_collapsed_default) {
+          localStorage.setItem('overclaw_sidebar_collapsed', '1');
+          var sidebar = document.getElementById('sidebar');
+          var toggle = document.getElementById('sidebarToggle');
+          if (sidebar && toggle) {
+            sidebar.classList.add('collapsed');
+            toggle.textContent = '\u25B6';
+            toggle.title = 'Show sidebar';
+          }
+        }
+      } catch (_) {}
+      refreshNow();
+      startRefreshLoop();
+    })();
   </script>
 </body>
 </html>

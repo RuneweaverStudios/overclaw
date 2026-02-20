@@ -17,6 +17,7 @@ set -euo pipefail
 # Resolve paths relative to this script (portable — works on any machine)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE="$(cd "$SCRIPT_DIR/.." && pwd)"
+export OVERCLAW_WORKSPACE="$WORKSPACE"
 NANOBOT_VENV="${NANOBOT_VENV:-$HOME/.nanobot-venv}"
 # Also check overclaw-venv (from install.sh)
 if [ ! -d "$NANOBOT_VENV" ] && [ -d "$HOME/.overclaw-venv" ]; then
@@ -166,6 +167,12 @@ start_all() {
         ok "OverClaw Gateway already running"
     else
         source "$NANOBOT_VENV/bin/activate"
+        # Resolve real Claude Code binary before prepending wrapper to PATH (so overstory agents get a PTY and stay running)
+        CLAUDE_CODE_BIN="${CLAUDE_CODE_BIN:-$(command -v claude 2>/dev/null || echo "/opt/homebrew/bin/claude")}"
+        export CLAUDE_CODE_BIN
+        export PATH="$WORKSPACE/.overstory/bin:$PATH"
+        unset CI
+        export TERM="${TERM:-xterm-256color}"
         python3 "$GATEWAY_SCRIPT" > "$LOG_DIR/overclaw-gateway.log" 2>&1 &
         local gw_pid=$!
         echo "$gw_pid" > "$LOG_DIR/overclaw-gateway.pid"

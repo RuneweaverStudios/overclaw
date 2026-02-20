@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import logging
 import os
 import subprocess
@@ -40,6 +41,7 @@ from starlette.routing import Route
 _SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE = Path(os.environ.get("OVERCLAW_WORKSPACE", str(_SCRIPT_DIR.parent)))
 SKILLS_DIR = WORKSPACE / "skills"
+SETTINGS_DANGEROUSLY_SKIP_FILE = WORKSPACE / ".overstory" / "dangerously-skip-permissions"
 OVERSTORY_BIN = os.environ.get("OVERSTORY_BIN", os.path.expanduser("~/.bun/bin/overstory"))
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "mistral:latest")
@@ -92,12 +94,13 @@ async def _run_command(cmd: list[str], timeout: int = 30, cwd: Path | None = Non
         return {"returncode": -1, "error": f"Command timed out after {timeout}s"}
 
 
-async def _overstory_run(args: list[str], timeout: int = 60) -> dict:
+async def _overstory_run(args: list[str], timeout: int = 60, cwd: Path | None = None) -> dict:
     """Run an overstory CLI command asynchronously."""
     proc = await asyncio.create_subprocess_exec(
         OVERSTORY_BIN, *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        cwd=str(cwd) if cwd else None,
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -112,6 +115,202 @@ async def _overstory_run(args: list[str], timeout: int = 60) -> dict:
         return json.loads(out)
     except json.JSONDecodeError:
         return {"raw": out}
+
+
+async def _create_bead_and_spec(task: str, task_id: str | None = None) -> dict:
+    """Create Bead task (if enabled) and spec file. Returns task_id, sling_task_id, spec_path, bead_created."""
+    task_id = task_id or f"oc-{uuid.uuid4().hex[:8]}"
+    spec_dir = WORKSPACE / ".overstory" / "specs"
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    spec_path = spec_dir / f"{task_id}.md"
+    spec_path.write_text(f"# Task: {task}\n\n{task}\n")
+    bead_created = False
+    sling_task_id = task_id
+    bead_id = None
+
+    bd_bin = None
+    try:
+        bd_check = await _run_command(["which", "bd"], timeout=2, cwd=WORKSPACE)
+        if bd_check.get("returncode") == 0 and bd_check.get("stdout", "").strip():
+            bd_bin = bd_check.get("stdout", "").strip()
+        if not bd_bin:
+            for path in ("/opt/homebrew/bin/bd", "/usr/local/bin/bd"):
+                if Path(path).exists():
+                    bd_bin = path
+                    break
+    except Exception:
+        pass
+    bd_available = bd_bin is not None
+    beads_enabled = False
+    try:
+        if yaml:
+            config_path = WORKSPACE / ".overstory" / "config.yaml"
+            if config_path.exists():
+                with open(config_path) as f:
+                    config = yaml.safe_load(f)
+                    beads_enabled = config.get("beads", {}).get("enabled", False)
+    except Exception:
+        pass
+    if beads_enabled and bd_available:
+        try:
+            bd_create_result = await _run_command([
+                str(bd_bin), "create", task,
+                "--priority", "1",
+                "--type", "task",
+                "--json",
+            ], timeout=10, cwd=WORKSPACE)
+            if bd_create_result.get("returncode") == 0:
+                bd_output = bd_create_result.get("stdout", "").strip()
+                # bd may print a warning before the JSON; extract first {...} object
+                start = bd_output.find("{")
+                if start >= 0:
+                    depth = 0
+                    end = -1
+                    for i in range(start, len(bd_output)):
+                        if bd_output[i] == "{":
+                            depth += 1
+                        elif bd_output[i] == "}":
+                            depth -= 1
+                            if depth == 0:
+                                end = i + 1
+                                break
+                    if end > start:
+                        try:
+                            bd_json = json.loads(bd_output[start:end])
+                            bead_id = bd_json.get("id")
+                            if bead_id:
+                                bead_created = True
+                                sling_task_id = bead_id
+                                log.info("Created Bead task %s via bd CLI", bead_id)
+                        except (json.JSONDecodeError, KeyError):
+                            pass
+                if not bead_created and bd_output:
+                    log.warning("Bead create produced no id. stderr: %s", bd_create_result.get("stderr", "")[:200])
+        except Exception as exc:
+            log.warning("Bead create failed: %s", exc)
+
+    return {
+        "task_id": task_id,
+        "sling_task_id": sling_task_id,
+        "spec_path": spec_path,
+        "bead_created": bead_created,
+        "bead_id": bead_id,
+    }
+
+
+def _tmux_session_from_sling_result(sling_result: dict) -> str | None:
+    """Extract tmux session name from sling result (JSON or raw text)."""
+    if sling_result.get("tmuxSession"):
+        return sling_result["tmuxSession"]
+    raw = sling_result.get("raw") or ""
+    # "Tmux: overstory-overclaw-lead-xxx" or "Tmux: overstory-overclaw-builder-xxx"
+    for line in raw.split("\n"):
+        line = line.strip()
+        if line.startswith("Tmux:") or "Tmux:" in line:
+            parts = line.split("Tmux:", 1)
+            if len(parts) == 2:
+                return parts[1].strip()
+    return None
+
+
+def _build_beacon(agent_name: str, capability: str, task_id: str, parent: str | None = None, depth: int = 0) -> str:
+    """Build Overstory-style startup beacon (single line). Sent after disclaimer so the agent receives the task."""
+    ts = datetime.now(timezone.utc).isoformat()
+    parent_str = parent or "none"
+    parts = [
+        f"[OVERSTORY] {agent_name} ({capability}) {ts} task:{task_id}",
+        f"Depth: {depth} | Parent: {parent_str}",
+        f"Startup: read .claude/CLAUDE.md, run mulch prime, check mail (overstory mail check --agent {agent_name}), then begin task {task_id}",
+    ]
+    return " — ".join(parts)
+
+
+async def _send_tmux_keys(session_name: str, keys: str, delay_after_s: float = 0.5) -> dict:
+    """Send keys to a tmux session (e.g. to accept Claude disclaimer). Appends Enter."""
+    proc = await asyncio.create_subprocess_exec(
+        "tmux", "send-keys", "-t", session_name, keys, "Enter",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(WORKSPACE),
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return {"error": "tmux send-keys timed out"}
+    err = (stderr or b"").decode().strip() if stderr else ""
+    if proc.returncode != 0:
+        return {"error": err or f"tmux send-keys exited {proc.returncode}"}
+    if delay_after_s > 0:
+        await asyncio.sleep(delay_after_s)
+    return {"ok": True}
+
+
+async def _send_tmux_keys_only(session_name: str, *keys: str) -> dict:
+    """Send key(s) to tmux without appending Enter (e.g. C-c for Ctrl+C)."""
+    if not keys:
+        return {"ok": True}
+    proc = await asyncio.create_subprocess_exec(
+        "tmux", "send-keys", "-t", session_name, *keys,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(WORKSPACE),
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return {"error": "tmux send-keys timed out"}
+    err = (stderr or b"").decode().strip() if stderr else ""
+    if proc.returncode != 0:
+        return {"error": err or f"tmux send-keys exited {proc.returncode}"}
+    return {"ok": True}
+
+
+async def _sling_agent(
+    sling_task_id: str,
+    capability: str,
+    name: str,
+    spec_path: Path,
+    parent: str | None = None,
+    force: bool = False,
+    timeout: int = 120,
+) -> dict:
+    """Run overstory sling with the given params. Uses --spec so overstory does not require Bead."""
+    args = [
+        "sling", sling_task_id,
+        "--capability", capability,
+        "--name", name,
+        "--json",
+    ]
+    if parent:
+        args.extend(["--parent", parent])
+    if force:
+        args.append("--force-hierarchy")
+    if spec_path.exists():
+        try:
+            spec_arg = str(spec_path.relative_to(WORKSPACE))
+        except ValueError:
+            spec_arg = str(spec_path)
+        args.extend(["--spec", spec_arg])
+    result = await _overstory_run(args, timeout=timeout, cwd=WORKSPACE)
+    if result.get("error"):
+        return result
+    # Overstory sends its beacon at 3s while the agent is still on the disclaimer, so it's lost.
+    # We accept the disclaimer first, then send the beacon ourselves so the agent gets the task.
+    session_name = _tmux_session_from_sling_result(result)
+    if session_name:
+        await asyncio.sleep(2)  # Let disclaimer appear
+        await _send_tmux_keys(session_name, "Down", delay_after_s=0)
+        await _send_tmux_keys(session_name, "", delay_after_s=0)
+        await asyncio.sleep(1)  # Let TUI be ready for the beacon
+        task_id = result.get("taskId") or result.get("beadId") or sling_task_id
+        agent_name = result.get("agentName") or name
+        cap = result.get("capability") or capability
+        beacon = _build_beacon(agent_name, cap, task_id, parent=parent, depth=0)
+        await _send_tmux_keys(session_name, beacon, delay_after_s=0)
+        await _send_tmux_keys(session_name, "", delay_after_s=0)  # Submit the beacon
+    return result
 
 
 def _discover_skills() -> list[dict]:
@@ -242,6 +441,233 @@ async def chat(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Mistral analyzer: can complete? direct answer / follow-up questions / handoff
+# ---------------------------------------------------------------------------
+
+_ANALYZER_SYSTEM = """You are a task analyzer. For the user's message you must decide:
+1. Can you complete the task yourself? (simple Q&A, greetings, factual one-shot answers, no code execution, no multi-step specialist work like research/code/build/campaigns)
+2. If yes: reply with a single JSON object only, no other text: {"can_complete": true, "direct_answer": "your full reply here", "follow_up_questions": null, "articulated_task": null, "handoff_xml": null}
+3. If no: you need to hand off to specialist agents. Either ask for more context (max 2 questions) OR produce the handoff.
+   - If you need more context: {"can_complete": false, "direct_answer": null, "follow_up_questions": ["question 1?", "question 2?"], "articulated_task": null, "handoff_xml": null}
+   - If you have enough context (or follow_up_answers were provided): set articulated_task (one clear sentence for the specialist) and handoff_xml (robust XML for the orchestrator). Example:
+     {"can_complete": false, "direct_answer": null, "follow_up_questions": null, "articulated_task": "Research recent AI trends and summarize in 3 bullets", "handoff_xml": "<handoff><intent>research</intent><task>Research recent AI trends and summarize in 3 bullets</task><context>User asked for AI trends summary.</context></handoff>"}
+Output only one valid JSON object, no markdown, no explanation."""
+
+_ARTICULATE_SYSTEM = """You have the user's original request and their follow-up answers. Produce a single JSON object only:
+{"articulated_task": "one clear sentence for the specialist agent", "handoff_xml": "<handoff><intent>...</intent><task>...</task><context>...</context></handoff>"}
+The articulated_task should be the exact task to send to the orchestrator. The handoff_xml should be robust XML with intent, task, and context. Output only that JSON, no other text."""
+
+
+def _extract_json_from_response(text: str) -> dict:
+    """Extract a JSON object from Ollama response (may be wrapped in markdown or have trailing text)."""
+    text = (text or "").strip()
+    # Try raw parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Strip markdown code block
+    if "```" in text:
+        start = text.find("```")
+        if "json" in text[:start + 10].lower():
+            start = text.find("\n", start) + 1
+        else:
+            start = start + 3
+        end = text.find("```", start)
+        if end != -1:
+            text = text[start:end]
+    # Find first { and last }
+    i = text.find("{")
+    j = text.rfind("}")
+    if i != -1 and j != -1 and j > i:
+        try:
+            return json.loads(text[i : j + 1])
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+async def _ollama_analyze(
+    message: str,
+    history: list[dict],
+    follow_up_answers: list[str] | None = None,
+) -> dict:
+    """Call Ollama to analyze the task. Returns dict with can_complete, direct_answer, follow_up_questions, articulated_task, handoff_xml."""
+    messages: list[dict] = [{"role": "system", "content": _ANALYZER_SYSTEM}]
+    for h in history[-10:]:
+        messages.append({"role": h.get("role", "user"), "content": h.get("content", "")})
+    user_content = message
+    if follow_up_answers:
+        user_content += "\n\n[Follow-up answers from user]\n" + "\n".join(f"- " + a for a in follow_up_answers)
+    messages.append({"role": "user", "content": user_content})
+
+    result = await _ollama_chat(messages)
+    raw = (result.get("message") or {}).get("content", "")
+    out = _extract_json_from_response(raw)
+    return {
+        "can_complete": bool(out.get("can_complete")),
+        "direct_answer": out.get("direct_answer"),
+        "follow_up_questions": out.get("follow_up_questions") if isinstance(out.get("follow_up_questions"), list) else None,
+        "articulated_task": out.get("articulated_task"),
+        "handoff_xml": out.get("handoff_xml"),
+    }
+
+
+async def _ollama_articulate(message: str, follow_up_answers: list[str]) -> dict:
+    """Build articulated_task and handoff_xml from original message + follow-up answers."""
+    messages = [
+        {"role": "system", "content": _ARTICULATE_SYSTEM},
+        {"role": "user", "content": f"Original request: {message}\n\nFollow-up answers:\n" + "\n".join(f"- {a}" for a in follow_up_answers)},
+    ]
+    result = await _ollama_chat(messages)
+    raw = (result.get("message") or {}).get("content", "")
+    return _extract_json_from_response(raw)
+
+
+# ---------------------------------------------------------------------------
+# Route: Message (analyze → direct answer / follow-up / handoff to route)
+# ---------------------------------------------------------------------------
+
+async def message(request: Request) -> JSONResponse:
+    """Single entry: Ollama analyzes task. If it can complete, answer directly. If not and route_to_agents: ask up to 2 follow-ups, then articulate and hand off to route (spawn).
+    
+    POST /api/message
+    {
+      "message": "user text",
+      "history": [{"role":"user"|"assistant","content":"..."}],
+      "route_to_agents": true,
+      "follow_up_answers": ["ans1", "ans2"]  // optional, when returning from need_follow_up
+    }
+    """
+    body = await request.json()
+    user_message = (body.get("message") or "").strip()
+    if not user_message:
+        return JSONResponse({"error": "message is required"}, status_code=400)
+
+    route_to_agents = body.get("route_to_agents", False)
+    history = body.get("history") or []
+    follow_up_answers = body.get("follow_up_answers")
+    if follow_up_answers is not None and not isinstance(follow_up_answers, list):
+        follow_up_answers = [str(follow_up_answers)] if follow_up_answers else None
+
+    try:
+        analysis = await _ollama_analyze(user_message, history, follow_up_answers)
+    except httpx.HTTPStatusError as exc:
+        return JSONResponse({"error": f"Ollama error: {exc.response.status_code}"}, status_code=502)
+    except Exception as exc:
+        log.exception("Analyzer failed")
+        return JSONResponse({"error": f"Analyzer failed: {exc}"}, status_code=500)
+
+    can_complete = analysis.get("can_complete")
+    direct_answer = analysis.get("direct_answer")
+    follow_up_questions = analysis.get("follow_up_questions")
+    articulated_task = analysis.get("articulated_task")
+    handoff_xml = analysis.get("handoff_xml")
+
+    # Mistral can complete → return direct answer (respects route_to_agents: user may still have wanted to route, but we answer directly)
+    if can_complete and direct_answer:
+        return JSONResponse({
+            "response": direct_answer,
+            "model": OLLAMA_MODEL,
+            "source": "ollama_direct",
+        })
+
+    # Cannot complete and Route to agents is OFF → Ollama replies directly with best effort or suggestion
+    if not route_to_agents:
+        fallback = direct_answer or "This needs specialist agents (research, code, build, etc.). Turn on \"Route to agents\" to hand off to the orchestrator."
+        return JSONResponse({
+            "response": fallback,
+            "model": OLLAMA_MODEL,
+            "source": "ollama_fallback",
+        })
+
+    # Route to agents ON, cannot complete: need follow-up or handoff
+    if follow_up_questions and not follow_up_answers:
+        # Cap at 2 questions
+        questions = follow_up_questions[:2]
+        return JSONResponse({
+            "need_follow_up": True,
+            "questions": questions,
+            "original_message": user_message,
+        })
+
+    # Build articulated task if we have follow-up answers and analysis didn't provide it
+    if follow_up_answers and (not articulated_task or not handoff_xml):
+        articulate = await _ollama_articulate(user_message, follow_up_answers)
+        articulated_task = articulated_task or articulate.get("articulated_task") or user_message
+        handoff_xml = handoff_xml or articulate.get("handoff_xml") or ""
+
+    task_for_route = (articulated_task or user_message).strip()
+    context = body.get("context") or {}
+    if handoff_xml:
+        context["handoff_xml"] = handoff_xml
+
+    try:
+        result = await _do_route_task(task_for_route, spawn=True, context=context)
+        return JSONResponse(result)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+async def _do_route_task(task: str, spawn: bool, context: dict | None = None) -> dict:
+    """Internal: run task router and optionally spawn. Returns result dict (not JSONResponse)."""
+    from task_router import TaskRouter
+
+    router = TaskRouter(overstory_client=None)
+    result = router.route_task(task, context=context or {})
+
+    if not spawn:
+        return result
+
+    worker_caps = {"builder", "scout", "reviewer"}
+    task_id = result.get("task_id", f"oc-{uuid.uuid4().hex[:8]}")
+    created = await _create_bead_and_spec(task, task_id=task_id)
+    sling_task_id = created["sling_task_id"]
+    spec_path = created["spec_path"]
+    await asyncio.sleep(2)
+
+    try:
+        if result.get("capability") in worker_caps:
+            lead_name = f"lead-{task_id[:8]}"
+            sling_result = await _sling_agent(
+                sling_task_id, "lead", lead_name, spec_path, timeout=120
+            )
+            if sling_result.get("error"):
+                result["spawn_error"] = sling_result.get("error")
+                result["spawned"] = False
+                return result
+            await asyncio.sleep(2)
+            sling_result = await _sling_agent(
+                sling_task_id,
+                result["capability"],
+                result["name"],
+                spec_path,
+                parent=lead_name,
+                timeout=120,
+            )
+        else:
+            sling_result = await _sling_agent(
+                sling_task_id,
+                result["capability"],
+                result["name"],
+                spec_path,
+                timeout=120,
+            )
+        if sling_result.get("error"):
+            result["spawn_error"] = sling_result.get("error")
+            result["spawned"] = False
+        else:
+            result["spawn_result"] = sling_result
+            result["spawned"] = True
+            agent_name = result.get("name") or f"{result.get('capability', 'agent')}-{task_id[:8]}"
+            await _send_mail_to_agent("orchestrator", agent_name, task, "normal")
+    except Exception as exc:
+        result["spawn_error"] = str(exc)
+        result["spawned"] = False
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Route: Route (classify + optionally spawn)
 # ---------------------------------------------------------------------------
 
@@ -250,6 +676,9 @@ async def route_task(request: Request) -> JSONResponse:
     
     POST /api/route
     {"task": "...", "spawn": false, "context": {}}
+    
+    When spawn=true, the gateway creates Bead/spec and runs sling (lead first for workers)
+    so overstory gets a valid task id/spec instead of the bridge's raw task_id.
     """
     body = await request.json()
     task = body.get("task", "")
@@ -257,12 +686,11 @@ async def route_task(request: Request) -> JSONResponse:
         return JSONResponse({"error": "task is required"}, status_code=400)
 
     try:
-        from task_router import TaskRouter
-        from overstory_client import OverstoryClient
-
-        client = OverstoryClient(binary=OVERSTORY_BIN) if body.get("spawn") else None
-        router = TaskRouter(overstory_client=client)
-        result = router.route_task(task, context=body.get("context"))
+        result = await _do_route_task(
+            task,
+            spawn=body.get("spawn", False),
+            context=body.get("context"),
+        )
         return JSONResponse(result)
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
@@ -302,112 +730,429 @@ async def agents_spawn(request: Request) -> JSONResponse:
     name = body.get("name", f"{capability}-{uuid.uuid4().hex[:6]}")
     task_id = body.get("task_id", f"oc-{uuid.uuid4().hex[:8]}")
 
-    # Create Bead task or spec file before spawning
-    spec_path = None
-    bead_created = False
-    
-    # Check if bd CLI is available
-    bd_available = False
-    try:
-        bd_check = await _run_command(["which", "bd"], timeout=2)
-        bd_available = bd_check.get("returncode") == 0
-    except Exception:
-        pass
-    
-    # Check if beads is enabled in config
-    beads_enabled = False
-    try:
-        if yaml:
-            config_path = WORKSPACE / ".overstory" / "config.yaml"
-            if config_path.exists():
-                with open(config_path) as f:
-                    config = yaml.safe_load(f)
-                    beads_enabled = config.get("beads", {}).get("enabled", False)
-    except Exception:
-        pass  # Default to disabled if we can't read config
-    
-    # Only use beads if enabled AND bd CLI is available
-    use_beads = beads_enabled and bd_available
-    
-    bead_id = None
-    if use_beads:
-        try:
-            # Create Bead task using bd CLI (bd auto-generates the ID)
-            bd_create_result = await _run_command([
-                "bd", "create", task,
-                "--priority", "1",
-                "--type", "task",
-                "--json"
-            ], timeout=10)
-            
-            if bd_create_result.get("returncode") == 0:
-                try:
-                    # Parse the JSON response to get the Bead ID
-                    bd_output = bd_create_result.get("stdout", "").strip()
-                    # bd outputs JSON to stdout (warnings go to stderr)
-                    # JSON may be multi-line, so parse the entire stdout
-                    bd_json = json.loads(bd_output)
-                    bead_id = bd_json.get("id")
-                    if bead_id:
-                        bead_created = True
-                        log.info("Created Bead task %s via bd CLI", bead_id)
-                        # Use the Bead ID as the task_id for sling
-                        task_id = bead_id
-                    else:
-                        log.warning("bd create succeeded but no 'id' in response: %s", bd_json)
-                except json.JSONDecodeError as exc:
-                    log.warning("Failed to parse bd create JSON: %s. Output: %s", exc, bd_output[:500])
-                except (KeyError, IndexError) as exc:
-                    log.warning("Failed to extract Bead ID: %s", exc)
-        except FileNotFoundError:
-            log.warning("bd CLI not found despite check")
-        except Exception as exc:
-            log.warning("Failed to create Bead task: %s", exc)
-    
-    # Always create spec file as well (for --spec flag)
-    spec_dir = WORKSPACE / ".overstory" / "specs"
-    spec_dir.mkdir(parents=True, exist_ok=True)
-    spec_path = spec_dir / f"{task_id}.md"
-    spec_path.write_text(f"# Task: {task}\n\n{task}\n")
-    
-    if not bead_created:
-        log.info("Created spec file for task %s (beads disabled or unavailable)", task_id)
+    created = await _create_bead_and_spec(task, task_id=task_id)
+    sling_task_id = created["sling_task_id"]
+    spec_path = created["spec_path"]
+    # Delay after DB operations (bead/spec creation) before spawning agent (reduce DB lock contention)
+    await asyncio.sleep(2)
 
-    # Use bead_id if we successfully created a Bead task, otherwise use original task_id
-    sling_task_id = bead_id if bead_created and bead_id else task_id
-    
-    args = [
-        "sling", sling_task_id,
-        "--capability", capability,
-        "--name", name,
-    ]
-    if body.get("parent"):
-        args.extend(["--parent", body["parent"]])
-    if body.get("force", False):
-        args.append("--force-hierarchy")
-    
-    # If we created a spec file, add --spec flag (use absolute path)
-    if spec_path and spec_path.exists():
-        args.extend(["--spec", str(spec_path)])
-
-    result = await _overstory_run(args, timeout=120)
+    result = await _sling_agent(
+        sling_task_id,
+        capability,
+        name,
+        spec_path,
+        parent=body.get("parent"),
+        force=body.get("force", False),
+        timeout=120,
+    )
     result["agent_name"] = name
     result["capability"] = capability
-    result["task_id"] = body.get("task_id", task_id)  # Return original task_id from request if provided
+    result["task_id"] = body.get("task_id", task_id)
     result["sling_task_id"] = sling_task_id
-    if bead_created and bead_id:
-        result["bead_id"] = bead_id
+    if created.get("bead_created") and created.get("bead_id"):
+        result["bead_id"] = created["bead_id"]
         result["bead_created"] = True
     if spec_path:
         result["spec_file"] = str(spec_path.relative_to(WORKSPACE))
+    # So "check mail" has something to show: send task to the new agent
+    if not result.get("error"):
+        await _send_mail_to_agent("orchestrator", name, task, "normal")
     return JSONResponse(result)
+
+
+def _tmux_session_for_agent(agents: list, agent_name: str) -> str | None:
+    """Get tmux session name for an agent from overstory status agents list."""
+    for a in agents or []:
+        if (a.get("agentName") or a.get("name")) == agent_name:
+            return a.get("tmuxSession")
+    return None
+
+
+def _output_has_confirm_prompt(text: str) -> bool:
+    """True if terminal output shows a Claude/CLI confirm prompt (Do you want to ... 1. Yes / 2. ... / 3. No)."""
+    if not text or "Do you want to" not in text:
+        return False
+    tail = text[-2000:] if len(text) > 2000 else text
+    # Must look like a menu: has option 1 (Yes) and at least one other option (2 or 3)
+    has_yes = "1. Yes" in tail or "1. Yes," in tail or "❯ 1." in tail
+    has_other = "2." in tail or "3. No" in tail
+    return bool(has_yes and has_other)
+
+
+def _output_has_bypass_disclaimer(text: str) -> bool:
+    """True if terminal shows Bypass Permissions disclaimer (1. No, exit / 2. Yes, I accept)."""
+    if not text:
+        return False
+    tail = text[-3000:] if len(text) > 3000 else text
+    return "Bypass Permissions mode" in tail and "Yes, I accept" in tail and ("1. No" in tail or "2. Yes" in tail)
+
+
+async def _capture_tmux_pane(session_name: str, lines: int = 80) -> str:
+    """Capture last N lines from tmux pane. Returns '' if tmux fails."""
+    result = await _run_command(
+        ["tmux", "capture-pane", "-t", session_name, "-p", "-S", f"-{lines}"],
+        timeout=5,
+        cwd=WORKSPACE,
+    )
+    if result.get("returncode") == 0:
+        return result.get("stdout", "")
+    return ""
+
+
+async def agents_auto_accept_prompts(request: Request) -> JSONResponse:
+    """POST /api/agents/auto-accept-prompts — for each agent: if Bypass disclaimer → Down+Enter; if generic confirm → Enter."""
+    try:
+        status = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
+        if status.get("error"):
+            return JSONResponse({"ok": False, "error": status["error"], "accepted": []})
+        agents = status.get("agents") or []
+        accepted = []
+        for a in agents:
+            name = a.get("agentName") or a.get("name")
+            if not name:
+                continue
+            session_name = _tmux_session_for_agent(agents, name) or f"overstory-overclaw-{name}"
+            output = await _capture_tmux_pane(session_name, lines=120)
+            # Bypass Permissions disclaimer: option 2 is "Yes, I accept" — send Down then Enter
+            if _output_has_bypass_disclaimer(output):
+                out = await _send_tmux_keys(session_name, "Down", delay_after_s=0)
+                if not out.get("error"):
+                    out = await _send_tmux_keys(session_name, "", delay_after_s=0)
+                if not out.get("error"):
+                    accepted.append(name)
+                    log.info("Auto-accepted Bypass disclaimer for agent %s", name)
+                continue
+            # Generic confirm (Do you want to ... 1. Yes): send Enter
+            if not _output_has_confirm_prompt(output):
+                continue
+            out = await _send_tmux_keys(session_name, "", delay_after_s=0)
+            if not out.get("error"):
+                accepted.append(name)
+                log.info("Auto-accepted confirm prompt for agent %s", name)
+        return JSONResponse({"ok": True, "accepted": accepted})
+    except Exception as e:
+        log.exception("agents_auto_accept_prompts failed")
+        return JSONResponse({"ok": False, "error": str(e), "accepted": []})
+
+
+async def agents_accept_disclaimer(request: Request) -> JSONResponse:
+    """POST /api/agents/{name}/accept-disclaimer — Down+Enter to select 'Yes, I accept' on Bypass Permissions disclaimer."""
+    name = request.path_params["name"]
+    status = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
+    agents = status.get("agents") or []
+    session_name = _tmux_session_for_agent(agents, name) or f"overstory-overclaw-{name}"
+    out = await _send_tmux_keys(session_name, "Down", delay_after_s=0)
+    if out.get("error"):
+        return JSONResponse({"ok": False, "agent": name, "error": out["error"], "session_used": session_name}, status_code=500)
+    out = await _send_tmux_keys(session_name, "", delay_after_s=0)
+    if out.get("error"):
+        return JSONResponse({"ok": False, "agent": name, "error": out["error"], "session_used": session_name}, status_code=500)
+    return JSONResponse({"ok": True, "agent": name, "message": "Sent Down+Enter (Yes, I accept)."})
+
+
+async def agents_accept_all_disclaimers(request: Request) -> JSONResponse:
+    """POST /api/agents/accept-all-disclaimers — send Down+Enter to every agent (leads and workers) to accept Bypass disclaimer."""
+    try:
+        status = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
+        if status.get("error"):
+            return JSONResponse({"ok": False, "error": status["error"], "accepted": []})
+        agents = status.get("agents") or []
+        accepted = []
+        for a in agents:
+            name = a.get("agentName") or a.get("name")
+            if not name:
+                continue
+            session_name = _tmux_session_for_agent(agents, name) or f"overstory-overclaw-{name}"
+            out = await _send_tmux_keys(session_name, "Down", delay_after_s=0)
+            if out.get("error"):
+                continue
+            out = await _send_tmux_keys(session_name, "", delay_after_s=0)
+            if not out.get("error"):
+                accepted.append(name)
+                log.info("Accept-all disclaimers: sent Down+Enter for %s", name)
+        return JSONResponse({"ok": True, "accepted": accepted, "message": f"Sent Down+Enter to {len(accepted)} agent(s)."})
+    except Exception as e:
+        log.exception("accept_all_disclaimers failed")
+        return JSONResponse({"ok": False, "error": str(e), "accepted": []})
+
+
+async def agents_approve(request: Request) -> JSONResponse:
+    """POST /api/agents/{name}/approve — send Down+Enter to accept the agent's current confirmation prompt.
+    Use when a worker has requested approval via mail; the lead (or orchestrator) calls this to approve."""
+    name = request.path_params["name"]
+    status = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
+    agents = status.get("agents") or []
+    session_name = _tmux_session_for_agent(agents, name) or f"overstory-overclaw-{name}"
+    out = await _send_tmux_keys(session_name, "Down", delay_after_s=0)
+    if out.get("error"):
+        return JSONResponse({"ok": False, "agent": name, "error": out["error"], "session_used": session_name}, status_code=500)
+    out = await _send_tmux_keys(session_name, "", delay_after_s=0)
+    if out.get("error"):
+        return JSONResponse({"ok": False, "agent": name, "error": out["error"], "session_used": session_name}, status_code=500)
+    return JSONResponse({"ok": True, "agent": name, "message": "Sent Down+Enter (approval)."})
+
+
+async def agents_restart_with_skip_permissions(request: Request) -> JSONResponse:
+    """POST /api/agents/restart-with-skip-permissions — Enable skip-permissions, send double Ctrl+C to all agent tmux, then start claude --dangerously-skip-permissions in each."""
+    try:
+        SETTINGS_DANGEROUSLY_SKIP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_DANGEROUSLY_SKIP_FILE.write_text("1")
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"Could not enable setting: {e}", "restarted": []})
+    try:
+        status = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
+        if status.get("error"):
+            return JSONResponse({"ok": False, "error": status["error"], "restarted": []})
+        agents = status.get("agents") or []
+        restarted = []
+        for a in agents:
+            name = a.get("agentName") or a.get("name")
+            if not name:
+                continue
+            session_name = _tmux_session_for_agent(agents, name) or f"overstory-overclaw-{name}"
+            out = await _send_tmux_keys_only(session_name, "C-c")
+            if out.get("error"):
+                log.warning("restart-skip-permissions: C-c #1 for %s: %s", name, out["error"])
+            await asyncio.sleep(0.3)
+            out = await _send_tmux_keys_only(session_name, "C-c")
+            if out.get("error"):
+                log.warning("restart-skip-permissions: C-c #2 for %s: %s", name, out["error"])
+            await asyncio.sleep(0.5)
+            out = await _send_tmux_keys(session_name, "claude --dangerously-skip-permissions", delay_after_s=0)
+            if out.get("error"):
+                log.warning("restart-skip-permissions: start claude for %s: %s", name, out["error"])
+            else:
+                restarted.append(name)
+                log.info("Restarted %s with --dangerously-skip-permissions", name)
+            # Wait for disclaimer, then Down+Enter to accept, then "continue"
+            await asyncio.sleep(2.5)
+            await _send_tmux_keys_only(session_name, "Down")
+            await _send_tmux_keys(session_name, "", delay_after_s=0)
+            await asyncio.sleep(0.5)
+            await _send_tmux_keys(session_name, "continue", delay_after_s=0)
+        return JSONResponse({"ok": True, "restarted": restarted, "message": f"Enabled skip-permissions; sent C-c C-c, restarted claude, accept disclaimer, and continue in {len(restarted)} session(s)."})
+    except Exception as e:
+        log.exception("agents_restart_with_skip_permissions failed")
+        return JSONResponse({"ok": False, "error": str(e), "restarted": []})
+
+
+async def agents_accept_mail_check(request: Request) -> JSONResponse:
+    """POST /api/agents/{name}/accept-mail-check — Down+Enter to select 'Yes, and don't ask again' for overstory mail check prompt."""
+    name = request.path_params["name"]
+    status = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
+    agents = status.get("agents") or []
+    session_name = _tmux_session_for_agent(agents, name) or f"overstory-overclaw-{name}"
+    # Option 1 = Yes, Option 2 = Yes don't ask again. Send Down then Enter to choose option 2.
+    out = await _send_tmux_keys(session_name, "Down", delay_after_s=0)
+    if out.get("error"):
+        return JSONResponse({"ok": False, "agent": name, "error": out["error"], "session_used": session_name}, status_code=500)
+    out = await _send_tmux_keys(session_name, "", delay_after_s=0)
+    if out.get("error"):
+        return JSONResponse({"ok": False, "agent": name, "error": out["error"], "session_used": session_name}, status_code=500)
+    return JSONResponse({"ok": True, "agent": name, "message": "Sent Down+Enter (Yes, don't ask again for mail check)."})
 
 
 async def agents_inspect(request: Request) -> JSONResponse:
     """GET /api/agents/{name} — inspect a specific agent."""
     name = request.path_params["name"]
-    result = await _overstory_run(["inspect", "--agent", name])
+    result = await _overstory_run(["inspect", name])
     return JSONResponse(result)
+
+
+async def agents_terminal(request: Request) -> JSONResponse:
+    """GET /api/agents/{name}/terminal — capture tmux output, or overstory inspect transcript if tmux unavailable.
+    Always returns 200 with JSON; errors are in body so the UI can show a message instead of 500."""
+    try:
+        name = request.path_params.get("name") or ""
+        if not name:
+            return JSONResponse({"output": "", "session": "", "source": "error", "error": "agent name required"}, status_code=400)
+        session_name = f"overstory-overclaw-{name}"
+        try:
+            lines = int(request.query_params.get("lines", "100"))
+        except (ValueError, TypeError):
+            lines = 100
+        lines = max(1, min(lines, 500))
+
+        # Try tmux capture first (only works when gateway shares the same tmux server as agents)
+        try:
+            result = await _run_command(
+                ["tmux", "capture-pane", "-t", session_name, "-p", "-S", f"-{lines}"],
+                timeout=5,
+                cwd=WORKSPACE,
+            )
+            if result.get("returncode") == 0:
+                return JSONResponse({"output": result.get("stdout", ""), "session": session_name, "source": "tmux"})
+        except Exception:
+            pass
+
+        # Fallback: overstory inspect (works without tmux; shows transcript/tool calls)
+        output = ""
+        try:
+            inspect_result = await _overstory_run(
+                ["inspect", name, "--no-tmux", "--limit", "50"],
+                timeout=15,
+                cwd=WORKSPACE,
+            )
+            if isinstance(inspect_result, dict) and "error" not in inspect_result:
+                raw = inspect_result.get("raw") or str(inspect_result)
+                return JSONResponse({
+                    "output": raw,
+                    "session": session_name,
+                    "source": "inspect",
+                    "attach_cmd": f"tmux attach -t {session_name}",
+                })
+            err = inspect_result.get("error", "") if isinstance(inspect_result, dict) else str(inspect_result)
+            raw = inspect_result.get("raw", "") if isinstance(inspect_result, dict) else ""
+            if "database is locked" in (err + raw).lower() or "locked" in (err + raw).lower():
+                output = "Transcript temporarily unavailable (database busy). Use the command above to watch live in your terminal."
+            else:
+                output = (raw or err)[:8000]
+        except Exception as e:
+            output = str(e)
+
+        return JSONResponse({
+            "output": f"[Tmux not available from this process. Run in your terminal to watch live:\n  tmux attach -t {session_name}\n\n--- Transcript (overstory inspect) ---\n{output}",
+            "session": session_name,
+            "source": "inspect",
+            "attach_cmd": f"tmux attach -t {session_name}",
+        })
+    except Exception as e:
+        log.exception("agents_terminal failed for %s", request.path_params.get("name"))
+        return JSONResponse({
+            "output": "",
+            "session": request.path_params.get("name", ""),
+            "source": "error",
+            "error": str(e),
+        })
+
+
+# ---------------------------------------------------------------------------
+# Route: Worktrees (prune when task complete — existing overstory feature)
+# ---------------------------------------------------------------------------
+
+async def worktrees_clean(request: Request) -> JSONResponse:
+    """POST /api/worktrees/clean — prune completed worktrees (overstory worktree clean --completed)."""
+    all_flag = request.query_params.get("all", "").lower() in ("1", "true", "yes")
+    force_flag = request.query_params.get("force", "").lower() in ("1", "true", "yes")
+    args = ["worktree", "clean", "--all"] if all_flag else ["worktree", "clean", "--completed"]
+    if force_flag:
+        args.append("--force")
+    result = await _overstory_run(args, timeout=60, cwd=WORKSPACE)
+    if result.get("error"):
+        result["logMessage"] = f"Prune failed: {result.get('error', 'unknown')}"
+        return JSONResponse(result, status_code=500)
+    # Build a one-line log message for terminal log
+    removed = result.get("removed") or result.get("worktrees") or result.get("cleaned")
+    if isinstance(removed, list) and removed:
+        result["logMessage"] = f"Pruned {len(removed)} completed worktrees: {', '.join(str(x) for x in removed[:10])}{'…' if len(removed) > 10 else ''}"
+    elif isinstance(removed, list):
+        result["logMessage"] = "Pruned 0 completed worktrees."
+    else:
+        raw = result.get("raw") or ""
+        result["logMessage"] = f"Pruned completed worktrees. {raw.strip()[:200]}" if raw.strip() else "Pruned completed worktrees."
+    return JSONResponse(result)
+
+
+async def zombies_list(request: Request) -> JSONResponse:
+    """GET /api/zombies — list agents with state=zombie (from overstory status --json)."""
+    result = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
+    if result.get("error"):
+        return JSONResponse({"error": result["error"], "zombies": [], "count": 0})
+    agents = result.get("agents") or []
+    zombies = [a for a in agents if (a.get("state") or "").lower() == "zombie"]
+    return JSONResponse({"zombies": zombies, "count": len(zombies)})
+
+
+def _lead_for_agent(agent_name: str) -> str:
+    """Return the lead to notify for this agent. Workers: lead-{suffix}; lead zombie: orchestrator."""
+    if not agent_name:
+        return "orchestrator"
+    if agent_name.startswith("lead-"):
+        return "orchestrator"
+    for prefix in ("scout-", "builder-", "reviewer-"):
+        if agent_name.startswith(prefix):
+            suffix = agent_name[len(prefix):]
+            return f"lead-{suffix}"
+    return "orchestrator"
+
+
+async def zombies_slay(request: Request) -> JSONResponse:
+    """POST /api/zombies/slay — kill zombie agents (overstory clean --worktrees --sessions).
+    Before slaying, auto-mail the lead for each zombie so the lead is notified."""
+    status_result = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
+    if status_result.get("error"):
+        return JSONResponse({"error": status_result["error"], "slain": 0})
+    agents = status_result.get("agents") or []
+    zombies = [a for a in agents if (a.get("state") or "").lower() == "zombie"]
+    zombie_names = [a.get("agentName") or a.get("name", "") for a in zombies]
+    slain = len(zombie_names)
+    if slain == 0:
+        return JSONResponse({"slain": 0, "message": "No zombies to slay.", "zombies": []})
+    # Auto-mail the lead for each zombie before slaying
+    for name in zombie_names:
+        lead = _lead_for_agent(name)
+        msg = f"Zombie detected: {name} was marked zombie and is being slain (clean --worktrees --sessions). You may want to respawn or reassign the task."
+        try:
+            await _send_mail_to_agent("gateway", lead, msg, "high")
+        except Exception as e:
+            log.warning("Failed to mail lead %s about zombie %s: %s", lead, name, e)
+    clean_result = await _overstory_run(["clean", "--worktrees", "--sessions"], timeout=30, cwd=WORKSPACE)
+    if clean_result.get("error"):
+        return JSONResponse({"error": clean_result["error"], "slain": 0, "zombies": zombie_names})
+    return JSONResponse({
+        "slain": slain,
+        "zombies": zombie_names,
+        "message": "Your agents were zombies so I had to kill them.",
+    })
+
+
+def _write_mail_to_db(from_agent: str, to_agent: str, message: str, priority: str = "normal") -> None:
+    """Persist sent mail to workspace .overstory/mail.db so the dashboard shows it (sent and received)."""
+    mail_db = WORKSPACE / ".overstory" / "mail.db"
+    mail_db.parent.mkdir(parents=True, exist_ok=True)
+    schema = """
+    CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id TEXT,
+        from_agent TEXT NOT NULL,
+        to_agent TEXT NOT NULL,
+        subject TEXT NOT NULL DEFAULT '',
+        body TEXT NOT NULL DEFAULT '',
+        priority TEXT NOT NULL DEFAULT 'normal',
+        read INTEGER NOT NULL DEFAULT 0,
+        created_at REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_msg_to ON messages(to_agent);
+    """
+    now = time.time()
+    subject = (message.strip().split("\n")[0][:200]) if message.strip() else "No subject"
+    body_text = (message or "").strip() or "(no body)"
+    try:
+        conn = sqlite3.connect(str(mail_db), timeout=5)
+        conn.executescript(schema)
+        conn.execute(
+            "INSERT INTO messages (from_agent, to_agent, subject, body, priority, created_at) VALUES (?,?,?,?,?,?)",
+            (from_agent or "orchestrator", to_agent or "", subject, body_text, priority or "normal", now),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("Could not write mail to %s: %s", mail_db, e)
+
+
+async def _send_mail_to_agent(from_agent: str, to_agent: str, message: str, priority: str = "normal") -> None:
+    """Persist to mail.db and send via overstory (uses --subject and --body)."""
+    _write_mail_to_db(from_agent, to_agent, message, priority)
+    subject = (message.strip().split("\n")[0][:200]) if message.strip() else "No subject"
+    body_text = (message or "").strip()[:2000] or "(no body)"
+    await _overstory_run([
+        "mail", "send",
+        "--from", from_agent,
+        "--to", to_agent,
+        "--subject", subject,
+        "--body", body_text,
+        "--priority", priority,
+    ], timeout=5, cwd=WORKSPACE)
 
 
 async def agents_mail(request: Request) -> JSONResponse:
@@ -416,14 +1161,12 @@ async def agents_mail(request: Request) -> JSONResponse:
     {"from": "orchestrator", "to": "builder-abc123", "message": "..."}
     """
     body = await request.json()
-    result = await _overstory_run([
-        "mail", "send",
-        "--from", body.get("from", "orchestrator"),
-        "--to", body.get("to", ""),
-        "--message", body.get("message", ""),
-        "--priority", body.get("priority", "normal"),
-    ])
-    return JSONResponse(result)
+    from_agent = body.get("from", "orchestrator")
+    to_agent = body.get("to", "")
+    message = body.get("message", "")
+    priority = body.get("priority", "normal")
+    await _send_mail_to_agent(from_agent, to_agent, message, priority)
+    return JSONResponse({"ok": True})
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +1252,35 @@ async def memory_write(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Settings (dangerously-skip-permissions for agents; UI toggle syncs here)
+# ---------------------------------------------------------------------------
+
+async def settings_get(request: Request) -> JSONResponse:
+    """GET /api/settings — Read dangerously_skip_permissions (used by wrapper for agents)."""
+    try:
+        if SETTINGS_DANGEROUSLY_SKIP_FILE.exists():
+            raw = SETTINGS_DANGEROUSLY_SKIP_FILE.read_text().strip()
+            value = raw in ("1", "true", "yes")
+        else:
+            value = True  # default: keep current behavior
+        return JSONResponse({"dangerously_skip_permissions": value})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+async def settings_put(request: Request) -> JSONResponse:
+    """POST /api/settings — Set dangerously_skip_permissions. Body: { \"dangerously_skip_permissions\": false }."""
+    try:
+        body = await request.json()
+        value = body.get("dangerously_skip_permissions", True)
+        SETTINGS_DANGEROUSLY_SKIP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_DANGEROUSLY_SKIP_FILE.write_text("1" if value else "0")
+        return JSONResponse({"dangerously_skip_permissions": bool(value)})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
@@ -516,17 +1288,30 @@ routes = [
     Route("/health", health, methods=["GET"]),
     Route("/api/status", status, methods=["GET"]),
     Route("/api/chat", chat, methods=["POST"]),
+    Route("/api/message", message, methods=["POST"]),
     Route("/api/route", route_task, methods=["POST"]),
     Route("/api/agents", agents_list, methods=["GET"]),
     Route("/api/agents/spawn", agents_spawn, methods=["POST"]),
     Route("/api/agents/mail", agents_mail, methods=["POST"]),
     Route("/api/agents/{name}", agents_inspect, methods=["GET"]),
+    Route("/api/agents/{name}/terminal", agents_terminal, methods=["GET"]),
+    Route("/api/agents/auto-accept-prompts", agents_auto_accept_prompts, methods=["POST"]),
+    Route("/api/agents/accept-all-disclaimers", agents_accept_all_disclaimers, methods=["POST"]),
+    Route("/api/agents/restart-with-skip-permissions", agents_restart_with_skip_permissions, methods=["POST"]),
+    Route("/api/agents/{name}/accept-disclaimer", agents_accept_disclaimer, methods=["POST"]),
+    Route("/api/agents/{name}/approve", agents_approve, methods=["POST"]),
+    Route("/api/agents/{name}/accept-mail-check", agents_accept_mail_check, methods=["POST"]),
+    Route("/api/worktrees/clean", worktrees_clean, methods=["POST"]),
+    Route("/api/zombies", zombies_list, methods=["GET"]),
+    Route("/api/zombies/slay", zombies_slay, methods=["POST"]),
     Route("/api/skills", skills_list, methods=["GET"]),
     Route("/api/skills/exec", skills_exec, methods=["POST"]),
     Route("/api/tools", tools_list, methods=["GET"]),
     Route("/api/tools/exec", tools_exec, methods=["POST"]),
     Route("/api/memory", memory_read, methods=["GET"]),
     Route("/api/memory", memory_write, methods=["POST"]),
+    Route("/api/settings", settings_get, methods=["GET"]),
+    Route("/api/settings", settings_put, methods=["POST"]),
 ]
 
 app = Starlette(routes=routes)
