@@ -120,7 +120,7 @@ _DEFAULT_UI_SETTINGS = {
     "default_project_folder": "overstory",  # "overstory" = ROOT_WORKSPACE; or absolute path under root
     "current_project_folder": "",           # "" = use default; or path (must be under ROOT_WORKSPACE)
     "create_project_on_next_prompt": False, # when True, next chat message creates a new folder from prompt
-    "refresh_interval_ms": 1000,            # dashboard poll interval (500, 1000, 2000, 5000)
+    "refresh_interval_ms": 3000,            # dashboard poll (MacBook-friendly default; 500, 1000, 2000, 3000, 5000)
     "sidebar_collapsed_default": False,    # start with sidebar collapsed
 }
 
@@ -994,7 +994,7 @@ def api_ui_settings():
                 s[key] = bool(data[key])
             elif key == "refresh_interval_ms":
                 v = data[key]
-                if isinstance(v, int) and v in (500, 1000, 2000, 5000):
+                if isinstance(v, int) and v in (500, 1000, 2000, 3000, 5000):
                     s[key] = v
             else:
                 s[key] = data[key] if isinstance(data[key], str) else str(data[key] or "")
@@ -2138,6 +2138,13 @@ INDEX_HTML = """<!DOCTYPE html>
       min-height: 400px;
       max-height: min(75vh, 700px);
     }
+    .agent-terminal-output {
+      scroll-behavior: auto;
+    }
+    .agent-terminal-item.agent-terminal-active {
+      border-color: #58a6ff;
+      box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.35);
+    }
     .chat-history-scroll {
       -webkit-overflow-scrolling: touch;
     }
@@ -2153,6 +2160,59 @@ INDEX_HTML = """<!DOCTYPE html>
       border: 1px solid #30363d;
       border-radius: 4px;
     }
+    .kanban-board {
+      display: flex;
+      gap: 12px;
+      padding: 12px;
+      min-height: 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      align-items: flex-start;
+    }
+    .kanban-column {
+      flex: 0 0 200px;
+      min-width: 200px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      display: flex;
+      flex-direction: column;
+      max-height: 100%;
+    }
+    .kanban-column-header {
+      padding: 10px 12px;
+      font-weight: 600;
+      font-size: 12px;
+      color: #58a6ff;
+      border-bottom: 1px solid #30363d;
+      border-radius: 8px 8px 0 0;
+      background: #21262d;
+    }
+    .kanban-column-cards {
+      padding: 8px;
+      overflow-y: auto;
+      min-height: 80px;
+      flex: 1;
+    }
+    .kanban-card {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 10px;
+      margin-bottom: 8px;
+      font-size: 12px;
+      cursor: default;
+    }
+    .kanban-card:last-child { margin-bottom: 0; }
+    .kanban-card-name { font-weight: 600; color: #e6edf3; margin-bottom: 4px; }
+    .kanban-card-state { color: #8b949e; font-size: 11px; }
+    .kanban-card-duration { color: #7ee787; font-size: 11px; }
+    .kanban-card-task { color: #8b949e; font-size: 11px; margin-top: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+    .kanban-card.zombie { border-color: #f85149; background: #1c1212; }
+    .kanban-card .state-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 4px; }
+    .kanban-card .state-dot.working { background: #7ee787; }
+    .kanban-card .state-dot.idle { background: #8b949e; }
+    .kanban-card .state-dot.zombie { background: #f85149; }
     .terminal-line {
       margin-bottom: 4px;
     }
@@ -2629,7 +2689,7 @@ INDEX_HTML = """<!DOCTYPE html>
       </div>
       <span class="header-title">overstory dashboard v0.2.0</span>
       <span class="header-time" id="currentTime">12:55:31 PM</span>
-      <span class="header-refresh">refresh: <span id="refreshInterval">1000ms</span></span>
+      <span class="header-refresh">refresh: <span id="refreshInterval">3000ms</span></span>
     </div>
     <div class="header-controls">
       <button id="restartWithSkipPermsBtn" class="header-btn-long" title="Enable skip-permissions, send Ctrl+C twice to all agent tmux, then start claude --dangerously-skip-permissions in each">Restart agents (skip perms)</button>
@@ -2724,7 +2784,7 @@ INDEX_HTML = """<!DOCTYPE html>
       <div class="tabs">
         <div class="tab active" data-tab="chat">Chat (Ollama)</div>
         <div class="tab" data-tab="terminal">TERMINAL</div>
-        <div class="tab" data-tab="output">OUTPUT</div>
+        <div class="tab" data-tab="kanban">KANBAN</div>
         <div class="tab" data-tab="problems">PROBLEMS</div>
         <div class="tab" data-tab="ports">PORTS</div>
         <div class="tab" data-tab="debug">DEBUG CONSOLE</div>
@@ -2760,8 +2820,9 @@ INDEX_HTML = """<!DOCTYPE html>
           <button type="button" id="terminalSendBtn">Send</button>
         </div>
       </div>
-      <div id="tabOutput" class="tab-content">
-        <div class="terminal-output" id="outputContent">[Command outputs will appear here]</div>
+      <div id="tabKanban" class="tab-content" style="flex-direction: column; min-height: 0; overflow: hidden;">
+        <div class="panel-header" style="margin: 0; border-radius: 0;">Agent Kanban</div>
+        <div id="kanbanBoard" class="kanban-board">[Loading agents…]</div>
       </div>
       <div id="tabProblems" class="tab-content">
         <div class="terminal-output" id="problemsContent">[Problems/errors will appear here]</div>
@@ -2808,8 +2869,9 @@ INDEX_HTML = """<!DOCTYPE html>
           <label for="settingRefreshInterval">Refresh interval</label>
           <select id="settingRefreshInterval">
             <option value="500">500 ms</option>
-            <option value="1000" selected>1 s</option>
+            <option value="1000">1 s</option>
             <option value="2000">2 s</option>
+            <option value="3000" selected>3 s</option>
             <option value="5000">5 s</option>
           </select>
         </div>
@@ -2854,15 +2916,17 @@ INDEX_HTML = """<!DOCTYPE html>
   <script>
     const GATEWAY_URL = {{ gateway_url|tojson }};
     let refreshIntervalId = null;
-    let REFRESH_INTERVAL = 1000; // 1s default; overridden from ui-settings
+    let REFRESH_INTERVAL = 3000; // 3s default (MacBook-friendly); overridden from ui-settings
     let zombiesSlayedTotal = 0;
-    const ZOMBIE_CHECK_INTERVAL_MS = 300000; // 5 minutes
-    let zombieCountdownSeconds = 300; // 5 minutes
+    const ZOMBIE_CHECK_INTERVAL_MS = 60000; // 1 minute (zombie slayer runs once per minute)
+    let zombieCountdownSeconds = 60; // 1 minute
     let zombieCountdownInterval = null;
     const agentErrorLogged = {};
     let gatewayUnreachableLogged = false;
     const expandedAgentTerminals = new Set();
     const SCROLL_BOTTOM_THRESHOLD = 30;
+    let activeAgentTerminal = null;
+    let cachedTerminalOutput = null;
 
     // --- Topbar: repo dropdown + GitHub (icon, login / avatar+username) | Sidebar: file tree + skills ---
     const GITHUB_ICON_SVG = '<svg class="github-icon" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>';
@@ -3300,6 +3364,7 @@ INDEX_HTML = """<!DOCTYPE html>
           connectTerminalStream();
           refreshAgentTerminals();
         }
+        if (tabKey === 'kanban') refreshKanban();
       });
     });
     // Initial state: only Chat tab content visible
@@ -3464,8 +3529,8 @@ INDEX_HTML = """<!DOCTYPE html>
       setTimeout(function() { btn.disabled = false; btn.textContent = 'Kill all agents'; }, 2500);
     });
 
-    // Auto-prune completed worktrees every 10 minutes and log to terminal
-    const AUTO_PRUNE_INTERVAL_MS = 10 * 60 * 1000;
+    // Auto-prune completed worktrees every 15 minutes (MacBook-friendly)
+    const AUTO_PRUNE_INTERVAL_MS = 15 * 60 * 1000;
     setInterval(function() { runPruneCompletedWorktrees(true); }, AUTO_PRUNE_INTERVAL_MS);
 
     // Zombie Hunter: slay zombies and update indicator
@@ -3480,7 +3545,7 @@ INDEX_HTML = """<!DOCTYPE html>
       if (el) el.textContent = mins + ':' + (secs < 10 ? '0' : '') + secs;
     }
     function resetZombieCountdown() {
-      zombieCountdownSeconds = 300; // 5 minutes
+      zombieCountdownSeconds = 60; // 1 minute
       updateZombieCountdown();
     }
     async function slayZombies() {
@@ -3515,7 +3580,7 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }, 1000);
 
-    // Periodically check for zombies and slay them (every 5 minutes)
+    // Periodically check for zombies and slay them (every 1 minute; gateway also runs slayer every 60s)
     setInterval(async () => {
       try {
         const r = await fetch('/api/zombies');
@@ -3538,6 +3603,12 @@ INDEX_HTML = """<!DOCTYPE html>
       } catch (_) {}
     }
 
+    var agentTerminalScrollState = {};
+    function resumeAgentTerminal() {
+      activeAgentTerminal = null;
+      cachedTerminalOutput = null;
+      refreshAgentTerminals();
+    }
     // Refresh agent terminals (tmux output for each agent) — Chat tab only; polled less often to avoid load
     async function refreshAgentTerminals() {
       const chatTab = document.getElementById('tabChat');
@@ -3545,6 +3616,17 @@ INDEX_HTML = """<!DOCTYPE html>
       const list = document.getElementById('agentTerminalsList');
       if (!list) return;
       try {
+        list.querySelectorAll('.agent-terminal-item').forEach(function(item) {
+          var name = item.getAttribute('data-agent-name');
+          if (!name) return;
+          var out = item.querySelector('.agent-terminal-output');
+          if (!out) return;
+          var atBottom = out.scrollHeight - out.scrollTop - out.clientHeight <= SCROLL_BOTTOM_THRESHOLD;
+          agentTerminalScrollState[name] = { atBottom: atBottom, scrollTop: out.scrollTop, scrollHeight: out.scrollHeight };
+          if (name === activeAgentTerminal && cachedTerminalOutput) {
+            cachedTerminalOutput.scrollTop = out.scrollTop;
+          }
+        });
         const r = await fetch('/api/overstory');
         const data = await r.json();
         if (data.error || !data.agents || data.agents.length === 0) {
@@ -3557,6 +3639,16 @@ INDEX_HTML = """<!DOCTYPE html>
           data.agents.slice(0, 10).map(async (agent) => {
             const name = agent.name || '';
             if (!name) return null;
+            if (name === activeAgentTerminal && cachedTerminalOutput) {
+              return {
+                name,
+                capability: agent.capability || '',
+                output: cachedTerminalOutput.output,
+                attachCmd: 'tmux attach -t overstory-overclaw-' + name,
+                source: '',
+                system: !!agent.system
+              };
+            }
             try {
               const termR = await fetch(`/api/agents/${name}/terminal?lines=50`);
               const termData = await termR.json();
@@ -3591,17 +3683,51 @@ INDEX_HTML = """<!DOCTYPE html>
           fetch('/api/terminal/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'Gateway unreachable. Start OverClaw gateway (port 18800) to view agent terminals and use Accept disclaimer.', type: 'error' }) }).catch(function(){});
         }
         if (!isGatewayError) gatewayUnreachableLogged = false;
-        list.innerHTML = terminals.filter(t => t).map(t => {
-          var expanded = expandedAgentTerminals.has(t.name);
-          var cap = (t.capability || '').toLowerCase();
-          var isLeadOrSupervisor = cap === 'lead' || cap === 'supervisor';
-          var bodyDisplay = (isLeadOrSupervisor && !expanded) ? 'none' : 'block';
-          return `
-          <div class="agent-terminal-item ${expanded ? 'agent-terminal-expanded' : ''} ${cap === 'lead' ? 'agent-terminal-lead' : ''} ${cap === 'supervisor' ? 'agent-terminal-supervisor' : ''}" data-agent-name="${escapeHtml(t.name)}" style="border: 1px solid #30363d; border-radius: 4px; overflow: hidden;">
+        var termList = terminals.filter(t => t);
+        var newNames = termList.map(function(t) { return t.name; });
+        var existingItems = list.querySelectorAll('.agent-terminal-item[data-agent-name]');
+        var existingNames = Array.prototype.map.call(existingItems, function(el) { return el.getAttribute('data-agent-name'); });
+        var sameList = existingNames.length === newNames.length && newNames.every(function(n, i) { return existingNames[i] === n; });
+
+        if (sameList && existingItems.length > 0) {
+          termList.forEach(function(t, index) {
+            var item = existingItems[index];
+            var out = item ? item.querySelector('.agent-terminal-output') : null;
+            if (!out) return;
+            var currentText = out.textContent || '';
+            var newOutput = t.output || '';
+            if (currentText === newOutput) return;
+            out.textContent = newOutput;
+            var name = t.name;
+            var isActive = name === activeAgentTerminal && cachedTerminalOutput;
+            if (isActive) {
+              out.scrollTop = cachedTerminalOutput.scrollTop;
+            } else {
+              var state = agentTerminalScrollState[name];
+              if (state && !state.atBottom) {
+                var newSh = out.scrollHeight;
+                var oldSh = state.scrollHeight;
+                var oldSt = state.scrollTop;
+                out.scrollTop = oldSh > 0 ? Math.min(newSh - 1, Math.round((oldSt / oldSh) * newSh)) : 0;
+              } else {
+                out.scrollTop = out.scrollHeight;
+              }
+            }
+          });
+        } else {
+          list.innerHTML = termList.map(t => {
+            var expanded = expandedAgentTerminals.has(t.name);
+            var cap = (t.capability || '').toLowerCase();
+            var isLeadOrSupervisor = cap === 'lead' || cap === 'supervisor';
+            var bodyDisplay = (isLeadOrSupervisor && !expanded) ? 'none' : 'block';
+            var isActive = t.name === activeAgentTerminal;
+            return `
+          <div class="agent-terminal-item ${expanded ? 'agent-terminal-expanded' : ''} ${cap === 'lead' ? 'agent-terminal-lead' : ''} ${cap === 'supervisor' ? 'agent-terminal-supervisor' : ''} ${isActive ? 'agent-terminal-active' : ''}" data-agent-name="${escapeHtml(t.name)}" style="border: 1px solid #30363d; border-radius: 4px; overflow: hidden;">
             <div class="agent-terminal-header" style="background: #161b22; padding: 6px 10px; font-size: 12px; font-weight: 600; color: #58a6ff; cursor: pointer; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px;">
               <span onclick="toggleAgentTerminalExpand('${escapeHtml(t.name)}')" title="Click to expand/collapse">${t.capability ? `<span style="color: #8b949e;">[${t.capability}]</span> ` : ''}${t.name}</span>
               <span style="display: flex; gap: 6px; align-items: center;">
-                <button type="button" onclick="event.stopPropagation(); toggleAgentTerminalExpand('${escapeHtml(t.name)}'); return false;" style="padding: 4px 8px; font-size: 11px; background: #21262d; color: #8b949e; border: 1px solid #30363d; border-radius: 4px; cursor: pointer;">${expanded ? 'Collapse' : 'Expand'}</button>
+                ${isActive ? '<button type="button" onclick="event.stopPropagation(); resumeAgentTerminal(); return false;" style="padding: 4px 8px; font-size: 11px; background: #58a6ff; color: #fff; border: none; border-radius: 4px; cursor: pointer;" title="Resume live updates">Resume</button>' : ''}
+                <button type="button" onclick="event.stopPropagation(); toggleAgentTerminalExpand(\'' + escapeHtml(t.name) + '\'); return false;" style="padding: 4px 8px; font-size: 11px; background: #21262d; color: #8b949e; border: 1px solid #30363d; border-radius: 4px; cursor: pointer;">${expanded ? 'Collapse' : 'Expand'}</button>
                 ${t.system ? '' : `<button type="button" class="accept-mail-check-btn" onclick="event.stopPropagation(); acceptMailCheck('${escapeHtml(t.name)}', this);" style="padding: 4px 8px; font-size: 11px; background: #1f6feb; color: #fff; border: none; border-radius: 4px; cursor: pointer;" title="Accept 'overstory mail check' prompt (don't ask again)">Mail check</button>
                 <button type="button" class="accept-disclaimer-btn" onclick="event.stopPropagation(); acceptDisclaimer('${escapeHtml(t.name)}', this);" style="padding: 4px 10px; font-size: 11px; background: #238636; color: #fff; border: none; border-radius: 4px; cursor: pointer;">Accept disclaimer</button>`}
               </span>
@@ -3609,16 +3735,43 @@ INDEX_HTML = """<!DOCTYPE html>
             <div class="agent-terminal-body" style="display: ${bodyDisplay};">
               ${t.attachCmd ? `<div class="agent-terminal-attach" style="background: #21262d; padding: 6px 8px; font-size: 11px; color: #7ee787; font-family: monospace;">Watch live: <code style="user-select: all;">${escapeHtml(t.attachCmd)}</code></div>` : ''}
               <div class="agent-terminal-output" style="background: #0d1117; color: #e6edf3; font-family: monospace; font-size: 11px; padding: 8px; padding-bottom: 12px; white-space: pre-wrap; word-wrap: break-word;">${escapeHtml(t.output)}</div>
-              <button type="button" class="scroll-to-bottom-btn" onclick="var o=this.previousElementSibling; if(o) { o.scrollTop=o.scrollHeight; }" style="margin-top: 4px; padding: 2px 8px; font-size: 10px; background: #21262d; color: #8b949e; border: 1px solid #30363d; border-radius: 4px; cursor: pointer;">Scroll to bottom</button>
+              <button type="button" class="scroll-to-bottom-btn" onclick="var o=this.previousElementSibling; if(o) o.scrollTo({top: o.scrollHeight, behavior: 'smooth'});" style="margin-top: 4px; padding: 2px 8px; font-size: 10px; background: #21262d; color: #8b949e; border: 1px solid #30363d; border-radius: 4px; cursor: pointer;">Scroll to bottom</button>
             </div>
           </div>
         `;
-        }).join('');
-        list.querySelectorAll('.agent-terminal-output').forEach(function(el) {
-          requestAnimationFrame(function() {
-            el.scrollTop = el.scrollHeight;
+          }).join('');
+          list.querySelectorAll('.agent-terminal-item').forEach(function(item, index) {
+            var name = item.getAttribute('data-agent-name');
+            if (!name) return;
+            var out = item.querySelector('.agent-terminal-output');
+            if (!out) return;
+            var isActive = name === activeAgentTerminal && cachedTerminalOutput;
+            function applyScroll() {
+              if (isActive) {
+                out.scrollTop = cachedTerminalOutput.scrollTop;
+                out._activeScrollListener = function() {
+                  if (activeAgentTerminal === name && cachedTerminalOutput) cachedTerminalOutput.scrollTop = out.scrollTop;
+                };
+                out.addEventListener('scroll', out._activeScrollListener, { passive: true });
+              } else {
+                var state = agentTerminalScrollState[name];
+                if (state && !state.atBottom) {
+                  var newSh = out.scrollHeight;
+                  var oldSh = state.scrollHeight;
+                  var oldSt = state.scrollTop;
+                  out.scrollTop = oldSh > 0 ? Math.min(newSh - 1, Math.round((oldSt / oldSh) * newSh)) : 0;
+                } else {
+                  out.scrollTop = out.scrollHeight;
+                }
+              }
+            }
+            if (isActive) {
+              requestAnimationFrame(applyScroll);
+            } else {
+              setTimeout(applyScroll, index * 35);
+            }
           });
-        });
+        }
       } catch (e) {
         list.innerHTML = '<div style="color: #f85149; font-size: 12px;">Error loading agent terminals: ' + e.message + '</div>';
       }
@@ -3647,6 +3800,30 @@ INDEX_HTML = """<!DOCTYPE html>
         }
       }
     }
+
+    (function setupAgentTerminalActivation() {
+      var list = document.getElementById('agentTerminalsList');
+      if (!list) return;
+      list.addEventListener('click', function(e) {
+        if (e.target.closest('button')) return;
+        var item = e.target.closest('.agent-terminal-item');
+        if (!item) return;
+        var name = item.getAttribute('data-agent-name');
+        if (!name) return;
+        if (name === activeAgentTerminal) {
+          resumeAgentTerminal();
+          return;
+        }
+        var out = item.querySelector('.agent-terminal-output');
+        if (!out) return;
+        activeAgentTerminal = name;
+        cachedTerminalOutput = { output: out.textContent, scrollTop: out.scrollTop };
+        item.classList.add('agent-terminal-active');
+        document.querySelectorAll('.agent-terminal-item.agent-terminal-active').forEach(function(el) {
+          if (el.getAttribute('data-agent-name') !== name) el.classList.remove('agent-terminal-active');
+        });
+      });
+    })();
 
     async function acceptMailCheck(agentName, btn) {
       if (btn) btn.disabled = true;
@@ -3737,6 +3914,7 @@ INDEX_HTML = """<!DOCTYPE html>
       refreshBunLog();
       refreshTerminal();
       refreshAgentTerminals();
+      refreshKanban();
       checkZombies();
       refreshSessionUsage();
       refreshGatewayHealth();
@@ -3791,6 +3969,80 @@ INDEX_HTML = """<!DOCTYPE html>
         const tbody = document.getElementById('agentsBody');
         const errRow = '<tr><td colspan="8">Failed to load: ' + e.message + '</td></tr>';
         if (tbody && tbody.innerHTML !== errRow) tbody.innerHTML = errRow;
+      }
+    }
+
+    var KANBAN_STATUS_ORDER = ['queued', 'started', 'in progress', 'completed', 'idle', 'cancelled'];
+    function durationToSeconds(dur) {
+      if (!dur || dur === '—') return 0;
+      var s = 0;
+      dur.split(/\s+/).forEach(function(p) {
+        if (p.endsWith('m')) s += parseInt(p, 10) * 60;
+        else if (p.endsWith('s')) s += parseInt(p, 10);
+      });
+      return s;
+    }
+    function agentToTaskStatus(a) {
+      var state = (a.state || '').toLowerCase();
+      var tmuxUp = (a.tmux || '').indexOf('●') !== -1;
+      var durSec = durationToSeconds(a.duration);
+      var icon = a.state_icon || '';
+      if (state.indexOf('zombie') !== -1 || state.indexOf('cancel') !== -1) return 'cancelled';
+      if (state.indexOf('idle') !== -1) return 'idle';
+      if (state.indexOf('complete') !== -1 || state.indexOf('done') !== -1 || state.indexOf('merged') !== -1) return 'completed';
+      if (state.indexOf('work') !== -1 || icon === '●') {
+        if (durSec < 45) return 'started';
+        return 'in progress';
+      }
+      if (state === 'worktree' || !tmuxUp) return 'queued';
+      return 'idle';
+    }
+    async function refreshKanban() {
+      const board = document.getElementById('kanbanBoard');
+      if (!board) return;
+      const tab = document.querySelector('.tab[data-tab="kanban"]');
+      if (tab && !tab.classList.contains('active')) return;
+      try {
+        const r = await fetch('/api/overstory');
+        const data = await r.json();
+        if (data.error) {
+          board.textContent = data.error;
+          return;
+        }
+        const agents = data.agents || [];
+        function esc(s) { if (s == null) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+        var byCol = {};
+        KANBAN_STATUS_ORDER.forEach(function(c) { byCol[c] = []; });
+        agents.forEach(function(a) {
+          var status = agentToTaskStatus(a);
+          if (KANBAN_STATUS_ORDER.indexOf(status) === -1) status = 'idle';
+          byCol[status].push(a);
+        });
+        var html = '';
+        KANBAN_STATUS_ORDER.forEach(function(colKey) {
+          var cards = byCol[colKey];
+          var label = colKey.charAt(0).toUpperCase() + colKey.slice(1);
+          html += '<div class="kanban-column"><div class="kanban-column-header">' + esc(label) + ' (' + cards.length + ')</div><div class="kanban-column-cards">';
+          (cards || []).forEach(function(a) {
+            var state = (a.state || '').toLowerCase();
+            var isZombie = state.indexOf('zombie') !== -1;
+            var dotClass = isZombie ? 'zombie' : (state.indexOf('work') !== -1 ? 'working' : 'idle');
+            var cardClass = 'kanban-card' + (isZombie ? ' zombie' : '');
+            var task = (a.task_short || a.task_full || '').trim().slice(0, 60);
+            var cap = (a.capability || '').trim();
+            html += '<div class="' + cardClass + '">';
+            html += '<div class="kanban-card-name"><span class="state-dot ' + dotClass + '"></span>' + esc(a.name) + '</div>';
+            if (cap) html += '<div class="kanban-card-state">' + esc(cap) + ' · ' + esc(a.state || '—') + '</div>';
+            else html += '<div class="kanban-card-state">' + esc(a.state || '—') + '</div>';
+            html += '<div class="kanban-card-duration">' + esc(a.duration || '') + '</div>';
+            if (task) html += '<div class="kanban-card-task" title="' + esc(task) + '">' + esc(task) + '</div>';
+            html += '</div>';
+          });
+          html += '</div></div>';
+        });
+        board.innerHTML = html || '<div style="color: #8b949e; padding: 16px;">No agents. Route a task from Chat to spawn agents.</div>';
+      } catch (e) {
+        board.textContent = 'Failed to load: ' + e.message;
       }
     }
 
@@ -4025,10 +4277,10 @@ INDEX_HTML = """<!DOCTYPE html>
           const [uiR, gwR] = await Promise.all([fetch('/api/ui-settings'), fetch('/api/settings')]);
           const ui = await uiR.json();
           const gw = await gwR.json().catch(function() { return {}; });
-          REFRESH_INTERVAL = parseInt(ui.refresh_interval_ms, 10) || 1000;
+          REFRESH_INTERVAL = parseInt(ui.refresh_interval_ms, 10) || 3000;
           if (refreshSelect) {
             refreshSelect.value = String(REFRESH_INTERVAL);
-            if (![500, 1000, 2000, 5000].includes(REFRESH_INTERVAL)) refreshSelect.value = '1000';
+            if (![500, 1000, 2000, 3000, 5000].includes(REFRESH_INTERVAL)) refreshSelect.value = '3000';
           }
           if (sidebarCollapsedCb) sidebarCollapsedCb.checked = !!ui.sidebar_collapsed_default;
           if (defaultFolderSel) {
@@ -4046,7 +4298,7 @@ INDEX_HTML = """<!DOCTYPE html>
       async function saveSettings() {
         try {
           const payload = {
-            refresh_interval_ms: parseInt(refreshSelect.value, 10) || 1000,
+            refresh_interval_ms: parseInt(refreshSelect.value, 10) || 3000,
             sidebar_collapsed_default: !!sidebarCollapsedCb.checked,
             default_project_folder: defaultFolderSel.value === '__custom__' ? (customPathInput.value || '').trim() || 'overstory' : 'overstory'
           };
@@ -4101,6 +4353,7 @@ INDEX_HTML = """<!DOCTYPE html>
         refreshSessionUsage();
         refreshTick++;
         if (refreshTick % 3 === 0) refreshAgentTerminals();
+        if (document.querySelector('.tab[data-tab="kanban"]') && document.querySelector('.tab[data-tab="kanban"]').classList.contains('active')) refreshKanban();
         if (refreshTick > 0 && refreshTick % 5 === 0) {
           fetch('/api/agents/auto-accept-prompts', { method: 'POST' }).catch(function(){});
         }
@@ -4112,7 +4365,7 @@ INDEX_HTML = """<!DOCTYPE html>
       try {
         const r = await fetch('/api/ui-settings');
         const s = await r.json();
-        REFRESH_INTERVAL = parseInt(s.refresh_interval_ms, 10) || 1000;
+        REFRESH_INTERVAL = parseInt(s.refresh_interval_ms, 10) || 3000;
         var refEl = document.getElementById('refreshInterval');
         if (refEl) refEl.textContent = REFRESH_INTERVAL + 'ms';
         if (localStorage.getItem('overclaw_sidebar_collapsed') === null && s.sidebar_collapsed_default) {

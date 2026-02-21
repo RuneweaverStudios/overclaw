@@ -154,7 +154,8 @@ async def _merge_drain_once() -> dict:
 
 async def _merge_drain_loop() -> None:
     """Background: periodically drain Overstory merge queue so lead→builder→reviewer→merge_ready flows complete."""
-    interval_s = int(os.environ.get("OVERCLAW_MERGE_DRAIN_INTERVAL", "45"))
+    # MacBook-friendly default: drain merge queue every 90s (was 45s)
+    interval_s = int(os.environ.get("OVERCLAW_MERGE_DRAIN_INTERVAL", "90"))
     while True:
         try:
             await asyncio.sleep(interval_s)
@@ -994,7 +995,8 @@ async def _capture_tmux_pane(session_name: str, lines: int = 80) -> str:
     return ""
 
 
-DISCLAIMER_WATCHER_INTERVAL_S = 3.0  # Poll tmux every 3s so disclaimers are accepted as soon as they appear
+# MacBook-friendly: poll tmux every 8s (was 3s) to reduce load on 16GB M1
+DISCLAIMER_WATCHER_INTERVAL_S = float(os.environ.get("OVERCLAW_DISCLAIMER_WATCHER_INTERVAL", "8"))
 
 
 async def _run_disclaimer_accept_once() -> int:
@@ -1356,19 +1358,17 @@ def _lead_for_agent(agent_name: str) -> str:
     return "orchestrator"
 
 
-async def zombies_slay(request: Request) -> JSONResponse:
-    """POST /api/zombies/slay — kill zombie agents (overstory clean --worktrees --sessions).
-    Before slaying, auto-mail the lead for each zombie so the lead is notified."""
+async def _slay_zombies_once() -> dict:
+    """Check for zombies and slay them (mail leads, then clean --worktrees --sessions). Returns {slain, error?, zombies, message?}."""
     status_result = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
     if status_result.get("error"):
-        return JSONResponse({"error": status_result["error"], "slain": 0})
+        return {"slain": 0, "error": status_result["error"]}
     agents = status_result.get("agents") or []
     zombies = [a for a in agents if (a.get("state") or "").lower() == "zombie"]
     zombie_names = [a.get("agentName") or a.get("name", "") for a in zombies]
     slain = len(zombie_names)
     if slain == 0:
-        return JSONResponse({"slain": 0, "message": "No zombies to slay.", "zombies": []})
-    # Auto-mail the lead for each zombie before slaying
+        return {"slain": 0, "zombies": [], "message": "No zombies to slay."}
     for name in zombie_names:
         lead = _lead_for_agent(name)
         msg = f"Zombie detected: {name} was marked zombie and is being slain (clean --worktrees --sessions). You may want to respawn or reassign the task."
@@ -1378,12 +1378,41 @@ async def zombies_slay(request: Request) -> JSONResponse:
             log.warning("Failed to mail lead %s about zombie %s: %s", lead, name, e)
     clean_result = await _overstory_run(["clean", "--worktrees", "--sessions"], timeout=30, cwd=WORKSPACE)
     if clean_result.get("error"):
-        return JSONResponse({"error": clean_result["error"], "slain": 0, "zombies": zombie_names})
-    return JSONResponse({
+        return {"slain": 0, "error": clean_result["error"], "zombies": zombie_names}
+    return {
         "slain": slain,
         "zombies": zombie_names,
         "message": "Your agents were zombies so I had to kill them.",
-    })
+    }
+
+
+async def zombies_slay(request: Request) -> JSONResponse:
+    """POST /api/zombies/slay — kill zombie agents (overstory clean --worktrees --sessions).
+    Before slaying, auto-mail the lead for each zombie so the lead is notified."""
+    result = await _slay_zombies_once()
+    if result.get("error") and result.get("slain", 0) == 0:
+        return JSONResponse({"error": result["error"], "slain": 0})
+    return JSONResponse(result)
+
+
+# Zombie slayer runs once per minute (MacBook-friendly; keeps agents from piling up)
+ZOMBIE_SLAYER_INTERVAL_S = int(os.environ.get("OVERCLAW_ZOMBIE_SLAYER_INTERVAL", "60"))
+
+
+async def _zombie_slayer_loop() -> None:
+    """Background: every N seconds check for zombies and slay them."""
+    log.info("Zombie slayer started (interval %ds)", ZOMBIE_SLAYER_INTERVAL_S)
+    while True:
+        try:
+            await asyncio.sleep(ZOMBIE_SLAYER_INTERVAL_S)
+            result = await _slay_zombies_once()
+            if result.get("slain", 0) > 0:
+                log.info("Zombie slayer: slain %s — %s", result["slain"], result.get("message", ""))
+        except asyncio.CancelledError:
+            log.info("Zombie slayer stopped")
+            break
+        except Exception as e:
+            log.warning("Zombie slayer tick: %s", e)
 
 
 async def agents_kill_all(request: Request) -> JSONResponse:
@@ -1606,7 +1635,8 @@ Message:
         return True
 
 
-APPROVAL_SUPERVISOR_INTERVAL_S = 1.0
+# MacBook-friendly: check approval mail every 12s (was 1s) to reduce load on 16GB M1
+APPROVAL_SUPERVISOR_INTERVAL_S = float(os.environ.get("OVERCLAW_APPROVAL_SUPERVISOR_INTERVAL", "12"))
 # Give leads time to approve first; supervisor steps in only after this many seconds (lead-first, supervisor fallback). If no active leads, window is 0.
 APPROVAL_SUPERVISOR_LEAD_WINDOW_S = 120
 _approval_supervisor_wake: asyncio.Event | None = None  # Set in lifespan so new mail can wake the loop immediately
@@ -2225,31 +2255,26 @@ routes = [
 
 @contextlib.asynccontextmanager
 async def lifespan(app: Starlette):
-    """Start background disclaimer watcher, Ollama approval supervisor, and Overstory merge drain loop."""
+    """Start background: disclaimer watcher, approval supervisor, merge drain, zombie slayer (once per minute)."""
     global _approval_supervisor_wake, _mail_db_lock
     _approval_supervisor_wake = asyncio.Event()
     _mail_db_lock = asyncio.Lock()
     watcher = asyncio.create_task(_disclaimer_watcher_loop())
     approval_supervisor = asyncio.create_task(_approval_supervisor_loop())
     merge_drain = asyncio.create_task(_merge_drain_loop())
+    zombie_slayer = asyncio.create_task(_zombie_slayer_loop())
     try:
         yield
     finally:
         watcher.cancel()
         approval_supervisor.cancel()
         merge_drain.cancel()
-        try:
-            await watcher
-        except asyncio.CancelledError:
-            pass
-        try:
-            await approval_supervisor
-        except asyncio.CancelledError:
-            pass
-        try:
-            await merge_drain
-        except asyncio.CancelledError:
-            pass
+        zombie_slayer.cancel()
+        for t in (watcher, approval_supervisor, merge_drain, zombie_slayer):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
 
 app = Starlette(routes=routes, lifespan=lifespan)
