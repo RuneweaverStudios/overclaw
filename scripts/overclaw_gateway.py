@@ -118,6 +118,53 @@ async def _overstory_run(args: list[str], timeout: int = 60, cwd: Path | None = 
         return {"raw": out}
 
 
+def _parse_merge_queue_from_status(raw_text: str) -> int:
+    """Parse merge queue count from overstory status stdout (e.g. '🔀 Merge queue: 2')."""
+    if not raw_text:
+        return 0
+    for line in (raw_text if isinstance(raw_text, str) else "").split("\n"):
+        line = line.strip()
+        if "🔀 Merge queue:" in line or "Merge queue:" in line:
+            try:
+                return int(line.split(":")[1].strip().split()[0])
+            except (IndexError, ValueError):
+                pass
+    return 0
+
+
+async def _get_merge_queue_count() -> int:
+    """Return number of branches in Overstory merge queue (ready to merge)."""
+    result = await _overstory_run(["status"], timeout=15)
+    raw = result.get("raw") or ""
+    return _parse_merge_queue_from_status(raw)
+
+
+async def _merge_drain_once() -> dict:
+    """If merge queue has items, run overstory merge --all once. Returns {drained, result?, error?}."""
+    count = await _get_merge_queue_count()
+    if count == 0:
+        return {"drained": 0}
+    log.info("Merge queue has %d branch(es), running overstory merge", count)
+    result = await _overstory_run(["merge", "--all"], timeout=300, cwd=WORKSPACE)
+    if result.get("error"):
+        log.warning("overstory merge --all failed: %s", result.get("error"))
+        return {"drained": 0, "error": result.get("error"), "result": result}
+    return {"drained": count, "result": result}
+
+
+async def _merge_drain_loop() -> None:
+    """Background: periodically drain Overstory merge queue so lead→builder→reviewer→merge_ready flows complete."""
+    interval_s = int(os.environ.get("OVERCLAW_MERGE_DRAIN_INTERVAL", "45"))
+    while True:
+        try:
+            await asyncio.sleep(interval_s)
+            await _merge_drain_once()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("Merge drain loop error: %s", e)
+
+
 async def _create_bead_and_spec(task: str, task_id: str | None = None) -> dict:
     """Create Bead task (if enabled) and spec file. Returns task_id, sling_task_id, spec_path, bead_created."""
     task_id = task_id or f"oc-{uuid.uuid4().hex[:8]}"
@@ -670,16 +717,23 @@ async def _do_route_task(task: str, spawn: bool, context: dict | None = None) ->
     if not spawn:
         return result
 
+    # Use a gateway-controlled task_id for spawn so overstory/sling never tries to resolve
+    # the router's id as a bead (which fails with "Bead task not found" when no overstory client).
+    spawn_task_id = f"oc-{uuid.uuid4().hex[:8]}"
+    short_id = spawn_task_id[3:11]  # 8 hex chars for lead/worker names (lead-xxxxxxxx, builder-xxxxxxxx)
+
     worker_caps = {"builder", "scout", "reviewer"}
-    task_id = result.get("task_id", f"oc-{uuid.uuid4().hex[:8]}")
-    created = await _create_bead_and_spec(task, task_id=task_id)
+    capability = result.get("capability", "builder")
+    lead_name = f"lead-{short_id}"
+    worker_name = f"{capability}-{short_id}"
+
+    created = await _create_bead_and_spec(task, task_id=spawn_task_id)
     sling_task_id = created["sling_task_id"]
     spec_path = created["spec_path"]
     await asyncio.sleep(2)
 
     try:
-        if result.get("capability") in worker_caps:
-            lead_name = f"lead-{task_id[:8]}"
+        if capability in worker_caps:
             sling_result = await _sling_agent(
                 sling_task_id, "lead", lead_name, spec_path, timeout=120
             )
@@ -690,8 +744,8 @@ async def _do_route_task(task: str, spawn: bool, context: dict | None = None) ->
             await asyncio.sleep(2)
             sling_result = await _sling_agent(
                 sling_task_id,
-                result["capability"],
-                result["name"],
+                capability,
+                worker_name,
                 spec_path,
                 parent=lead_name,
                 timeout=120,
@@ -699,8 +753,8 @@ async def _do_route_task(task: str, spawn: bool, context: dict | None = None) ->
         else:
             sling_result = await _sling_agent(
                 sling_task_id,
-                result["capability"],
-                result["name"],
+                capability,
+                worker_name,
                 spec_path,
                 timeout=120,
             )
@@ -710,8 +764,9 @@ async def _do_route_task(task: str, spawn: bool, context: dict | None = None) ->
         else:
             result["spawn_result"] = sling_result
             result["spawned"] = True
-            agent_name = result.get("name") or f"{result.get('capability', 'agent')}-{task_id[:8]}"
-            await _send_mail_to_agent("orchestrator", agent_name, task, "normal")
+            result["task_id"] = short_id
+            result["name"] = worker_name
+            await _send_mail_to_agent("orchestrator", worker_name, task, "normal")
     except Exception as exc:
         result["spawn_error"] = str(exc)
         result["spawned"] = False
@@ -763,8 +818,9 @@ async def agents_spawn(request: Request) -> JSONResponse:
     {"task": "...", "capability": "builder", "name": "optional", "force": false}
 
     overstory hierarchy: coordinator -> lead -> workers (builder/scout/reviewer).
-    Use capability="lead" for top-level spawns, or force=true to bypass.
-    A task-id is auto-generated (overstory requires one for Beads tracking).
+    When capability is builder/scout/reviewer and parent is not set, we spawn a lead first so workers
+    never run without a lead (approval mail, 2-min window). Use capability="lead" for top-level spawns,
+    or force=true to bypass. A task-id is auto-generated (overstory requires one for Beads tracking).
     """
     body = await request.json()
     task = body.get("task", "")
@@ -780,32 +836,58 @@ async def agents_spawn(request: Request) -> JSONResponse:
 
     name = body.get("name", f"{capability}-{uuid.uuid4().hex[:6]}")
     task_id = body.get("task_id", f"oc-{uuid.uuid4().hex[:8]}")
+    force = body.get("force", False)
+    parent = body.get("parent")
+
+    worker_caps = {"builder", "scout", "reviewer"}
+    spawn_lead_first = (
+        capability in worker_caps
+        and not parent
+        and not force
+    )
 
     created = await _create_bead_and_spec(task, task_id=task_id)
     sling_task_id = created["sling_task_id"]
     spec_path = created["spec_path"]
-    # Delay after DB operations (bead/spec creation) before spawning agent (reduce DB lock contention)
     await asyncio.sleep(2)
+
+    if spawn_lead_first:
+        lead_name = f"lead-{task_id[:8]}"
+        lead_result = await _sling_agent(
+            sling_task_id, "lead", lead_name, spec_path, timeout=120
+        )
+        if lead_result.get("error"):
+            return JSONResponse({
+                "error": f"Lead spawn failed (worker requires lead): {lead_result['error']}",
+                "agent_name": name,
+                "capability": capability,
+                "task_id": task_id,
+                "sling_task_id": sling_task_id,
+            }, status_code=500)
+        await asyncio.sleep(2)
+        parent = lead_name
 
     result = await _sling_agent(
         sling_task_id,
         capability,
         name,
         spec_path,
-        parent=body.get("parent"),
-        force=body.get("force", False),
+        parent=parent,
+        force=force,
         timeout=120,
     )
     result["agent_name"] = name
     result["capability"] = capability
     result["task_id"] = body.get("task_id", task_id)
     result["sling_task_id"] = sling_task_id
+    if spawn_lead_first:
+        result["lead_spawned"] = True
+        result["lead_name"] = f"lead-{task_id[:8]}"
     if created.get("bead_created") and created.get("bead_id"):
         result["bead_id"] = created["bead_id"]
         result["bead_created"] = True
     if spec_path:
         result["spec_file"] = str(spec_path.relative_to(WORKSPACE))
-    # So "check mail" has something to show: send task to the new agent
     if not result.get("error"):
         await _send_mail_to_agent("orchestrator", name, task, "normal")
     return JSONResponse(result)
@@ -816,6 +898,40 @@ def _tmux_session_for_agent(agents: list, agent_name: str) -> str | None:
     for a in agents or []:
         if (a.get("agentName") or a.get("name")) == agent_name:
             return a.get("tmuxSession")
+    return None
+
+
+async def _list_overstory_tmux_sessions() -> list[str]:
+    """List all tmux session names that look like overstory agents (overstory-overclaw-*)."""
+    result = await _run_command(
+        ["tmux", "list-sessions", "-F", "#{session_name}"],
+        timeout=5,
+        cwd=WORKSPACE,
+    )
+    if result.get("returncode") != 0:
+        return []
+    out = (result.get("stdout") or "").strip()
+    return [s.strip() for s in out.splitlines() if s.strip().startswith("overstory-overclaw-")]
+
+
+async def _resolve_tmux_session_for_approval(from_agent: str, agents: list) -> str | list[str] | None:
+    """Resolve mail sender (e.g. builder-test-ap) to one or more tmux session names. Uses overstory status first;
+    if that session does not exist (e.g. name is display name but session has task-id suffix), falls back
+    to sessions matching by role prefix (builder, lead, scout, etc.) so the supervisor can try each until one accepts."""
+    session = _tmux_session_for_agent(agents, from_agent) or f"overstory-overclaw-{from_agent}"
+    all_sessions = await _list_overstory_tmux_sessions()
+    if session in all_sessions:
+        return session
+    # Fallback: from_agent may be a display name; session might be e.g. overstory-overclaw-builder-4b36c480
+    prefix = from_agent.split("-")[0] if "-" in from_agent else from_agent
+    matching = [
+        s for s in all_sessions
+        if (s.replace("overstory-overclaw-", "", 1)).startswith(prefix + "-")
+    ]
+    if len(matching) == 1:
+        return matching[0]
+    if len(matching) > 1:
+        return matching  # Supervisor will try each until one accepts
     return None
 
 
@@ -997,18 +1113,34 @@ async def agents_accept_all_disclaimers(request: Request) -> JSONResponse:
 
 async def agents_approve(request: Request) -> JSONResponse:
     """POST /api/agents/{name}/approve — send Down+Enter to accept the agent's current confirmation prompt.
-    Use when a worker has requested approval via mail; the lead (or orchestrator) calls this to approve."""
+    Use when a worker has requested approval via mail; the lead (or orchestrator) calls this to approve.
+    Resolves name to tmux session via overstory status, or by single matching session by role prefix (e.g. builder-*)."""
     name = request.path_params["name"]
     status = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
     agents = status.get("agents") or []
-    session_name = _tmux_session_for_agent(agents, name) or f"overstory-overclaw-{name}"
-    out = await _send_tmux_keys(session_name, "Down", delay_after_s=0)
-    if out.get("error"):
-        return JSONResponse({"ok": False, "agent": name, "error": out["error"], "session_used": session_name}, status_code=500)
-    out = await _send_tmux_keys(session_name, "", delay_after_s=0)
-    if out.get("error"):
-        return JSONResponse({"ok": False, "agent": name, "error": out["error"], "session_used": session_name}, status_code=500)
-    return JSONResponse({"ok": True, "agent": name, "message": "Sent Down+Enter (approval)."})
+    resolved = await _resolve_tmux_session_for_approval(name, agents)
+    if not resolved:
+        return JSONResponse(
+            {"ok": False, "agent": name, "error": "no tmux session found (exact or match by role)", "session_used": ""},
+            status_code=500,
+        )
+    candidates = [resolved] if isinstance(resolved, str) else resolved
+    for session_name in candidates:
+        out = await _send_tmux_keys(session_name, "Down", delay_after_s=0)
+        if out.get("error"):
+            continue
+        out = await _send_tmux_keys(session_name, "", delay_after_s=0)
+        if out.get("error"):
+            continue
+        try:
+            await _send_mail_to_agent("approval-supervisor", name, "Approved. You may proceed.", "normal")
+        except Exception as e:
+            log.debug("agents_approve: could not send approval mail to %s: %s", name, e)
+        return JSONResponse({"ok": True, "agent": name, "message": "Sent Down+Enter (approval).", "session_used": session_name})
+    return JSONResponse(
+        {"ok": False, "agent": name, "error": f"tried {len(candidates)} session(s), none accepted keys", "session_used": candidates[0] if candidates else ""},
+        status_code=500,
+    )
 
 
 async def agents_restart_with_skip_permissions(request: Request) -> JSONResponse:
@@ -1075,6 +1207,13 @@ async def agents_accept_mail_check(request: Request) -> JSONResponse:
 async def agents_inspect(request: Request) -> JSONResponse:
     """GET /api/agents/{name} — inspect a specific agent."""
     name = request.path_params["name"]
+    if name and name.strip().lower() == "ollama supervisor":
+        return JSONResponse({
+            "name": "Ollama supervisor",
+            "capability": "supervisor",
+            "system": True,
+            "raw": "Ollama approval supervisor runs in the gateway process (no Overstory tmux session).\n\nIt analyzes unread mail to lead/supervisor every 1s and, when Ollama classifies a message as an approval request, sends Down+Enter to the worker's session. When there are active leads, they get a 2-minute window to approve first; otherwise the supervisor acts immediately.\n\nTo watch gateway logs, check the process that runs overclaw_gateway or use your terminal.",
+        })
     result = await _overstory_run(["inspect", name])
     return JSONResponse(result)
 
@@ -1086,6 +1225,12 @@ async def agents_terminal(request: Request) -> JSONResponse:
         name = request.path_params.get("name") or ""
         if not name:
             return JSONResponse({"output": "", "session": "", "source": "error", "error": "agent name required"}, status_code=400)
+        if name.strip().lower() == "ollama supervisor":
+            return JSONResponse({
+                "output": "Ollama approval supervisor runs in the gateway process (no tmux session).\n\nIt analyzes unread mail to lead/supervisor every 1s and, when Ollama classifies a message as an approval request, sends Down+Enter to the worker's session. When there are active leads, they get a 2-minute window to approve first; otherwise the supervisor acts immediately.",
+                "session": "",
+                "source": "system",
+            })
         session_name = f"overstory-overclaw-{name}"
         try:
             lines = int(request.query_params.get("lines", "100"))
@@ -1164,12 +1309,18 @@ async def worktrees_clean(request: Request) -> JSONResponse:
     # Build a one-line log message for terminal log
     removed = result.get("removed") or result.get("worktrees") or result.get("cleaned")
     if isinstance(removed, list) and removed:
-        result["logMessage"] = f"Pruned {len(removed)} completed worktrees: {', '.join(str(x) for x in removed[:10])}{'…' if len(removed) > 10 else ''}"
+        parts = [str(x).replace("overstory/", "overclaw/") for x in removed[:10]]
+        result["logMessage"] = f"Pruned {len(removed)} completed worktrees: {', '.join(parts)}{'…' if len(removed) > 10 else ''}"
     elif isinstance(removed, list):
         result["logMessage"] = "Pruned 0 completed worktrees."
     else:
         raw = result.get("raw") or ""
-        result["logMessage"] = f"Pruned completed worktrees. {raw.strip()[:200]}" if raw.strip() else "Pruned completed worktrees."
+        if raw.strip():
+            # Display overclaw instead of overstory in user-facing log
+            display_raw = raw.strip()[:200].replace("overstory/", "overclaw/")
+            result["logMessage"] = f"Pruned completed worktrees. {display_raw}"
+        else:
+            result["logMessage"] = "Pruned completed worktrees."
     return JSONResponse(result)
 
 
@@ -1179,9 +1330,9 @@ async def zombies_list(request: Request) -> JSONResponse:
         result = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
     except Exception as e:
         log.exception("zombies_list: overstory run failed")
-        return JSONResponse({"error": str(e), "zombies": [], "count": 0}, status_code=500)
+        return JSONResponse({"error": str(e), "zombies": [], "count": 0}, status_code=200)
     if result.get("error"):
-        return JSONResponse({"error": result["error"], "zombies": [], "count": 0})
+        return JSONResponse({"error": result["error"], "zombies": [], "count": 0}, status_code=200)
     agents = result.get("agents") or []
     zombies = []
     for a in agents:
@@ -1235,6 +1386,39 @@ async def zombies_slay(request: Request) -> JSONResponse:
     })
 
 
+async def agents_kill_all(request: Request) -> JSONResponse:
+    """POST /api/agents/kill-all — stop all agents, clear mail and task queue for a fresh start.
+    Runs overstory clean --worktrees --sessions then clears mail.db. Use when opening a new project fresh."""
+    try:
+        # 1) Kill all agent sessions and clean worktrees (same as slay but run unconditionally)
+        clean_result = await _overstory_run(["clean", "--worktrees", "--sessions"], timeout=45, cwd=WORKSPACE)
+        if not isinstance(clean_result, dict):
+            clean_result = {"error": "overstory returned invalid result"}
+        if clean_result.get("error"):
+            return JSONResponse({
+                "ok": False,
+                "error": str(clean_result.get("error", "clean failed"))[:500],
+                "cleaned": False,
+                "mail_cleared": 0,
+            }, status_code=500)
+        # 2) Clear all mail so inbox is empty
+        mail_cleared = await _clear_all_mail()
+        return JSONResponse({
+            "ok": True,
+            "cleaned": True,
+            "mail_cleared": mail_cleared,
+            "message": "All agents stopped, mail and queue cleared. You can open a new project fresh.",
+        }, status_code=200)
+    except Exception as e:
+        log.exception("agents_kill_all failed")
+        return JSONResponse({
+            "ok": False,
+            "error": str(e)[:500],
+            "cleaned": False,
+            "mail_cleared": 0,
+        }, status_code=500)
+
+
 def _mail_db_path() -> Path:
     return WORKSPACE / ".overstory" / "mail.db"
 
@@ -1259,6 +1443,35 @@ async def _with_mail_db_lock():
     return _mail_db_lock
 
 
+def _clear_all_mail_sync() -> int:
+    """Sync helper: delete all messages and threads from mail.db. Returns count deleted."""
+    mail_db = _mail_db_path()
+    if not mail_db.is_file():
+        return 0
+    try:
+        conn = _mail_db_connection(mail_db)
+        cur = conn.execute("SELECT COUNT(*) FROM messages")
+        count = cur.fetchone()[0]
+        conn.execute("DELETE FROM messages")
+        if "threads" in [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]:
+            conn.execute("DELETE FROM threads")
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+        return count
+    except Exception as e:
+        log.warning("_clear_all_mail_sync: %s", e)
+        return 0
+
+
+async def _clear_all_mail() -> int:
+    """Delete all messages (and threads) from mail.db. Returns count deleted. Use for kill-all reset."""
+    lock = await _with_mail_db_lock()
+    async with lock:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _clear_all_mail_sync)
+
+
 def _fetch_unread_mail_to_lead_supervisor() -> list[dict]:
     """Read mail.db for ALL unread messages to lead/supervisor/approval-supervisor/coordinator.
     Matches overstory's expected recipients so the Ollama approval supervisor processes the same mail overstory shows."""
@@ -1269,7 +1482,7 @@ def _fetch_unread_mail_to_lead_supervisor() -> list[dict]:
         conn = _mail_db_connection(mail_db)
         conn.row_factory = sqlite3.Row
         cur = conn.execute(
-            """SELECT id, from_agent, to_agent, body FROM messages
+            """SELECT id, from_agent, to_agent, body, created_at FROM messages
                WHERE read = 0 AND (
                  to_agent = 'lead' OR to_agent = 'supervisor'
                  OR to_agent = 'approval-supervisor' OR to_agent = 'coordinator'
@@ -1285,18 +1498,94 @@ def _fetch_unread_mail_to_lead_supervisor() -> list[dict]:
         return []
 
 
-def _mark_mail_read(msg_id: int) -> None:
-    """Mark a message as read in mail.db."""
+def _mark_mail_read(msg_id: int | str | None) -> None:
+    """Mark a message as read in mail.db. msg_id can be integer (legacy) or text (overstory id)."""
+    if msg_id is None:
+        return
     mail_db = _mail_db_path()
     if not mail_db.is_file():
         return
     try:
         conn = _mail_db_connection(mail_db)
-        conn.execute("UPDATE messages SET read = 1 WHERE id = ?", (msg_id,))
+        conn.execute("UPDATE messages SET read = 1 WHERE id = ?", (str(msg_id),))
         conn.commit()
         conn.close()
     except Exception as e:
         log.debug("_mark_mail_read: %s", e)
+
+
+def _mark_all_unread_from_sender_to_lead_read(from_agent: str) -> int:
+    """Mark all unread messages from this sender to any lead/supervisor as read. Returns count updated. Use after approving that sender once to dedupe mail."""
+    mail_db = _mail_db_path()
+    if not mail_db.is_file() or not (from_agent or "").strip():
+        return 0
+    try:
+        conn = _mail_db_connection(mail_db)
+        cur = conn.execute(
+            """UPDATE messages SET read = 1 WHERE read = 0 AND from_agent = ? AND (
+                 to_agent = 'lead' OR to_agent = 'supervisor'
+                 OR to_agent = 'approval-supervisor' OR to_agent = 'coordinator'
+                 OR to_agent LIKE 'lead-%' OR to_agent LIKE 'supervisor-%'
+                 OR to_agent LIKE 'approval-supervisor-%' OR to_agent LIKE 'coordinator-%'
+               )""",
+            (from_agent.strip(),),
+        )
+        n = cur.rowcount
+        conn.commit()
+        conn.close()
+        return n
+    except Exception as e:
+        log.debug("_mark_all_unread_from_sender_to_lead_read: %s", e)
+        return 0
+
+
+def _reassign_mail_to_lead(lead_name: str) -> int:
+    """Reassign all unread mail to lead/supervisor/coordinator to the given lead. Returns number of rows updated."""
+    mail_db = _mail_db_path()
+    if not mail_db.is_file() or not (lead_name or "").strip():
+        return 0
+    try:
+        conn = _mail_db_connection(mail_db)
+        cur = conn.execute(
+            """UPDATE messages SET to_agent = ? WHERE read = 0 AND (
+                 to_agent = 'lead' OR to_agent = 'supervisor'
+                 OR to_agent = 'approval-supervisor' OR to_agent = 'coordinator'
+                 OR to_agent LIKE 'lead-%' OR to_agent LIKE 'supervisor-%'
+                 OR to_agent LIKE 'approval-supervisor-%' OR to_agent LIKE 'coordinator-%'
+               )""",
+            (lead_name.strip(),),
+        )
+        n = cur.rowcount
+        conn.commit()
+        conn.close()
+        return n
+    except Exception as e:
+        log.debug("_reassign_mail_to_lead: %s", e)
+        return 0
+
+
+def _get_unread_mail_counts() -> tuple[int, int]:
+    """Return (total_unread, unread_to_lead_supervisor). For debug endpoint."""
+    mail_db = _mail_db_path()
+    if not mail_db.is_file():
+        return 0, 0
+    try:
+        conn = _mail_db_connection(mail_db)
+        total = conn.execute("SELECT COUNT(*) FROM messages WHERE read = 0").fetchone()[0]
+        cur = conn.execute(
+            """SELECT COUNT(*) FROM messages WHERE read = 0 AND (
+                 to_agent = 'lead' OR to_agent = 'supervisor'
+                 OR to_agent = 'approval-supervisor' OR to_agent = 'coordinator'
+                 OR to_agent LIKE 'lead-%' OR to_agent LIKE 'supervisor-%'
+                 OR to_agent LIKE 'approval-supervisor-%' OR to_agent LIKE 'coordinator-%'
+               )"""
+        )
+        to_lead = cur.fetchone()[0]
+        conn.close()
+        return total, to_lead
+    except Exception as e:
+        log.debug("_get_unread_mail_counts: %s", e)
+        return 0, 0
 
 
 async def _ollama_is_approval_request(body: str) -> bool:
@@ -1318,20 +1607,185 @@ Message:
 
 
 APPROVAL_SUPERVISOR_INTERVAL_S = 1.0
+# Give leads time to approve first; supervisor steps in only after this many seconds (lead-first, supervisor fallback). If no active leads, window is 0.
+APPROVAL_SUPERVISOR_LEAD_WINDOW_S = 120
 _approval_supervisor_wake: asyncio.Event | None = None  # Set in lifespan so new mail can wake the loop immediately
+_approval_supervisor_last_error: str | None = None  # Last failure reason (for debug endpoint)
 
 
-async def _approval_supervisor_once() -> int:
-    """Analyze every unread mail to lead/supervisor with Ollama; if approval request, approve sender. Ensures no approvals are missed."""
+# Max leads to reinstate per tick; avoid storm when many workers have missing leads.
+REINSTATE_LEADS_MAX_PER_TICK = 3
+# Don't try to reinstate the same lead again within this many seconds.
+REINSTATE_LEAD_COOLDOWN_S = 90
+_reinstate_last_done: dict[str, float] = {}  # lead_name -> time
+
+
+async def _reinstate_missing_leads() -> int:
+    """If unread mail is to a lead-X and that lead is not active, spawn (reinstate) that lead so it can finish its job. Returns number reinstated."""
+    now = time.time()
+    # Prune cooldown dict
+    global _reinstate_last_done
+    _reinstate_last_done = {k: t for k, t in _reinstate_last_done.items() if now - t < REINSTATE_LEAD_COOLDOWN_S}
     lock = await _with_mail_db_lock()
     async with lock:
         candidates = _fetch_unread_mail_to_lead_supervisor()
+    to_agents = set()
+    for row in candidates:
+        to = (row.get("to_agent") or "").strip()
+        if to.startswith("lead-") and len(to) > 5:
+            to_agents.add(to)
+    if not to_agents:
+        return 0
+    try:
+        status = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
+        agents = status.get("agents") or []
+        active_names = set()
+        for a in agents:
+            name = (a.get("agentName") or a.get("name") or "").strip()
+            if name:
+                active_names.add(name)
+        missing = [name for name in to_agents if name not in active_names and (now - _reinstate_last_done.get(name, 0)) >= REINSTATE_LEAD_COOLDOWN_S]
+        if not missing:
+            return 0
+        reinstated = 0
+        task_template = (
+            "You are the lead for workers. Check mail (overstory mail check --agent $OVERSTORY_AGENT_NAME) "
+            "and approve any Need approval from your workers via approve_agent; coordinate and send merge_ready when done."
+        )
+        for lead_name in sorted(missing)[:REINSTATE_LEADS_MAX_PER_TICK]:
+            try:
+                task_id = lead_name.replace("lead-", "", 1) if lead_name.startswith("lead-") else lead_name
+                created = await _create_bead_and_spec(task_template, task_id=task_id)
+                await asyncio.sleep(1)
+                result = await _sling_agent(
+                    created["sling_task_id"],
+                    "lead",
+                    lead_name,
+                    created["spec_path"],
+                    parent=None,
+                    force=True,
+                    timeout=120,
+                )
+                if result.get("error"):
+                    log.warning("Reinstate lead %s failed: %s", lead_name, result.get("error"))
+                    continue
+                _reinstate_last_done[lead_name] = now
+                reinstated += 1
+                log.info("Reinstated missing lead %s (mail was waiting for them)", lead_name)
+            except Exception as e:
+                log.warning("Reinstate lead %s exception: %s", lead_name, e)
+        return reinstated
+    except Exception as e:
+        log.debug("_reinstate_missing_leads: %s", e)
+        return 0
+
+
+async def _stuck_builder_rescue_once() -> int:
+    """Find builders who sent 'Need approval' to a lead and have no reply from that lead with 'Approved' or 'proceed'; send them approval mail. Returns number sent."""
+    mail_db = _mail_db_path()
+    if not mail_db.is_file():
+        return 0
+    try:
+        conn = _mail_db_connection(mail_db)
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(
+            """SELECT id, from_agent, to_agent, body FROM messages
+               WHERE read = 0 AND (to_agent LIKE 'lead-%' OR to_agent = 'lead' OR to_agent = 'supervisor')
+               AND (body LIKE '%Need approval%' OR body LIKE '%please approve%' OR body LIKE '%requesting approval%')""",
+        )
+        requests = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    except Exception as e:
+        log.debug("_stuck_builder_rescue_once query: %s", e)
+        return 0
+    seen: set[tuple[str, str]] = set()
+    sent = 0
+    for row in requests:
+        from_agent = (row.get("from_agent") or "").strip()
+        to_agent = (row.get("to_agent") or "").strip()
+        if not from_agent or not to_agent or from_agent in ("orchestrator", "gateway"):
+            continue
+        key = (from_agent, to_agent)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            conn = _mail_db_connection(mail_db)
+            cur = conn.execute(
+                """SELECT 1 FROM messages
+                   WHERE from_agent = ? AND to_agent = ? AND (body LIKE '%Approved%' OR body LIKE '%proceed%')
+                   LIMIT 1""",
+                (to_agent, from_agent),
+            )
+            has_reply = cur.fetchone() is not None
+            conn.close()
+        except Exception:
+            has_reply = True
+        if has_reply:
+            continue
+        try:
+            await _send_mail_to_agent(to_agent, from_agent, "Approved. You may proceed.", "normal")
+            sent += 1
+            log.info("Stuck-builder rescue: sent approval mail to %s (from %s)", from_agent, to_agent)
+        except Exception as e:
+            log.warning("Stuck-builder rescue send to %s failed: %s", from_agent, e)
+    return sent
+
+
+async def _approval_supervisor_effective_lead_window_s() -> int:
+    """Return APPROVAL_SUPERVISOR_LEAD_WINDOW_S if there is at least one active lead, else 0 (no window when no leads)."""
+    try:
+        status = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
+        agents = status.get("agents") or []
+        for a in agents:
+            if (a.get("capability") or "").strip().lower() == "lead" and (a.get("state") or "").strip().lower() == "active":
+                return APPROVAL_SUPERVISOR_LEAD_WINDOW_S
+        return 0
+    except Exception:
+        return APPROVAL_SUPERVISOR_LEAD_WINDOW_S  # On error, keep window so we don't bypass leads
+
+
+async def _approval_supervisor_once(lead_window_override_s: float | None = None) -> int:
+    """Process unread mail to lead/supervisor: only act on messages that have been unread for at least effective_lead_window_s
+    (2 min when there are active leads; 0 when none so supervisor acts immediately). Pass lead_window_override_s=0 for immediate approval (e.g. Approve all button)."""
+    lead_window_s = lead_window_override_s if lead_window_override_s is not None else await _approval_supervisor_effective_lead_window_s()
+    lock = await _with_mail_db_lock()
+    async with lock:
+        candidates = _fetch_unread_mail_to_lead_supervisor()
+    now = time.time()
     approved = 0
+    status = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
+    agents = status.get("agents") or []
+    # When lead window is set, mail to a missing lead (not in active set) gets 0 window so supervisor acts immediately.
+    active_lead_names: set[str] = set()
+    if lead_window_s > 0:
+        for a in agents:
+            if (a.get("capability") or "").strip().lower() == "lead":
+                name = (a.get("agentName") or a.get("name") or "").strip()
+                if name:
+                    active_lead_names.add(name)
     for row in candidates:
         msg_id = row.get("id")
         from_agent = (row.get("from_agent") or "").strip()
+        to_agent = (row.get("to_agent") or "").strip()
         body = (row.get("body") or "")[:2000]
+        created_at = row.get("created_at")
+        # Use 0 window for mail to a lead that is not active (so supervisor approves immediately; reinstate may spawn that lead next tick).
+        row_window_s = 0.0 if (to_agent and to_agent.startswith("lead-") and to_agent not in active_lead_names) else lead_window_s
+        if created_at is not None and row_window_s > 0:
+            try:
+                age_s = now - float(created_at)
+                if age_s < row_window_s:
+                    continue  # Lead window: give leads time to approve first; skip until window elapsed
+            except (TypeError, ValueError):
+                pass
         if not from_agent:
+            if msg_id:
+                async with lock:
+                    _mark_mail_read(msg_id)
+            continue
+        # System-originated mail to lead (e.g. test mail from orchestrator) is not a worker approval request; mark read and skip.
+        if from_agent in ("orchestrator", "gateway"):
             if msg_id:
                 async with lock:
                     _mark_mail_read(msg_id)
@@ -1342,21 +1796,44 @@ async def _approval_supervisor_once() -> int:
                     _mark_mail_read(msg_id)
             continue
         try:
-            status = await _overstory_run(["status", "--json"], timeout=10, cwd=WORKSPACE)
-            agents = status.get("agents") or []
-            session_name = _tmux_session_for_agent(agents, from_agent) or f"overstory-overclaw-{from_agent}"
-            out = await _send_tmux_keys(session_name, "Down", delay_after_s=0)
-            if out.get("error"):
-                log.debug("Approval supervisor: approve failed for %s: %s", from_agent, out["error"])
+            global _approval_supervisor_last_error
+            _approval_supervisor_last_error = None
+            resolved = await _resolve_tmux_session_for_approval(from_agent, agents)
+            if not resolved:
+                _approval_supervisor_last_error = f"{from_agent}: no tmux session found (exact or match by role)"
+                log.info("Approval supervisor: no session for %s (try tmux list-sessions | grep %s)", from_agent, from_agent.split("-")[0] if "-" in from_agent else from_agent)
+                # Mark all unread from this sender so inbox clears (stale agent, no session to approve).
+                async with lock:
+                    _mark_all_unread_from_sender_to_lead_read(from_agent)
                 continue
-            out = await _send_tmux_keys(session_name, "", delay_after_s=0)
-            if out.get("error"):
-                log.debug("Approval supervisor: Enter failed for %s: %s", from_agent, out["error"])
-                continue
-            approved += 1
-            log.info("Approval supervisor (Ollama): approved %s", from_agent)
+            candidates = [resolved] if isinstance(resolved, str) else resolved
+            approved_this = False
+            for session_name in candidates:
+                out = await _send_tmux_keys(session_name, "Down", delay_after_s=0)
+                if out.get("error"):
+                    continue
+                out = await _send_tmux_keys(session_name, "", delay_after_s=0)
+                if out.get("error"):
+                    continue
+                approved += 1
+                approved_this = True
+                log.info("Approval supervisor (Ollama): approved %s (session %s)", from_agent, session_name)
+                # Mark all unread approval mail from this sender as read to dedupe (avoid repeated "Need approval" spam).
+                async with lock:
+                    _mark_all_unread_from_sender_to_lead_read(from_agent)
+                # So the worker's "wait for lead response" mail check sees a reply: send mail from the lead they wrote to, back to the worker.
+                to_agent = (row.get("to_agent") or "").strip() or "approval-supervisor"
+                try:
+                    await _send_mail_to_agent(to_agent, from_agent, "Approved. You may proceed.", "normal")
+                except Exception as e:
+                    log.debug("Approval supervisor: could not send approval mail to %s: %s", from_agent, e)
+                break
+            if not approved_this:
+                _approval_supervisor_last_error = f"{from_agent}: tried {len(candidates)} session(s), none accepted keys"
+                log.info("Approval supervisor: could not send keys to %s (tried %s)", from_agent, candidates)
         except Exception as e:
-            log.debug("Approval supervisor: %s for %s: %s", type(e).__name__, from_agent, e)
+            _approval_supervisor_last_error = f"{from_agent}: {type(e).__name__}: {e}"
+            log.info("Approval supervisor: exception for %s — %s", from_agent, e)
         if msg_id:
             async with lock:
                 _mark_mail_read(msg_id)
@@ -1364,13 +1841,19 @@ async def _approval_supervisor_once() -> int:
 
 
 async def _approval_supervisor_loop() -> None:
-    """Always active: on every new mail (wake) or every 1s, analyze all unread mail to lead/supervisor with Ollama and respond to approval requests."""
+    """Always active: on every new mail (wake) or every 1s, reinstate any missing leads with pending mail, then analyze unread mail with Ollama and respond to approval requests."""
     log.info("Approval supervisor (Ollama) started — trigger on every new mail, interval %.1fs", APPROVAL_SUPERVISOR_INTERVAL_S)
     while True:
         try:
+            r = await _reinstate_missing_leads()
+            if r:
+                log.info("Approval supervisor: reinstated %d missing lead(s)", r)
             n = await _approval_supervisor_once()
             if n:
                 log.info("Approval supervisor: approved %d agent(s)", n)
+            rescue = await _stuck_builder_rescue_once()
+            if rescue:
+                log.info("Approval supervisor: stuck-builder rescue sent %d approval mail(s)", rescue)
         except Exception as e:
             log.debug("Approval supervisor tick: %s", e)
         try:
@@ -1381,34 +1864,34 @@ async def _approval_supervisor_loop() -> None:
 
 
 def _write_mail_to_db(from_agent: str, to_agent: str, message: str, priority: str = "normal") -> None:
-    """Persist sent mail to workspace .overstory/mail.db so the dashboard shows it (sent and received)."""
+    """Persist sent mail to workspace .overstory/mail.db. Uses overstory-compatible schema (id TEXT, type, created_at TEXT) so overstory mail check sees it."""
     mail_db = _mail_db_path()
     mail_db.parent.mkdir(parents=True, exist_ok=True)
-    schema = """
-    CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        thread_id TEXT,
-        from_agent TEXT NOT NULL,
-        to_agent TEXT NOT NULL,
-        subject TEXT NOT NULL DEFAULT '',
-        body TEXT NOT NULL DEFAULT '',
-        priority TEXT NOT NULL DEFAULT 'normal',
-        read INTEGER NOT NULL DEFAULT 0,
-        created_at REAL NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_msg_to ON messages(to_agent);
-    CREATE INDEX IF NOT EXISTS idx_msg_read ON messages(read);
-    """
-    now = time.time()
+    msg_id = f"msg-{uuid.uuid4().hex[:12]}"
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     subject = (message.strip().split("\n")[0][:200]) if message.strip() else "No subject"
     body_text = (message or "").strip() or "(no body)"
+    from_a = from_agent or "orchestrator"
+    to_a = to_agent or ""
+    prio = priority or "normal"
     try:
         conn = _mail_db_connection(mail_db)
-        conn.executescript(schema)
-        conn.execute(
-            "INSERT INTO messages (from_agent, to_agent, subject, body, priority, created_at) VALUES (?,?,?,?,?,?)",
-            (from_agent or "orchestrator", to_agent or "", subject, body_text, priority or "normal", now),
-        )
+        # Overstory schema: id TEXT, from_agent, to_agent, subject, body, type, priority, thread_id, payload, read, created_at TEXT
+        try:
+            conn.execute(
+                """INSERT INTO messages (id, from_agent, to_agent, subject, body, type, priority, read, created_at)
+                   VALUES (?,?,?,?,?,?,?,0,?)""",
+                (msg_id, from_a, to_a, subject, body_text, "status", prio, now_iso),
+            )
+        except sqlite3.OperationalError as e:
+            if "no such column" in str(e).lower():
+                # Fallback for older schema (integer id, real created_at)
+                conn.execute(
+                    "INSERT INTO messages (from_agent, to_agent, subject, body, priority, created_at) VALUES (?,?,?,?,?,?)",
+                    (from_a, to_a, subject, body_text, prio, time.time()),
+                )
+            else:
+                raise
         conn.commit()
         conn.close()
     except Exception as e:
@@ -1512,6 +1995,135 @@ async def debug_approval_supervisor_run(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": str(e), "approved": 0})
 
 
+async def supervisor_approve_all(request: Request) -> JSONResponse:
+    """POST /api/supervisor/approve-all — reinstate missing leads first, then process all pending approval mail once (Ollama classify + send Down+Enter to senders). Use when builders are stuck with no lead."""
+    try:
+        r = await _reinstate_missing_leads()
+        if r:
+            log.info("Approve-all: reinstated %d missing lead(s) first", r)
+        n = await _approval_supervisor_once(lead_window_override_s=0)
+        rescue = await _stuck_builder_rescue_once()
+        if rescue:
+            log.info("Approve-all: stuck-builder rescue sent %d approval mail(s)", rescue)
+        return JSONResponse({
+            "ok": True,
+            "approved": n,
+            "reinstated": r,
+            "rescue": rescue,
+            "last_error": _approval_supervisor_last_error,
+        })
+    except Exception as e:
+        log.exception("supervisor_approve_all failed")
+        return JSONResponse({"ok": False, "error": str(e), "approved": 0, "reinstated": 0, "rescue": 0, "last_error": _approval_supervisor_last_error})
+
+
+async def supervisor_send_approval_mail(request: Request) -> JSONResponse:
+    """POST /api/supervisor/send-approval-mail — send 'Approved. You may proceed.' to an agent so their mail check sees it (unblock when supervisor already consumed their Need approval without sending reply). Body: {"to": "builder-4b36c480"} or {"to": "builder-4b36c480", "from": "lead-4b36c480"}."""
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        to_agent = (body.get("to") or "").strip()
+        from_agent = (body.get("from") or "").strip() or "approval-supervisor"
+        if not to_agent:
+            return JSONResponse({"ok": False, "error": "missing 'to' (agent name)"}, status_code=400)
+        await _send_mail_to_agent(from_agent, to_agent, "Approved. You may proceed.", "normal")
+        return JSONResponse({"ok": True, "to": to_agent, "from": from_agent})
+    except Exception as e:
+        log.exception("supervisor_send_approval_mail failed")
+        return JSONResponse({"ok": False, "error": str(e)})
+
+
+async def supervisor_inject_lead(request: Request) -> JSONResponse:
+    """POST /api/supervisor/inject-lead — spawn a lead and reassign all unread lead/supervisor mail to it. Use when agents have no lead."""
+    lead_name = f"lead-inject-{uuid.uuid4().hex[:8]}"
+    task = (
+        "You are the injected lead for orphaned workers. "
+        "Check mail (overstory mail check --agent $OVERSTORY_AGENT_NAME) and approve any workers that need approval via approve_agent; "
+        "coordinate with existing builders."
+    )
+    task_id = f"inject-{uuid.uuid4().hex[:8]}"
+    try:
+        created = await _create_bead_and_spec(task, task_id=task_id)
+        spec_path = created["spec_path"]
+        sling_task_id = created["sling_task_id"]
+        await asyncio.sleep(1)
+        result = await _sling_agent(
+            sling_task_id,
+            "lead",
+            lead_name,
+            spec_path,
+            parent=None,
+            force=True,
+            timeout=120,
+        )
+        if result.get("error"):
+            return JSONResponse({
+                "ok": False,
+                "error": result.get("error"),
+                "lead_name": lead_name,
+                "spawned": False,
+                "mail_reassigned": 0,
+            })
+        mail_reassigned = _reassign_mail_to_lead(lead_name)
+        if _approval_supervisor_wake:
+            _approval_supervisor_wake.set()
+        return JSONResponse({
+            "ok": True,
+            "lead_name": lead_name,
+            "spawned": True,
+            "spawn_result": result,
+            "mail_reassigned": mail_reassigned,
+        })
+    except Exception as e:
+        log.exception("supervisor_inject_lead failed")
+        return JSONResponse({
+            "ok": False,
+            "error": str(e),
+            "lead_name": lead_name,
+            "spawned": False,
+            "mail_reassigned": 0,
+        })
+
+
+async def debug_reinstate_missing_leads_run(request: Request) -> JSONResponse:
+    """POST /api/debug/reinstate-missing-leads-run — run reinstate missing leads once (for tests). Returns {reinstated: n}."""
+    try:
+        r = await _reinstate_missing_leads()
+        return JSONResponse({"ok": True, "reinstated": r})
+    except Exception as e:
+        log.exception("debug_reinstate_missing_leads_run failed")
+        return JSONResponse({"ok": False, "error": str(e), "reinstated": 0})
+
+
+async def debug_approval_supervisor_status(request: Request) -> JSONResponse:
+    """GET /api/debug/approval-supervisor-status — unread counts and last error (why lead/supervisor may not be intervening)."""
+    try:
+        total, to_lead = _get_unread_mail_counts()
+        effective_window = await _approval_supervisor_effective_lead_window_s()
+        return JSONResponse({
+            "unread_total": total,
+            "unread_to_lead_supervisor": to_lead,
+            "last_error": _approval_supervisor_last_error,
+            "lead_window_s": APPROVAL_SUPERVISOR_LEAD_WINDOW_S,
+            "effective_lead_window_s": effective_window,
+            "hint": "When active leads exist, they get lead_window_s to approve first; else effective_lead_window_s is 0 and supervisor acts immediately. If last_error is set, tmux session for sender may be missing — run tmux list-sessions.",
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def overstory_merge(request: Request) -> JSONResponse:
+    """POST /api/overstory/merge — drain merge queue once (run overstory merge --all). Integrates coordinator/lead/builder/reviewer/merger pipeline."""
+    try:
+        out = await _merge_drain_once()
+        return JSONResponse(out)
+    except Exception as e:
+        log.exception("overstory merge failed")
+        return JSONResponse({"error": str(e), "drained": 0}, status_code=500)
+
+
 async def memory_read(request: Request) -> JSONResponse:
     """GET /api/memory?section=... — read MEMORY.md."""
     section = request.query_params.get("section")
@@ -1587,6 +2199,7 @@ routes = [
     Route("/api/agents/auto-accept-prompts", agents_auto_accept_prompts, methods=["POST"]),
     Route("/api/agents/accept-all-disclaimers", agents_accept_all_disclaimers, methods=["POST"]),
     Route("/api/agents/restart-with-skip-permissions", agents_restart_with_skip_permissions, methods=["POST"]),
+    Route("/api/agents/kill-all", agents_kill_all, methods=["POST"]),
     Route("/api/agents/{name}/accept-disclaimer", agents_accept_disclaimer, methods=["POST"]),
     Route("/api/agents/{name}/approve", agents_approve, methods=["POST"]),
     Route("/api/agents/{name}/accept-mail-check", agents_accept_mail_check, methods=["POST"]),
@@ -1602,27 +2215,39 @@ routes = [
     Route("/api/settings", settings_get, methods=["GET"]),
     Route("/api/settings", settings_put, methods=["POST"]),
     Route("/api/debug/approval-supervisor-run", debug_approval_supervisor_run, methods=["POST"]),
+    Route("/api/debug/reinstate-missing-leads-run", debug_reinstate_missing_leads_run, methods=["POST"]),
+    Route("/api/debug/approval-supervisor-status", debug_approval_supervisor_status, methods=["GET"]),
+    Route("/api/supervisor/approve-all", supervisor_approve_all, methods=["POST"]),
+    Route("/api/supervisor/send-approval-mail", supervisor_send_approval_mail, methods=["POST"]),
+    Route("/api/supervisor/inject-lead", supervisor_inject_lead, methods=["POST"]),
+    Route("/api/overstory/merge", overstory_merge, methods=["POST"]),
 ]
 
 @contextlib.asynccontextmanager
 async def lifespan(app: Starlette):
-    """Start background disclaimer watcher and Ollama approval supervisor (always active, trigger on every new mail)."""
+    """Start background disclaimer watcher, Ollama approval supervisor, and Overstory merge drain loop."""
     global _approval_supervisor_wake, _mail_db_lock
     _approval_supervisor_wake = asyncio.Event()
     _mail_db_lock = asyncio.Lock()
     watcher = asyncio.create_task(_disclaimer_watcher_loop())
     approval_supervisor = asyncio.create_task(_approval_supervisor_loop())
+    merge_drain = asyncio.create_task(_merge_drain_loop())
     try:
         yield
     finally:
         watcher.cancel()
         approval_supervisor.cancel()
+        merge_drain.cancel()
         try:
             await watcher
         except asyncio.CancelledError:
             pass
         try:
             await approval_supervisor
+        except asyncio.CancelledError:
+            pass
+        try:
+            await merge_drain
         except asyncio.CancelledError:
             pass
 

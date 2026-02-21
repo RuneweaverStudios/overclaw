@@ -73,7 +73,7 @@
 					},
 					{
 						"type": "command",
-						"command": "mulch learn"
+						"command": "command -v mulch >/dev/null 2>&1 && test -f .mulch/mulch.config.yaml && [ -z \"${OVERSTORY_AGENT_NAME}\" ] && (pwd | grep -q '.overstory/worktrees' || mulch learn) || true"
 					}
 				]
 			}

@@ -51,7 +51,8 @@ merge:
   reimagineEnabled: false
 models:
 mulch:
-  domains: []
+  domains:
+    - overclaw
   enabled: true
   primeFormat: markdown
 project:

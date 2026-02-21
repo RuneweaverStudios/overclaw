@@ -145,6 +145,13 @@ check_only() {
         err "overstory — not found"; all_ok=false
     fi
 
+    # mulch (expertise CLI for overstory agents)
+    if has_cmd mulch || [ -f "$HOME/.bun/bin/mulch" ]; then
+        ok "mulch (expertise CLI)"
+    else
+        err "mulch — not found (npm/bun: mulch-cli)"; all_ok=false
+    fi
+
     # Playwright browsers
     if [ -n "$venv_python" ]; then
         if "$venv_python" -c "from playwright.sync_api import sync_playwright" 2>/dev/null; then
@@ -337,6 +344,26 @@ install_all() {
             }
             ok "overstory installed"
         fi
+    fi
+
+    # 7a. mulch (expertise CLI — overstory agents use mulch prime/record/learn)
+    log "7a/16 mulch (expertise CLI)..."
+    export PATH="${HOME}/.bun/bin:${HOME}/.local/bin:${PATH}"
+    if has_cmd mulch || [ -f "$HOME/.bun/bin/mulch" ]; then
+        ok "mulch already installed ($(mulch --version 2>/dev/null || echo 'mulch-cli'))"
+    else
+        bun install -g mulch-cli 2>/dev/null || npm install -g mulch-cli 2>/dev/null || {
+            err "Could not install mulch-cli — run: bun install -g mulch-cli or npm install -g mulch-cli"
+            MISSING+=("mulch-cli")
+        }
+        if has_cmd mulch || [ -f "$HOME/.bun/bin/mulch" ]; then
+            ok "mulch installed"
+        fi
+    fi
+    if [ -d "$WORKSPACE/.overstory" ] && [ ! -d "$WORKSPACE/.mulch" ]; then
+        log "  Initializing mulch in workspace..."
+        (cd "$WORKSPACE" && mulch init >/dev/null 2>&1) || true
+        [ -d "$WORKSPACE/.mulch" ] && ok "  mulch initialized in workspace" || true
     fi
 
     # 8. Ollama Mistral model

@@ -48,6 +48,47 @@ def _resolve_root_workspace() -> Path:
 ROOT_WORKSPACE = _resolve_root_workspace()
 WORKSPACE = ROOT_WORKSPACE  # kept for compatibility; effective project folder from get_effective_project_folder()
 
+SPECS_DIR = ROOT_WORKSPACE / ".overstory" / "specs"
+
+
+def _task_description_for_agent(name: str, bead_id: str) -> tuple[str, str]:
+    """Resolve short and full task description from spec files. Returns (task_short, task_full)."""
+    task_short = ""
+    task_full = ""
+    if not name or name == "Ollama supervisor":
+        return task_short, task_full
+    # Try oc-{suffix}.md from agent name (e.g. lead-acf799e7 -> oc-acf799e7.md)
+    suffix = ""
+    for prefix in ("lead-", "builder-", "scout-", "reviewer-", "scribe-", "blogger-", "researcher-", "social-media-manager-"):
+        if name.startswith(prefix):
+            suffix = name[len(prefix):].strip()
+            break
+    if not suffix and "-" in name:
+        suffix = name.split("-", 1)[-1]
+    candidates = []
+    if suffix:
+        candidates.append(SPECS_DIR / f"oc-{suffix}.md")
+    bead = (bead_id or "").strip()
+    if bead and bead != "—":
+        candidates.append(SPECS_DIR / f"{bead}.md")
+    for path in candidates:
+        if path.is_file():
+            try:
+                raw = path.read_text(encoding="utf-8", errors="replace").strip()
+                if raw.startswith("# Task:"):
+                    after_header = raw.replace("# Task:", "", 1).strip()
+                    # First meaningful line is often the task (next line after header)
+                    lines = [s.strip() for s in after_header.split("\n") if s.strip()]
+                    task_full = lines[0] if lines else after_header[:2000]
+                    if len(lines) > 1 and len(lines[0]) < 20:
+                        task_full = lines[1] if len(lines[1]) > len(lines[0]) else task_full
+                    task_full = task_full[:2000]
+                    task_short = (task_full[:80] + "…") if len(task_full) > 80 else task_full
+                    break
+            except Exception:
+                pass
+    return task_short, task_full
+
 
 def _resolve_last30days_store() -> Path:
     """Resolve path to last30days store.py by walking up until we find skills/last30days/scripts/store.py."""
@@ -218,14 +259,19 @@ def overstory_status():
                 elif ("●" in line or "◐" in line or "○" in line) and "│" in line:
                     parts = [p.strip() for p in line.split("│")][1:-1]
                     if len(parts) >= 6:
+                        name = parts[1][:20] if len(parts) > 1 else ""
+                        bead_id = parts[4][:16] if len(parts) > 4 else ""
+                        task_short, task_full = _task_description_for_agent(name, bead_id)
                         agents.append({
                             "state_icon": "●" if "●" in line else "◐" if "◐" in line else "○",
-                            "name": parts[1][:20] if len(parts) > 1 else "",
+                            "name": name,
                             "capability": parts[2][:12] if len(parts) > 2 else "",
                             "state": parts[3][:10] if len(parts) > 3 else "",
-                            "bead_id": parts[4][:16] if len(parts) > 4 else "",
+                            "bead_id": bead_id,
                             "duration": parts[5][:10] if len(parts) > 5 else "",
                             "tmux": "●" if len(parts) > 6 and "●" in (parts[6] or "") else "○",
+                            "task_short": task_short,
+                            "task_full": task_full,
                         })
             if in_worktrees and line.startswith("overstory/"):
                 worktrees.append(line)
@@ -251,15 +297,33 @@ def overstory_status():
                     if name and name not in seen:
                         seen.add(name)
                         cap = name.split("-")[0] if "-" in name else name[:12]
+                        bead_id = parts[2][:16] if len(parts) > 2 else ""
+                        task_short, task_full = _task_description_for_agent(name[:24], bead_id)
                         agents.append({
                             "state_icon": "●",
                             "name": name[:24],
                             "capability": cap[:12],
                             "state": "worktree",
-                            "bead_id": parts[2][:16] if len(parts) > 2 else "",
+                            "bead_id": bead_id,
                             "duration": "—",
                             "tmux": "○",
+                            "task_short": task_short,
+                            "task_full": task_full,
                         })
+
+        # Always show Ollama approval supervisor first (runs in gateway, not an overstory tmux agent)
+        agents.insert(0, {
+            "state_icon": "●",
+            "name": "Ollama supervisor",
+            "capability": "supervisor",
+            "state": "active",
+            "bead_id": "—",
+            "duration": "—",
+            "tmux": "○",
+            "system": True,
+            "task_short": "",
+            "task_full": "",
+        })
 
         # Calculate average duration
         avg_duration = "0s"
@@ -478,7 +542,7 @@ def get_terminal_logs_from_status():
         # Add status update
         logs.append({
             "timestamp": time.time(),
-            "message": f"Overstory Status: {len(agents)} active agents",
+            "message": f"OverClaw Status: {len(agents)} active agents",
             "type": "success",
         })
     except:
@@ -886,6 +950,33 @@ def api_project_open():
             return jsonify(result), 400
         return jsonify(result)
     return jsonify({"error": "Provide path or repo"}), 400
+
+
+@app.route("/api/project/create-folder", methods=["POST"])
+def api_project_create_folder():
+    """Create a new subfolder under the workspace and return its path. Request: { \"name\": \"folder-name\" } (relative path; no ..)."""
+    data = request.get_json() or {}
+    name = (data.get("name") or "").strip().replace("\\", "/")
+    if not name:
+        return jsonify({"error": "Folder name is required"}), 400
+    parts = [p for p in name.split("/") if p and p not in (".", "..")]
+    if not parts:
+        return jsonify({"error": "Invalid folder name"}), 400
+    # Limit depth to avoid abuse
+    if len(parts) > 5:
+        return jsonify({"error": "Path too deep (max 5 segments)"}), 400
+    relative = "/".join(parts)
+    path = ROOT_WORKSPACE / relative
+    try:
+        path = path.resolve()
+        path.relative_to(ROOT_WORKSPACE)
+    except (ValueError, OSError):
+        return jsonify({"error": "Path must be under workspace"}), 400
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return jsonify({"error": f"Cannot create folder: {e}"}), 400
+    return jsonify({"path": relative, "absolute": str(path)}), 201
 
 
 @app.route("/api/ui-settings", methods=["GET", "POST"])
@@ -1318,23 +1409,6 @@ def api_agents_auto_accept_prompts():
         return jsonify({"ok": False, "error": str(e), "accepted": []}), 200
 
 
-@app.route("/api/agents/accept-all-disclaimers", methods=["POST"])
-def api_agents_accept_all_disclaimers():
-    """Proxy to gateway: send Down+Enter to every agent (leads + workers) to accept Bypass disclaimer."""
-    try:
-        with httpx.Client(timeout=30.0) as client:
-            r = client.post(f"{GATEWAY_URL.rstrip('/')}/api/agents/accept-all-disclaimers")
-            body = r.json() if r.content else {}
-            if r.status_code != 200 and "error" not in body:
-                body["ok"] = False
-                body["error"] = body.get("error") or f"Gateway returned {r.status_code}"
-            return jsonify(body), 200
-    except httpx.ConnectError:
-        return jsonify({"ok": False, "error": "Gateway unreachable", "accepted": []}), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e), "accepted": []}), 200
-
-
 @app.route("/api/worktrees/clean", methods=["POST"])
 def api_worktrees_clean():
     """Proxy to gateway: overstory worktree clean --completed."""
@@ -1346,21 +1420,71 @@ def api_worktrees_clean():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/supervisor/approve-all", methods=["POST"])
+def api_supervisor_approve_all():
+    """Proxy to gateway: process all pending approval mail (unblock builders when no lead)."""
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            r = client.post(f"{GATEWAY_URL.rstrip('/')}/api/supervisor/approve-all")
+            return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "approved": 0}), 200
+
+
+@app.route("/api/supervisor/inject-lead", methods=["POST"])
+def api_supervisor_inject_lead():
+    """Proxy to gateway: spawn a lead and reassign unread lead/supervisor mail to it."""
+    try:
+        with httpx.Client(timeout=130.0) as client:
+            r = client.post(f"{GATEWAY_URL.rstrip('/')}/api/supervisor/inject-lead")
+            return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "lead_name": "", "mail_reassigned": 0}), 200
+
+
+@app.route("/api/agents/spawn", methods=["POST"])
+def api_agents_spawn():
+    """Proxy to gateway: spawn an overstory agent (e.g. approval-supervisor for cleanup)."""
+    try:
+        with httpx.Client(timeout=120.0) as client:
+            body = request.get_json() or {}
+            r = client.post(f"{GATEWAY_URL.rstrip('/')}/api/agents/spawn", json=body)
+            return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 200
+
+
+@app.route("/api/overstory/merge", methods=["POST"])
+def api_overstory_merge():
+    """Proxy to gateway: overstory merge --all (drain merge queue)."""
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            r = client.post(f"{GATEWAY_URL.rstrip('/')}/api/overstory/merge")
+            return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"error": str(e), "drained": 0}), 200
+
+
 @app.route("/api/zombies")
 def api_zombies():
-    """Proxy to gateway: list zombie agents."""
+    """Proxy to gateway: list zombie agents. Always return 200 so UI doesn't break; errors in body."""
     try:
         with httpx.Client(timeout=10.0) as client:
             r = client.get(f"{GATEWAY_URL.rstrip('/')}/api/zombies")
-            return jsonify(r.json()), r.status_code
+            data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {"zombies": [], "count": 0}
+            if r.status_code >= 400:
+                data.setdefault("error", f"Gateway returned {r.status_code}")
+                data["zombies"] = data.get("zombies", [])
+                data["count"] = data.get("count", 0)
+            return jsonify(data), 200
     except httpx.ConnectError as e:
         return jsonify({
             "error": f"Gateway unreachable at {GATEWAY_URL}. Is it running?",
             "zombies": [],
             "count": 0,
-        }), 502
+        }), 200
     except Exception as e:
-        return jsonify({"error": str(e), "zombies": [], "count": 0}), 500
+        return jsonify({"error": str(e), "zombies": [], "count": 0}), 200
 
 
 @app.route("/api/zombies/slay", methods=["POST"])
@@ -1372,6 +1496,42 @@ def api_zombies_slay():
             return jsonify(r.json()), r.status_code
     except Exception as e:
         return jsonify({"error": str(e), "slain": 0}), 500
+
+
+@app.route("/api/agents/kill-all", methods=["POST"])
+def api_agents_kill_all():
+    """Proxy to gateway: kill all agents, clear mail and task queue (fresh start)."""
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            r = client.post(f"{GATEWAY_URL.rstrip('/')}/api/agents/kill-all")
+            text = (r.text or "").strip()
+            if not text:
+                return jsonify({
+                    "ok": False,
+                    "error": "Gateway returned empty response (is it running?)",
+                    "cleaned": False,
+                    "mail_cleared": 0,
+                }), r.status_code if r.status_code >= 400 else 502
+            try:
+                data = r.json()
+            except ValueError:
+                preview = (text[:200] + "…") if len(text) > 200 else text
+                return jsonify({
+                    "ok": False,
+                    "error": "Gateway returned invalid JSON. Response preview: " + (preview or "(empty)"),
+                    "cleaned": False,
+                    "mail_cleared": 0,
+                }), 502
+            return jsonify(data), r.status_code
+    except httpx.ConnectError as e:
+        return jsonify({
+            "ok": False,
+            "error": f"Gateway unreachable at {GATEWAY_URL}. Is it running?",
+            "cleaned": False,
+            "mail_cleared": 0,
+        }), 502
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "cleaned": False, "mail_cleared": 0}), 500
 
 
 @app.route("/api/settings", methods=["GET", "POST"])
@@ -1407,15 +1567,17 @@ INDEX_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>overstory dashboard v0.2.0</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { height: 100%; }
     body {
       font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
       background: #0d1117;
       color: #e6edf3;
-      height: 100vh;
+      height: 100%;
+      min-height: 100vh;
       overflow: hidden;
       display: flex;
       flex-direction: column;
@@ -1465,6 +1627,14 @@ INDEX_HTML = """<!DOCTYPE html>
     .header-controls button:hover {
       background: #21262d;
       color: #e6edf3;
+    }
+    .header-controls button.header-btn-danger {
+      color: #f85149;
+      border-color: #f85149;
+    }
+    .header-controls button.header-btn-danger:hover {
+      background: rgba(248, 81, 73, 0.15);
+      color: #ff7b72;
     }
     .repo-dropdown-wrap {
       position: relative;
@@ -1715,6 +1885,18 @@ INDEX_HTML = """<!DOCTYPE html>
       color: #e6edf3;
       font-size: 11px;
     }
+    .project-create-folder-btn {
+      margin-top: 4px;
+      padding: 4px 8px;
+      font-size: 11px;
+      background: #238636;
+      border: 1px solid #2ea043;
+      color: #fff;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .project-create-folder-btn:hover { background: #2ea043; }
+    #showNewFolderBtn { width: 100%; margin-top: 2px; }
     .project-new-btn {
       margin-top: 8px;
       width: 100%;
@@ -1753,17 +1935,36 @@ INDEX_HTML = """<!DOCTYPE html>
       flex: 1;
       min-height: 120px;
       min-width: 0;
-      overflow: auto;
+      overflow: hidden;
       display: flex;
       flex-direction: column;
       margin-bottom: 12px;
     }
     #leftPanelAgents .panel-body {
-      flex: 1;
+      flex: 1 1 0;
       min-height: 0;
-      overflow: auto;
+      overflow-y: auto;
+      overflow-x: auto;
       max-height: none;
+      display: block;
+      -webkit-overflow-scrolling: touch;
+      padding: 0;
+      line-height: 0;
     }
+    #leftPanelAgents .agents-table {
+      margin: 0;
+      border-collapse: collapse;
+      border-spacing: 0;
+      line-height: normal;
+      vertical-align: top;
+    }
+    #leftPanelAgents .agents-table th,
+    #leftPanelAgents .agents-table td {
+      padding: 4px 8px;
+    }
+    #leftPanelAgents .agents-table .task-cell { max-width: 220px; font-size: 11px; }
+    #leftPanelAgents .agents-table .task-summary { cursor: pointer; max-width: 200px; }
+    #leftPanelAgents .agents-table .task-full { max-height: 120px; overflow: auto; }
     #leftPanelMail, #leftPanelMerge, #leftPanelMetrics {
       flex: 0 0 auto;
       margin-bottom: 12px;
@@ -1828,6 +2029,10 @@ INDEX_HTML = """<!DOCTYPE html>
       border-bottom: 1px solid #21262d;
     }
     .agents-table th { color: #8b949e; font-weight: 600; }
+    .agents-table .task-cell { max-width: 220px; font-size: 11px; }
+    .agents-table .task-details { margin: 0; }
+    .agents-table .task-summary { cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; display: inline-block; }
+    .agents-table .task-full { margin: 4px 0 0 0; padding: 6px; font-size: 10px; white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow: auto; background: #21262d; border-radius: 4px; }
     .bun-log {
       background: #161b22;
       border: 1px solid #30363d;
@@ -1910,10 +2115,12 @@ INDEX_HTML = """<!DOCTYPE html>
       flex: 0 0 auto;
       min-height: 0;
     }
-    .agent-terminal-item.agent-terminal-lead .agent-terminal-body {
+    .agent-terminal-item.agent-terminal-lead .agent-terminal-body,
+    .agent-terminal-item.agent-terminal-supervisor .agent-terminal-body {
       display: none;
     }
-    .agent-terminal-item.agent-terminal-lead.agent-terminal-expanded .agent-terminal-body {
+    .agent-terminal-item.agent-terminal-lead.agent-terminal-expanded .agent-terminal-body,
+    .agent-terminal-item.agent-terminal-supervisor.agent-terminal-expanded .agent-terminal-body {
       display: block;
     }
     .agent-terminal-output {
@@ -2101,10 +2308,283 @@ INDEX_HTML = """<!DOCTYPE html>
     .settings-panel .settings-actions button { padding: 6px 14px; font-size: 12px; }
     .settings-panel .settings-actions button.secondary { background: #21262d; color: #8b949e; border: 1px solid #30363d; }
     .settings-panel .settings-actions button.secondary:hover { background: #30363d; color: #e6edf3; }
+
+    /* --- Mobile: single-column chat-first layout (like conversation UI) --- */
+    @media (max-width: 768px) {
+      html { height: 100%; min-height: 100dvh; min-height: -webkit-fill-available; }
+      body {
+        overflow: hidden;
+        height: 100%;
+        min-height: 100dvh;
+        min-height: 100vh;
+        min-height: -webkit-fill-available;
+      }
+      .header {
+        flex-wrap: nowrap;
+        gap: 6px;
+        padding: 6px 8px;
+        min-width: 0;
+      }
+      .header-left {
+        flex: 1;
+        min-width: 0;
+        gap: 6px;
+        overflow: hidden;
+      }
+      .header-title { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 80px; }
+      .header-time, .header-refresh { display: none; }
+      .header-controls {
+        flex-shrink: 0;
+        gap: 4px;
+      }
+      .header-controls button {
+        padding: 4px 6px;
+        font-size: 10px;
+      }
+      .header-controls .header-btn-long { display: none; }
+      .repo-dropdown-wrap { min-width: 0; overflow: hidden; }
+      .github-btn {
+        min-width: 0;
+        max-width: 100%;
+        overflow: hidden;
+      }
+      .github-btn .github-username { max-width: 60px; }
+      .open-folder-btn {
+        min-width: 0;
+        max-width: 90px;
+        overflow: hidden;
+      }
+      .open-folder-btn .repo-dropdown-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .main-layout {
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+        overflow: hidden;
+      }
+      .sidebar {
+        position: fixed;
+        top: 0;
+        left: -280px;
+        bottom: 0;
+        width: 280px;
+        min-width: 280px;
+        z-index: 1001;
+        box-shadow: 4px 0 20px rgba(0,0,0,0.4);
+        transition: left 0.2s ease;
+      }
+      .sidebar.mobile-open { left: 0; }
+      .sidebar-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(0,0,0,0.5);
+        z-index: 1000;
+      }
+      .sidebar-overlay.visible { display: block; }
+      .main-content {
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+        width: 100%;
+        overflow: hidden;
+        min-width: 0;
+      }
+      .left {
+        display: none;
+        flex: none;
+        width: 100%;
+        max-height: 40vh;
+        overflow: auto;
+        padding: 10px;
+        border-right: none;
+        border-bottom: 1px solid #30363d;
+      }
+      .left.mobile-panels-open {
+        display: flex;
+        flex-direction: column;
+      }
+      .right {
+        flex: 1;
+        width: 100%;
+        min-width: 0;
+        border-left: none;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        overflow: hidden;
+      }
+      .tabs {
+        padding: 6px 8px;
+        gap: 2px;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        min-width: 0;
+        flex-shrink: 0;
+      }
+      .tab {
+        padding: 6px 10px;
+        font-size: 11px;
+        white-space: nowrap;
+        flex-shrink: 0;
+      }
+      #tabChat.chat-tab-split {
+        flex-direction: column;
+        padding: 0;
+        min-height: 0;
+        flex: 1;
+        overflow: hidden;
+      }
+      #tabChat .chat-top-half {
+        flex: 1 1 0;
+        min-height: 0;
+        border-bottom: 1px solid #30363d;
+        overflow: hidden;
+        min-width: 0;
+      }
+      #tabChat .chat-top-half .panel-header,
+      #tabChat .chat-top-half .terminal-current-path {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      #agentTerminalsList {
+        min-width: 0;
+        overflow-x: hidden;
+      }
+      #agentTerminalsList .agent-terminal-item {
+        min-width: 0;
+        overflow: hidden;
+      }
+      #agentTerminalsList .agent-terminal-header {
+        flex-wrap: wrap;
+        gap: 4px;
+      }
+      #agentTerminalsList .agent-terminal-output,
+      #agentTerminalsList .agent-terminal-body {
+        word-wrap: break-word;
+        overflow-wrap: break-word;
+        white-space: pre-wrap;
+        overflow-x: hidden;
+        max-width: 100%;
+      }
+      #tabChat .chat-bottom-half {
+        flex: 1 1 0;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        padding: 8px;
+        padding-bottom: calc(8px + env(safe-area-inset-bottom));
+        overflow: hidden;
+      }
+      #tabChat .chat-bottom-half .chat-history-scroll {
+        flex: 1;
+        min-height: 80px;
+        -webkit-overflow-scrolling: touch;
+        overflow-x: hidden;
+      }
+      #tabChat .chat-bottom-half .route-toggle {
+        margin-bottom: 6px;
+        font-size: 11px;
+        white-space: normal;
+        line-height: 1.3;
+        flex-shrink: 0;
+      }
+      #tabChat .chat-bottom-half textarea#chatInput {
+        min-height: 44px;
+        padding: 8px 12px;
+        border-radius: 12px;
+        font-size: 14px;
+        flex-shrink: 0;
+        margin-bottom: 6px;
+      }
+      #tabChat .chat-bottom-half .chat-footer {
+        padding-top: 6px;
+        border-top: 1px solid #30363d;
+        flex-shrink: 0;
+      }
+      #tabChat .chat-bottom-half .chat-footer button#sendBtn {
+        padding: 10px 20px;
+        border-radius: 12px;
+      }
+      /* Chat flush to bottom: hide footer on mobile so chat area extends to screen bottom */
+      .footer {
+        display: none;
+      }
+      /* Chat message bubbles on mobile */
+      #chatHistory .terminal-line {
+        margin-bottom: 10px;
+        padding: 10px 14px;
+        border-radius: 12px;
+        max-width: 95%;
+      }
+      #chatHistory .terminal-line.user {
+        background: #1f6feb;
+        color: #e6edf3;
+        margin-left: 0;
+        margin-right: auto;
+      }
+      #chatHistory .terminal-line.info,
+      #chatHistory .terminal-line.thinking-row {
+        background: #21262d;
+        border: 1px solid #30363d;
+        margin-left: 0;
+        margin-right: auto;
+      }
+      #chatHistory .terminal-line.error {
+        background: rgba(248, 81, 73, 0.15);
+        border: 1px solid #f85149;
+      }
+      .chat-footer {
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .mobile-hamburger {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 32px;
+        height: 32px;
+        padding: 0;
+        background: transparent;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        color: #8b949e;
+        cursor: pointer;
+        font-size: 18px;
+        flex-shrink: 0;
+      }
+      .mobile-hamburger:hover { background: #21262d; color: #e6edf3; }
+      .mobile-panels-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 32px;
+        height: 32px;
+        padding: 0;
+        background: transparent;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        color: #8b949e;
+        cursor: pointer;
+        font-size: 14px;
+        flex-shrink: 0;
+      }
+      .mobile-panels-btn:hover { background: #21262d; color: #e6edf3; }
+    }
+    @media (min-width: 769px) {
+      .mobile-hamburger { display: none; }
+      .mobile-panels-btn { display: none; }
+    }
   </style>
 </head>
 <body>
   <div class="header">
+    <button type="button" class="mobile-hamburger" id="mobileHamburger" aria-label="Open menu">&#9776;</button>
     <div class="header-left">
       <div class="repo-dropdown-wrap">
         <span id="githubBtnWrap">
@@ -2152,12 +2632,16 @@ INDEX_HTML = """<!DOCTYPE html>
       <span class="header-refresh">refresh: <span id="refreshInterval">1000ms</span></span>
     </div>
     <div class="header-controls">
-      <button id="acceptAllDisclaimersBtn" title="Send Down+Enter to every agent (leads and workers) to accept Bypass Permissions disclaimer">Accept all disclaimers</button>
-      <button id="restartWithSkipPermsBtn" title="Enable skip-permissions, send Ctrl+C twice to all agent tmux, then start claude --dangerously-skip-permissions in each">Restart agents (skip perms)</button>
-      <button id="pruneWorktreesBtn" title="Prune completed worktrees (overstory worktree clean --completed)">Prune completed</button>
+      <button id="restartWithSkipPermsBtn" class="header-btn-long" title="Enable skip-permissions, send Ctrl+C twice to all agent tmux, then start claude --dangerously-skip-permissions in each">Restart agents (skip perms)</button>
+      <button id="approveAllAndCleanBtn" class="header-btn-long" title="Process pending approval mail, drain merge queue, then prune completed worktrees (unblocks builders when no lead)">Approve all &amp; clean</button>
+      <button id="injectLeadBtn" class="header-btn-long" title="Spawn a lead and reassign all unread lead/supervisor mail to it (use when agents have no lead)">Inject Lead</button>
+      <button id="pruneWorktreesBtn" class="header-btn-long" title="Prune completed worktrees (overstory worktree clean --completed)">Prune completed</button>
+      <button id="killAllAgentsBtn" class="header-btn-long header-btn-danger" title="Stop all agents, clear all mail and task queue so you can open a new project fresh">Kill all agents</button>
+      <button type="button" class="mobile-panels-btn" id="mobilePanelsBtn" aria-label="Toggle agents and mail panels" title="Agents &amp; Mail">▦</button>
       <button onclick="refreshNow()" title="Refresh">↻</button>
     </div>
   </div>
+  <div class="sidebar-overlay" id="sidebarOverlay" aria-hidden="true"></div>
   <div class="main-layout">
     <aside class="sidebar" id="sidebar">
       <button type="button" class="sidebar-toggle" id="sidebarToggle" title="Toggle sidebar">◀</button>
@@ -2170,10 +2654,18 @@ INDEX_HTML = """<!DOCTYPE html>
               <select id="defaultProjectFolder" class="project-select" title="Default project folder">
                 <option value="overstory">Overstory workspace</option>
                 <option value="__custom__">Custom path…</option>
+                <option value="__new__">Create new subfolder…</option>
               </select>
             </label>
+            <div class="project-setting-row">
+              <button type="button" id="showNewFolderBtn" class="project-create-folder-btn" title="Create a new subfolder in the workspace and set it as default">+ New folder</button>
+            </div>
             <div id="customProjectPathWrap" class="project-setting-row" style="display:none;">
               <input type="text" id="customProjectPath" class="project-path-input" placeholder="Path under workspace">
+            </div>
+            <div id="newProjectFolderWrap" class="project-setting-row" style="display:none;">
+              <input type="text" id="newProjectFolderName" class="project-path-input" placeholder="New folder name">
+              <button type="button" id="newProjectFolderBtn" class="project-create-folder-btn">Create & set default</button>
             </div>
           </div>
         </div>
@@ -2199,7 +2691,7 @@ INDEX_HTML = """<!DOCTYPE html>
           <div class="panel-header">Agents (<span id="agentCount">0</span>)</div>
           <div class="panel-body">
             <table class="agents-table">
-              <thead><tr><th>St</th><th>Name</th><th>Capability</th><th>State</th><th>Bead ID</th><th>Duration</th><th>Tmux</th></tr></thead>
+              <thead><tr><th>St</th><th>Name</th><th>Capability</th><th>State</th><th>Bead ID</th><th>Duration</th><th>Tmux</th><th>Task</th></tr></thead>
               <tbody id="agentsBody"></tbody>
             </table>
           </div>
@@ -2285,8 +2777,8 @@ INDEX_HTML = """<!DOCTYPE html>
   </div>
   <div class="footer" id="footerBar">
     <div class="footer-left">
-      <div class="footer-tokens" id="footerTokens">
-        <span>Session tokens:</span>
+      <div class="footer-tokens" id="footerTokens" title="Sum of input/output tokens across all agents (main + subagents) in sessions.json">
+        <span>Tokens (all agents):</span>
         <span class="token-in" id="footerTokenIn">0</span> in
         <span class="token-out" id="footerTokenOut">0</span> out
         <span id="footerTokenTotal" style="color: #8b949e;">(0 total)</span>
@@ -2333,11 +2825,17 @@ INDEX_HTML = """<!DOCTYPE html>
           <select id="settingDefaultFolder">
             <option value="overstory">Overstory workspace</option>
             <option value="__custom__">Custom path…</option>
+            <option value="__new__">Create new subfolder…</option>
           </select>
         </div>
         <div class="settings-row" id="settingCustomPathWrap" style="display: none;">
           <label for="settingCustomPath">Custom path</label>
           <input type="text" id="settingCustomPath" placeholder="Path under workspace" style="flex: 1;">
+        </div>
+        <div class="settings-row" id="settingNewFolderWrap" style="display: none;">
+          <label for="settingNewFolderName">New folder name</label>
+          <input type="text" id="settingNewFolderName" placeholder="New folder name" style="flex: 1;">
+          <button type="button" id="settingNewFolderBtn">Create & set default</button>
         </div>
       </div>
       <div class="settings-section">
@@ -2616,6 +3114,10 @@ INDEX_HTML = """<!DOCTYPE html>
     function initSidebar() {
       const sidebar = document.getElementById('sidebar');
       const toggle = document.getElementById('sidebarToggle');
+      const overlay = document.getElementById('sidebarOverlay');
+      const hamburger = document.getElementById('mobileHamburger');
+      const leftPanel = document.querySelector('.left');
+      const panelsBtn = document.getElementById('mobilePanelsBtn');
       const collapsed = localStorage.getItem('overclaw_sidebar_collapsed') === '1';
       if (collapsed) { sidebar.classList.add('collapsed'); toggle.textContent = '▶'; toggle.title = 'Show sidebar'; } else { toggle.title = 'Hide sidebar'; }
       toggle.addEventListener('click', function() {
@@ -2624,7 +3126,25 @@ INDEX_HTML = """<!DOCTYPE html>
         toggle.textContent = isCollapsed ? '▶' : '◀';
         toggle.title = isCollapsed ? 'Show sidebar' : 'Hide sidebar';
         localStorage.setItem('overclaw_sidebar_collapsed', isCollapsed ? '1' : '0');
+        if (window.innerWidth <= 768) { sidebar.classList.remove('mobile-open'); if (overlay) overlay.classList.remove('visible'); }
       });
+      if (hamburger && overlay) {
+        hamburger.addEventListener('click', function() {
+          sidebar.classList.toggle('mobile-open');
+          overlay.classList.toggle('visible');
+          overlay.setAttribute('aria-hidden', sidebar.classList.contains('mobile-open') ? 'false' : 'true');
+        });
+        overlay.addEventListener('click', function() {
+          sidebar.classList.remove('mobile-open');
+          overlay.classList.remove('visible');
+          overlay.setAttribute('aria-hidden', 'true');
+        });
+      }
+      if (panelsBtn && leftPanel) {
+        panelsBtn.addEventListener('click', function() {
+          leftPanel.classList.toggle('mobile-panels-open');
+        });
+      }
       document.querySelectorAll('.skills-tab').forEach(btn => {
         btn.addEventListener('click', function() {
           document.querySelectorAll('.skills-tab').forEach(b => b.classList.remove('active'));
@@ -2640,32 +3160,61 @@ INDEX_HTML = """<!DOCTYPE html>
       loadFileTree();
       loadSkills();
       window.refreshProjectUI = function() { loadWorkspace(); loadFileTree(); loadSkills(); };
-      // Project settings: default folder + New project
+      // Project settings: default folder + New project + Create new subfolder
       (async function initProjectSettings() {
         const sel = document.getElementById('defaultProjectFolder');
         const customWrap = document.getElementById('customProjectPathWrap');
         const customInput = document.getElementById('customProjectPath');
+        const newWrap = document.getElementById('newProjectFolderWrap');
+        const newInput = document.getElementById('newProjectFolderName');
+        const newBtn = document.getElementById('newProjectFolderBtn');
+        const showNewBtn = document.getElementById('showNewFolderBtn');
         if (!sel) return;
+        function showFolderWraps() {
+          const v = sel.value;
+          customWrap.style.display = v === '__custom__' ? 'block' : 'none';
+          if (newWrap) newWrap.style.display = v === '__new__' ? 'block' : 'none';
+          if (v !== '__custom__' && v !== '__new__') saveProjectSetting('default_project_folder', 'overstory');
+        }
         try {
           const r = await fetch('/api/ui-settings');
           const s = await r.json();
           const def = (s.default_project_folder || 'overstory').trim();
           if (def && def !== 'overstory') {
             sel.value = '__custom__';
-            customWrap.style.display = 'block';
             customInput.value = def;
           } else {
             sel.value = 'overstory';
-            customWrap.style.display = 'none';
           }
-        } catch (_) {}
-        sel.addEventListener('change', function() {
-          customWrap.style.display = this.value === '__custom__' ? 'block' : 'none';
-          if (this.value !== '__custom__') saveProjectSetting('default_project_folder', 'overstory');
+          showFolderWraps();
+        } catch (_) { showFolderWraps(); }
+        sel.addEventListener('change', showFolderWraps);
+        if (showNewBtn) showNewBtn.addEventListener('click', function() {
+          sel.value = '__new__';
+          showFolderWraps();
+          if (newInput) { newInput.value = ''; newInput.focus(); }
         });
         customInput.addEventListener('change', function() {
           saveProjectSetting('default_project_folder', this.value.trim() || 'overstory');
         });
+        if (newBtn && newInput) {
+          newBtn.addEventListener('click', async function() {
+            const name = newInput.value.trim();
+            if (!name) { alert('Enter a folder name'); return; }
+            try {
+              const res = await fetch('/api/project/create-folder', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name }) });
+              const data = await res.json();
+              if (!res.ok) { alert(data.error || 'Failed to create folder'); return; }
+              saveProjectSetting('default_project_folder', data.path);
+              sel.value = '__custom__';
+              customInput.value = data.path;
+              newInput.value = '';
+              showFolderWraps();
+              loadWorkspace();
+              loadFileTree();
+            } catch (e) { alert('Failed: ' + (e.message || 'Unknown error')); }
+          });
+        }
         function saveProjectSetting(key, value) {
           fetch('/api/ui-settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ [key]: value }) }).then(function() { loadWorkspace(); loadFileTree(); }).catch(function(){});
         }
@@ -2802,25 +3351,57 @@ INDEX_HTML = """<!DOCTYPE html>
       setTimeout(() => { btn.disabled = false; btn.textContent = 'Prune completed'; }, 2000);
     });
 
-    document.getElementById('acceptAllDisclaimersBtn').addEventListener('click', async function() {
+    async function runApproveAllAndClean() {
+      try {
+        const r = await fetch('/api/supervisor/approve-all', { method: 'POST' });
+        const data = await r.json().catch(function() { return {}; });
+        const approved = data.approved || 0;
+        const reinstated = data.reinstated || 0;
+        const err = data.last_error || data.error;
+        let msg = data.ok ? (reinstated ? reinstated + ' lead(s) reinstated; ' : '') + approved + ' approved.' : (err || 'failed');
+        fetch('/api/terminal/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'Approve all: ' + msg, type: data.ok ? 'info' : 'error' }) }).catch(function(){});
+        if (err) console.warn('approve-all:', err);
+        const m = await fetch('/api/overstory/merge', { method: 'POST' });
+        const mData = await m.json().catch(function() { return {}; });
+        fetch('/api/terminal/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'Merge: ' + (m.ok ? (mData.drained || 0) + ' drained.' : (mData.error || 'failed')), type: m.ok ? 'info' : 'error' }) }).catch(function(){});
+        const ok = await runPruneCompletedWorktrees(false);
+        if (ok) refreshNow();
+        return ok;
+      } catch (e) {
+        fetch('/api/terminal/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'Approve all & clean failed: ' + e.message, type: 'error' }) }).catch(function(){});
+        return false;
+      }
+    }
+    document.getElementById('approveAllAndCleanBtn').addEventListener('click', async function() {
+      const btn = this;
+      btn.disabled = true;
+      btn.textContent = '…';
+      await runApproveAllAndClean();
+      btn.textContent = 'Done';
+      setTimeout(function() { btn.disabled = false; btn.textContent = 'Approve all & clean'; }, 2000);
+    });
+
+    document.getElementById('injectLeadBtn').addEventListener('click', async function() {
       const btn = this;
       btn.disabled = true;
       btn.textContent = '…';
       try {
-        const r = await fetch('/api/agents/accept-all-disclaimers', { method: 'POST' });
+        const r = await fetch('/api/supervisor/inject-lead', { method: 'POST' });
         const data = await r.json().catch(function() { return {}; });
-        if (r.ok && data.ok) {
-          btn.textContent = data.accepted && data.accepted.length ? 'Sent to ' + data.accepted.length : 'Done';
-          if (data.accepted && data.accepted.length) refreshAgentTerminals();
+        if (data.ok && data.spawned) {
+          const msg = 'Inject Lead: ' + data.lead_name + (data.mail_reassigned ? ' — ' + data.mail_reassigned + ' mail reassigned' : '');
+          fetch('/api/terminal/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: msg, type: 'info' }) }).catch(function(){});
+          btn.textContent = 'Injected';
+          refreshNow();
         } else {
+          fetch('/api/terminal/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'Inject Lead failed: ' + (data.error || 'unknown'), type: 'error' }) }).catch(function(){});
           btn.textContent = 'Error';
-          alert(data.error || 'Failed');
         }
       } catch (e) {
+        fetch('/api/terminal/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'Inject Lead failed: ' + e.message, type: 'error' }) }).catch(function(){});
         btn.textContent = 'Error';
-        alert(e.message || 'Failed');
       }
-      setTimeout(function() { btn.disabled = false; btn.textContent = 'Accept all disclaimers'; }, 2500);
+      setTimeout(function() { btn.disabled = false; btn.textContent = 'Inject Lead'; }, 2500);
     });
 
     document.getElementById('restartWithSkipPermsBtn').addEventListener('click', async function() {
@@ -2843,6 +3424,44 @@ INDEX_HTML = """<!DOCTYPE html>
         alert(e.message || 'Failed');
       }
       setTimeout(function() { btn.disabled = false; btn.textContent = 'Restart agents (skip perms)'; }, 3000);
+    });
+
+    document.getElementById('killAllAgentsBtn').addEventListener('click', async function() {
+      if (!confirm('Kill all agents and clear mail and task queue? This stops every agent and empties the inbox so you can open a new project fresh. Continue?')) {
+        return;
+      }
+      const btn = this;
+      btn.disabled = true;
+      btn.textContent = '…';
+      try {
+        const r = await fetch('/api/agents/kill-all', { method: 'POST' });
+        const text = await r.text();
+        let data = { ok: false, error: 'Invalid response' };
+        if (text && text.trim()) {
+          try {
+            data = JSON.parse(text);
+          } catch (_) {
+            data.error = 'Server returned invalid response. Is the gateway running?';
+          }
+        } else {
+          data.error = 'Empty response. Is the gateway running?';
+        }
+        if (data.ok) {
+          const msg = (data.mail_cleared ? data.mail_cleared + ' mail cleared. ' : '') + (data.message || 'All agents stopped.');
+          fetch('/api/terminal/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'Kill all: ' + msg, type: 'info' }) }).catch(function(){});
+          btn.textContent = 'Done';
+          refreshNow();
+        } else {
+          fetch('/api/terminal/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'Kill all failed: ' + (data.error || 'unknown'), type: 'error' }) }).catch(function(){});
+          btn.textContent = 'Error';
+          alert(data.error || 'Kill all failed');
+        }
+      } catch (e) {
+        fetch('/api/terminal/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'Kill all failed: ' + e.message, type: 'error' }) }).catch(function(){});
+        btn.textContent = 'Error';
+        alert(e.message || 'Kill all failed');
+      }
+      setTimeout(function() { btn.disabled = false; btn.textContent = 'Kill all agents'; }, 2500);
     });
 
     // Auto-prune completed worktrees every 10 minutes and log to terminal
@@ -2945,7 +3564,7 @@ INDEX_HTML = """<!DOCTYPE html>
               if (err) {
                 if ((err + '').indexOf('Connection refused') !== -1 || (err + '').indexOf('Gateway unreachable') !== -1 || (err + '').indexOf('Errno 61') !== -1) {
                   isGatewayError = true;
-                  return { name, capability: agent.capability || '', output: '[Gateway unreachable — start OverClaw gateway on port 18800 to view terminals]', attachCmd: 'tmux attach -t overstory-overclaw-' + name, source: '' };
+                  return { name, capability: agent.capability || '', output: '[Gateway unreachable — start OverClaw gateway on port 18800 to view terminals]', attachCmd: 'tmux attach -t overstory-overclaw-' + name, source: '', system: !!agent.system };
                 }
                 if (agentErrorLogged[name] !== err) {
                   agentErrorLogged[name] = err;
@@ -2957,12 +3576,13 @@ INDEX_HTML = """<!DOCTYPE html>
                 capability: agent.capability || '',
                 output: termData.output || termData.error || '[No output]',
                 attachCmd: termData.attach_cmd || null,
-                source: termData.source || ''
+                source: termData.source || '',
+                system: !!agent.system
               };
             } catch (e) {
               if ((e.message + '').indexOf('Connection refused') !== -1 || (e.message + '').indexOf('Failed to fetch') !== -1) isGatewayError = true;
               if (agentErrorLogged[name] !== 'load') agentErrorLogged[name] = 'load';
-              return { name, capability: agent.capability || '', output: '[Error loading terminal]', attachCmd: null, source: '' };
+              return { name, capability: agent.capability || '', output: '[Error loading terminal]', attachCmd: null, source: '', system: !!agent.system };
             }
           })
         );
@@ -2973,17 +3593,20 @@ INDEX_HTML = """<!DOCTYPE html>
         if (!isGatewayError) gatewayUnreachableLogged = false;
         list.innerHTML = terminals.filter(t => t).map(t => {
           var expanded = expandedAgentTerminals.has(t.name);
+          var cap = (t.capability || '').toLowerCase();
+          var isLeadOrSupervisor = cap === 'lead' || cap === 'supervisor';
+          var bodyDisplay = (isLeadOrSupervisor && !expanded) ? 'none' : 'block';
           return `
-          <div class="agent-terminal-item ${expanded ? 'agent-terminal-expanded' : ''} ${(t.capability || '').toLowerCase() === 'lead' ? 'agent-terminal-lead' : ''}" data-agent-name="${escapeHtml(t.name)}" style="border: 1px solid #30363d; border-radius: 4px; overflow: hidden;">
+          <div class="agent-terminal-item ${expanded ? 'agent-terminal-expanded' : ''} ${cap === 'lead' ? 'agent-terminal-lead' : ''} ${cap === 'supervisor' ? 'agent-terminal-supervisor' : ''}" data-agent-name="${escapeHtml(t.name)}" style="border: 1px solid #30363d; border-radius: 4px; overflow: hidden;">
             <div class="agent-terminal-header" style="background: #161b22; padding: 6px 10px; font-size: 12px; font-weight: 600; color: #58a6ff; cursor: pointer; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px;">
               <span onclick="toggleAgentTerminalExpand('${escapeHtml(t.name)}')" title="Click to expand/collapse">${t.capability ? `<span style="color: #8b949e;">[${t.capability}]</span> ` : ''}${t.name}</span>
               <span style="display: flex; gap: 6px; align-items: center;">
                 <button type="button" onclick="event.stopPropagation(); toggleAgentTerminalExpand('${escapeHtml(t.name)}'); return false;" style="padding: 4px 8px; font-size: 11px; background: #21262d; color: #8b949e; border: 1px solid #30363d; border-radius: 4px; cursor: pointer;">${expanded ? 'Collapse' : 'Expand'}</button>
-                <button type="button" class="accept-mail-check-btn" onclick="event.stopPropagation(); acceptMailCheck('${escapeHtml(t.name)}', this);" style="padding: 4px 8px; font-size: 11px; background: #1f6feb; color: #fff; border: none; border-radius: 4px; cursor: pointer;" title="Accept 'overstory mail check' prompt (don't ask again)">Mail check</button>
-                <button type="button" class="accept-disclaimer-btn" onclick="event.stopPropagation(); acceptDisclaimer('${escapeHtml(t.name)}', this);" style="padding: 4px 10px; font-size: 11px; background: #238636; color: #fff; border: none; border-radius: 4px; cursor: pointer;">Accept disclaimer</button>
+                ${t.system ? '' : `<button type="button" class="accept-mail-check-btn" onclick="event.stopPropagation(); acceptMailCheck('${escapeHtml(t.name)}', this);" style="padding: 4px 8px; font-size: 11px; background: #1f6feb; color: #fff; border: none; border-radius: 4px; cursor: pointer;" title="Accept 'overstory mail check' prompt (don't ask again)">Mail check</button>
+                <button type="button" class="accept-disclaimer-btn" onclick="event.stopPropagation(); acceptDisclaimer('${escapeHtml(t.name)}', this);" style="padding: 4px 10px; font-size: 11px; background: #238636; color: #fff; border: none; border-radius: 4px; cursor: pointer;">Accept disclaimer</button>`}
               </span>
             </div>
-            <div class="agent-terminal-body" style="display: block;">
+            <div class="agent-terminal-body" style="display: ${bodyDisplay};">
               ${t.attachCmd ? `<div class="agent-terminal-attach" style="background: #21262d; padding: 6px 8px; font-size: 11px; color: #7ee787; font-family: monospace;">Watch live: <code style="user-select: all;">${escapeHtml(t.attachCmd)}</code></div>` : ''}
               <div class="agent-terminal-output" style="background: #0d1117; color: #e6edf3; font-family: monospace; font-size: 11px; padding: 8px; padding-bottom: 12px; white-space: pre-wrap; word-wrap: break-word;">${escapeHtml(t.output)}</div>
               <button type="button" class="scroll-to-bottom-btn" onclick="var o=this.previousElementSibling; if(o) { o.scrollTop=o.scrollHeight; }" style="margin-top: 4px; padding: 2px 8px; font-size: 10px; background: #21262d; color: #8b949e; border: 1px solid #30363d; border-radius: 4px; cursor: pointer;">Scroll to bottom</button>
@@ -3006,6 +3629,7 @@ INDEX_HTML = """<!DOCTYPE html>
       return div.innerHTML;
     }
     function toggleAgentTerminalExpand(agentName) {
+      var isExpanding = !expandedAgentTerminals.has(agentName);
       if (expandedAgentTerminals.has(agentName)) {
         expandedAgentTerminals.delete(agentName);
       } else {
@@ -3015,6 +3639,10 @@ INDEX_HTML = """<!DOCTYPE html>
       for (var i = 0; i < items.length; i++) {
         if (items[i].getAttribute('data-agent-name') === agentName) {
           items[i].classList.toggle('agent-terminal-expanded');
+          var body = items[i].querySelector('.agent-terminal-body');
+          if (body && (items[i].classList.contains('agent-terminal-lead') || items[i].classList.contains('agent-terminal-supervisor'))) {
+            body.style.display = isExpanding ? 'block' : 'none';
+          }
           break;
         }
       }
@@ -3133,7 +3761,7 @@ INDEX_HTML = """<!DOCTYPE html>
         const metricsBodyEl = document.getElementById('metricsBody');
         const tbody = document.getElementById('agentsBody');
         if (data.error) {
-          if (tbody.innerHTML.indexOf(data.error) === -1) tbody.innerHTML = '<tr><td colspan="7">' + data.error + '</td></tr>';
+          if (tbody.innerHTML.indexOf(data.error) === -1) tbody.innerHTML = '<tr><td colspan="8">' + data.error + '</td></tr>';
           return;
         }
         if (agentCountEl && agentCountEl.textContent !== String(data.agents.length)) agentCountEl.textContent = data.agents.length;
@@ -3143,7 +3771,17 @@ INDEX_HTML = """<!DOCTYPE html>
         if (mergeCountEl && lastMergeCount !== mergeCount) { mergeCountEl.textContent = mergeCount; lastMergeCount = mergeCount; }
         const metricsText = 'Total sessions: ' + (data.agents.length) + ' | Avg duration: ' + (data.metrics && data.metrics.avgDuration || '0s');
         if (metricsBodyEl && lastMetricsText !== metricsText) { metricsBodyEl.textContent = metricsText; lastMetricsText = metricsText; }
-        const newRows = data.agents.map(a => `<tr><td>${a.state_icon}</td><td>${a.name}</td><td>${a.capability}</td><td>${a.state}</td><td>${a.bead_id}</td><td>${a.duration}</td><td>${a.tmux}</td></tr>`).join('') || '<tr><td colspan="7">No agents</td></tr>';
+        function escapeHtml(s) { if (s == null) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+        function taskCell(a) {
+          const short = (a.task_short || '').trim();
+          const full = (a.task_full || short).trim();
+          if (!short && !full) return '<td class="task-cell">—</td>';
+          const summary = short || '—';
+          const fullEsc = escapeHtml(full);
+          const summaryEsc = escapeHtml(summary);
+          return '<td class="task-cell"><details class="task-details"><summary class="task-summary" title="' + summaryEsc + '">' + summaryEsc + '</summary><pre class="task-full">' + fullEsc + '</pre></details></td>';
+        }
+        const newRows = data.agents.map(a => `<tr><td>${a.state_icon}</td><td>${a.name}</td><td>${a.capability}</td><td>${a.state}</td><td>${a.bead_id}</td><td>${a.duration}</td><td>${a.tmux}</td>${taskCell(a)}</tr>`).join('') || '<tr><td colspan="8">No agents</td></tr>';
         const snapshot = data.agents.length + '|' + newRows;
         if (snapshot !== lastAgentsSnapshot) {
           lastAgentsSnapshot = snapshot;
@@ -3151,7 +3789,7 @@ INDEX_HTML = """<!DOCTYPE html>
         }
       } catch (e) {
         const tbody = document.getElementById('agentsBody');
-        const errRow = '<tr><td colspan="7">Failed to load: ' + e.message + '</td></tr>';
+        const errRow = '<tr><td colspan="8">Failed to load: ' + e.message + '</td></tr>';
         if (tbody && tbody.innerHTML !== errRow) tbody.innerHTML = errRow;
       }
     }
@@ -3371,6 +4009,9 @@ INDEX_HTML = """<!DOCTYPE html>
       const defaultFolderSel = document.getElementById('settingDefaultFolder');
       const customPathWrap = document.getElementById('settingCustomPathWrap');
       const customPathInput = document.getElementById('settingCustomPath');
+      const newFolderWrap = document.getElementById('settingNewFolderWrap');
+      const newFolderInput = document.getElementById('settingNewFolderName');
+      const newFolderBtn = document.getElementById('settingNewFolderBtn');
       const skipPermsCb = document.getElementById('settingSkipPermissions');
 
       function openModal() {
@@ -3394,7 +4035,9 @@ INDEX_HTML = """<!DOCTYPE html>
             const def = (ui.default_project_folder || 'overstory').trim();
             defaultFolderSel.value = def && def !== 'overstory' ? '__custom__' : 'overstory';
             customPathWrap.style.display = defaultFolderSel.value === '__custom__' ? 'block' : 'none';
+            if (newFolderWrap) newFolderWrap.style.display = defaultFolderSel.value === '__new__' ? 'block' : 'none';
             if (customPathInput) customPathInput.value = def !== 'overstory' ? def : '';
+            if (newFolderInput) newFolderInput.value = '';
           }
           if (skipPermsCb) skipPermsCb.checked = !!gw.dangerously_skip_permissions;
         } catch (_) {}
@@ -3426,7 +4069,24 @@ INDEX_HTML = """<!DOCTYPE html>
       if (saveBtn) saveBtn.addEventListener('click', saveSettings);
       if (modal) modal.addEventListener('click', function(e) { if (e.target === modal) closeModal(); });
       if (defaultFolderSel) defaultFolderSel.addEventListener('change', function() {
-        customPathWrap.style.display = this.value === '__custom__' ? 'block' : 'none';
+        const v = this.value;
+        customPathWrap.style.display = v === '__custom__' ? 'block' : 'none';
+        if (newFolderWrap) newFolderWrap.style.display = v === '__new__' ? 'block' : 'none';
+      });
+      if (newFolderBtn && newFolderInput) newFolderBtn.addEventListener('click', async function() {
+        const name = newFolderInput.value.trim();
+        if (!name) { alert('Enter a folder name'); return; }
+        try {
+          const res = await fetch('/api/project/create-folder', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name }) });
+          const data = await res.json();
+          if (!res.ok) { alert(data.error || 'Failed to create folder'); return; }
+          if (customPathInput) customPathInput.value = data.path;
+          if (defaultFolderSel) defaultFolderSel.value = '__custom__';
+          if (customPathWrap) customPathWrap.style.display = 'block';
+          if (newFolderWrap) { newFolderWrap.style.display = 'none'; newFolderInput.value = ''; }
+          await fetch('/api/ui-settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ default_project_folder: data.path }) });
+          if (typeof window.refreshProjectUI === 'function') window.refreshProjectUI();
+        } catch (e) { alert('Failed: ' + (e.message || 'Unknown error')); }
       });
     })();
 
