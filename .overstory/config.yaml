@@ -1,6 +1,9 @@
 agents:
   baseDir: .overstory/agent-defs
   capabilities:
+    approval-supervisor:
+      description: Responds to all approval requests in mail as quickly as possible (gateway runs an Ollama-backed loop that polls mail every 5s and approves senders; optional spawn uses this capability).
+      model: claude-code
     blogger:
       description: Create humanized blog content and articles
       model: claude-code

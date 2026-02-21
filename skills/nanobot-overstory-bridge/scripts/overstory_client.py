@@ -77,16 +77,23 @@ class OverstoryClient:
         capability: str,
         name: str,
         description: str,
+        parent: Optional[str] = None,
+        force_hierarchy: bool = False,
     ) -> Dict[str, Any]:
         """Spawn a new agent via `overstory sling`."""
         log.info("Slinging agent %s (capability=%s)", name, capability)
-        return self._run([
+        args = [
             "sling",
             "--task-id", task_id,
             "--capability", capability,
             "--name", name,
             "--description", description,
-        ])
+        ]
+        if parent:
+            args.extend(["--parent", parent])
+        if force_hierarchy:
+            args.append("--force-hierarchy")
+        return self._run(args)
 
     def status(self, agent_name: Optional[str] = None) -> Dict[str, Any]:
         """Get agent status. If agent_name is None, returns all agents."""

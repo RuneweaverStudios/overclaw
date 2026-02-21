@@ -17,6 +17,8 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -24,6 +26,7 @@ from typing import Any, Dict, List, Optional
 NANOBOT_GATEWAY_URL = os.environ.get("NANOBOT_GATEWAY_URL", "http://localhost:18800")
 NANOBOT_WORKSPACE = Path(os.environ.get("NANOBOT_WORKSPACE", "/Users/ghost/.openclaw/workspace"))
 NANOBOT_SKILLS_DIR = Path(os.environ.get("NANOBOT_SKILLS_DIR", "/Users/ghost/.openclaw/workspace/skills"))
+UI_SETTINGS_PATH = NANOBOT_WORKSPACE / ".overclaw_ui" / "settings.json"
 
 logging.basicConfig(
     level=os.environ.get("GATEWAY_TOOLS_LOG_LEVEL", "INFO"),
@@ -134,9 +137,63 @@ def discover_skills(skills_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
     return results
 
 
+def _slug_from_name(name: str, max_len: int = 48) -> str:
+    """Generate a safe folder name from a name or prompt."""
+    s = re.sub(r"[^a-z0-9\s\-]", "", (name or "project")[:max_len].lower())
+    s = re.sub(r"[\s_-]+", "-", s).strip("-") or "project"
+    return s[:max_len]
+
+
+def create_project_folder(name: str = "project") -> Dict[str, Any]:
+    """Create a new project folder under the workspace and set it as current in the Overclaw UI.
+    Writes to .overclaw_ui/settings.json so the UI switches to the new folder.
+    """
+    slug = _slug_from_name(name)
+    base = NANOBOT_WORKSPACE / slug
+    path = base
+    n = 1
+    while path.exists():
+        n += 1
+        path = NANOBOT_WORKSPACE / f"{slug}-{n}"
+    path.mkdir(parents=True, exist_ok=True)
+    # Update UI settings so Overclaw UI shows this folder as current
+    default_settings = {"default_project_folder": "overstory", "current_project_folder": "", "create_project_on_next_prompt": False}
+    if UI_SETTINGS_PATH.is_file():
+        try:
+            data = json.loads(UI_SETTINGS_PATH.read_text(encoding="utf-8"))
+            for k in default_settings:
+                if k not in data:
+                    data[k] = default_settings[k]
+        except (json.JSONDecodeError, OSError):
+            data = dict(default_settings)
+    else:
+        data = dict(default_settings)
+    data["current_project_folder"] = str(path)
+    data["create_project_on_next_prompt"] = False
+    UI_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    UI_SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    log.info("Created project folder: %s", path.name)
+    return {"ok": True, "path": str(path), "name": path.name}
+
+
 def discover_tools(skills_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
-    """Aggregate tools from skill _meta.json files and known MCP tool sets."""
+    """Aggregate tools from skill _meta.json files, known MCP tool sets, and built-in gateway tools."""
     tools: List[Dict[str, Any]] = []
+
+    # Built-in: create project folder (so user can ask in chat instead of using a button)
+    tools.append({
+        "name": "create_project_folder",
+        "source": "gateway",
+        "source_type": "builtin",
+        "description": "Create a new project folder under the workspace and set it as the current project in the Overclaw UI. Use when the user asks to create a folder, new project, or workspace. Params: name (string, optional) - folder name or description; defaults to 'project'.",
+    })
+    # Built-in: approve an agent's current confirmation prompt (lead approves worker)
+    tools.append({
+        "name": "approve_agent",
+        "source": "gateway",
+        "source_type": "builtin",
+        "description": "Approve an agent's current confirmation prompt (sends Down+Enter to their terminal). Use when a worker has sent you mail requesting approval. Params: agent (string, required) - agent name, e.g. builder-abc123 or scout-xyz.",
+    })
 
     for skill in discover_skills(skills_dir):
         for tool_name in skill.get("tools", []):
@@ -214,8 +271,31 @@ def run_script(skill_name: str, script_name: str, args: str = "") -> Dict[str, A
 
 
 def exec_tool(tool_name: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Execute a tool by name — resolves to MCP or skill script."""
+    """Execute a tool by name — resolves to built-in, MCP, or skill script."""
     params = params or {}
+
+    if tool_name == "create_project_folder":
+        return create_project_folder(params.get("name") or "project")
+
+    if tool_name == "approve_agent":
+        agent = params.get("agent") or params.get("name")
+        if not agent:
+            return {"error": "approve_agent requires 'agent' (agent name)", "exit_code": 1}
+        try:
+            req = urllib.request.Request(
+                f"{NANOBOT_GATEWAY_URL}/api/agents/{urllib.parse.quote(str(agent))}/approve",
+                data=b"",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                out = json.loads(resp.read())
+                if not out.get("ok"):
+                    return {"error": out.get("error", "approve failed"), "exit_code": 1, "response": out}
+                return {"ok": True, "agent": agent, "message": out.get("message", "approved")}
+        except Exception as exc:
+            log.warning("approve_agent failed for %s: %s", agent, exc)
+            return {"error": str(exc), "exit_code": 1}
 
     mcp_tools = {t["name"]: t for t in _discover_mcp_tools()}
     if tool_name in mcp_tools:

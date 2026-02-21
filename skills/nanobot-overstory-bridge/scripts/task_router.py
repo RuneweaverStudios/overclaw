@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sys
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
@@ -189,12 +190,31 @@ class TaskRouter:
 
         if self.client:
             try:
-                spawn_result = self.client.sling(
-                    task_id=routed.task_id,
-                    capability=routed.capability,
-                    name=routed.name,
-                    description=routed.description,
-                )
+                worker_caps = {"builder", "scout", "reviewer"}
+                if routed.capability in worker_caps:
+                    # Coordinator can only spawn "lead" directly; spawn lead first, then worker with --parent
+                    lead_name = f"lead-{routed.task_id[:8]}"
+                    self.client.sling(
+                        task_id=routed.task_id,
+                        capability="lead",
+                        name=lead_name,
+                        description=routed.description,
+                    )
+                    time.sleep(1)  # give overstory a moment to register the lead
+                    spawn_result = self.client.sling(
+                        task_id=routed.task_id,
+                        capability=routed.capability,
+                        name=routed.name,
+                        description=routed.description,
+                        parent=lead_name,
+                    )
+                else:
+                    spawn_result = self.client.sling(
+                        task_id=routed.task_id,
+                        capability=routed.capability,
+                        name=routed.name,
+                        description=routed.description,
+                    )
                 result["spawn_result"] = spawn_result
                 result["spawned"] = True
                 log.info("Spawned agent %s via overstory", routed.name)

@@ -116,3 +116,95 @@ This is a **run/stream error**, not necessarily a local process crash. The gatew
 ```
 
 With no arguments it just ensures the gateway is running and waits for the port: `ensure_gateway_then.sh`. You can also run `gateway_guard.py ensure --apply --wait` before starting the TUI manually.
+
+---
+
+## 5. Agents turn into zombies / don't finish tasks / don't send mail (OverClaw / Overstory)
+
+**What's happening:** Overstory agents (lead, builder, researcher, blogger, etc.) show up as **zombies** in status. Tasks never complete and inter-agent mail doesn't get sent or processed.
+
+**Cause:** Overstory marks an agent as **zombie** when the underlying process or tmux session is dead or disconnected but the agent record is still in its state. Zombie agents don't run tools, don't complete work, and don't read/send mail — so the swarm appears stuck.
+
+**Tools and skills to use:**
+
+1. **List zombies (OverClaw Gateway):**
+   ```bash
+   curl -s http://localhost:18800/api/zombies
+   ```
+   Or use the **Zombie Hunter** panel in the OverClaw dashboard (checks every 5 minutes).
+
+2. **Slay zombies (clear worktrees + sessions so new agents can run):**
+   ```bash
+   curl -s -X POST http://localhost:18800/api/zombies/slay
+   ```
+   Or click **Slay** in the dashboard. This runs `overstory clean --worktrees --sessions`: removes worktrees, kills tmux sessions, and clears agent state so status shows 0 zombies.
+
+3. **From the workspace (no gateway):**
+   ```bash
+   cd /Users/ghost/.openclaw/workspace
+   overstory status --json    # see agents and state
+   overstory clean --worktrees --sessions --json   # slay zombies and clear state
+   ```
+
+4. **OpenClaw subagents (different system):** If you're on OpenClaw (not OverClaw) and subagents seem stuck, use **subagent-tracker** to see who's active and **subagent-dashboard** to cancel or resume:
+   ```bash
+   python3 /Users/ghost/.openclaw/workspace/skills/subagent-tracker/scripts/subagent_tracker.py list --active 30 --summary
+   python3 /Users/ghost/.openclaw/workspace/skills/subagent-tracker/scripts/subagent_tracker.py check --stall-minutes 30
+   ```
+   Dashboard: **Cancel Job** / **Resume** on stalled cards.
+
+5. **Mail:** Sending mail is via `POST /api/agents/mail` (gateway) or `overstory mail send`. Mail is written to the mail DB; zombie agents never *read* their inbox, so delivery only helps once agents are running again. Slay zombies first, then spawn new tasks.
+
+**Prevention:** Keep the OverClaw dashboard open so the Zombie Hunter runs every 5 minutes and slays zombies automatically, or run `curl -X POST http://localhost:18800/api/zombies/slay` periodically (e.g. from a cron or after starting the stack).
+
+**Keep Claude process from exiting (OverClaw):** The stack uses a wrapper at `.overstory/bin/claude` so the agent process does not exit and become a zombie. When you run `./scripts/start-overclaw.sh`, it sets `PATH` so that wrapper is used: it unsets `CI`, sets `TERM`, runs the real Claude Code binary, and if Claude exits it restarts it in a loop so the tmux pane stays alive. Start the stack with `./scripts/start-overclaw.sh` (not by hand without that PATH) so the wrapper is in effect. To point to a different Claude binary, set `CLAUDE_CODE_BIN` before starting (e.g. `export CLAUDE_CODE_BIN=/path/to/claude`).
+
+---
+
+## 6. Bypass Permissions disclaimer stuck on all agents (OverClaw)
+
+**What's happening:** Every builder/lead/scout (and other) session shows the **Bypass Permissions** warning (“1. No, exit / 2. Yes, I accept”) and never moves on. You may also see **Mail check** and **Accept disclaimer** prompts.
+
+**Quick fix:**
+
+1. **Ensure the OverClaw gateway is running** (port 18800). The gateway runs a **disclaimer watcher** every 3 seconds that sends Down+Enter to each agent’s tmux pane to accept the disclaimer. If the gateway isn’t running, that watcher doesn’t run.
+2. **Use the dashboard:** Click **Accept all disclaimers** (sends Down+Enter to every agent). If you have many sessions, click it once; it may take a few seconds to hit all of them.
+3. **Or call the API:**
+   ```bash
+   curl -s -X POST http://localhost:18800/api/agents/accept-all-disclaimers
+   ```
+   Or to both accept disclaimers and any generic “confirm” prompts:
+   ```bash
+   curl -s -X POST http://localhost:18800/api/agents/auto-accept-prompts
+   ```
+
+**If it keeps coming back:** The watcher only knows about tmux sessions that Overstory reports in `overstory status --json` (or sessions named `overstory-overclaw-*` as a fallback). If your sessions use different names, the watcher won’t see them — use the **Accept all disclaimers** button or the curl commands above when you open the dashboard.
+
+**Optional:** Use **Restart agents (skip perms)** in the dashboard (or the gateway’s restart-with-skip-permissions endpoint) so agents start with `claude --dangerously-skip-permissions` and the disclaimer is accepted once automatically.
+
+---
+
+## 7. Agents section: Error: database is locked (OverClaw)
+
+**What's happening:** The Agents panel in the OverClaw dashboard shows **Error: database is locked** (or similar).
+
+**Cause:** Overstory’s internal SQLite DB (or the shared mail DB) is busy — multiple processes (gateway loops, UI, overstory CLI, spawned agents) can hit it at once and SQLite returns “database is locked”.
+
+**What we did:**
+- **UI** retries `overstory status` up to 3 times with a short delay when it sees “database is locked” or “locked”. If it still fails, the message shown is: **“Agents temporarily unavailable (database busy). Try again in a moment.”**
+- **mail.db** in the gateway uses WAL mode and a per-process lock so only one reader/writer at a time; the UI uses WAL and a 15s busy timeout when reading mail.db.
+
+**What you can do:** Refresh the dashboard in a few seconds; the retries usually succeed. If it persists, avoid running many overstory commands in parallel (e.g. wait for the dashboard to load before running `overstory status` in a terminal).
+
+---
+
+## Approval flow (lead approves worker)
+
+**Intended flow:** Task requires approval → spawn lead + worker → worker hits a confirmation prompt → worker mails lead (“Need approval”) → lead approves (sends Down+Enter to worker’s terminal) → worker continues.
+
+**Implementations:**
+
+- **POST /api/agents/{name}/approve** (gateway) — sends Down+Enter to that agent’s tmux. Call this when a worker has requested approval (e.g. after you see mail from worker to lead with “Need approval”).
+- **approve_agent** tool (gateway_tools) — built-in tool that calls the gateway approve endpoint. The lead agent can use this (e.g. when it has gateway_tools and reads “Need approval” mail) to approve a worker by name.
+
+**E2E test:** `python3 scripts/test_approval_flow.py` from the workspace root. It spawns lead+worker with a task that may trigger a confirmation; if the worker mails the lead (or the test simulates that), it calls the approve endpoint. **Requires:** OverClaw gateway running on 18800 (restart gateway after adding the approve route so the test sees it).

@@ -1846,6 +1846,11 @@ def _query_overstory_agents(timeout_sec=10):
         return []
     if isinstance(data, dict) and data.get("error"):
         return []
+    # Gateway may return {"raw": "text"} when overstory status outputs plain text
+    if isinstance(data, dict) and "raw" in data and not any(k in data for k in ("agents", "agent", "items", "result")):
+        # Parse Overstory status text to extract agent info from worktrees
+        raw_text = data.get("raw", "")
+        return _parse_overstory_status_text(raw_text)
     if isinstance(data, list):
         return data
     if isinstance(data, dict) and "agents" in data:
@@ -1854,6 +1859,42 @@ def _query_overstory_agents(timeout_sec=10):
         if key in data and isinstance(data[key], list):
             return data[key]
     return []
+
+
+def _parse_overstory_status_text(status_text):
+    """Parse Overstory status text output to extract agent info from worktrees.
+    Returns list of agent dicts with name, task_id, capability inferred from worktree paths.
+    """
+    if not status_text:
+        return []
+    agents = []
+    lines = status_text.split('\n')
+    in_worktrees = False
+    for line in lines:
+        line = line.strip()
+        if '🌳 Worktrees:' in line or 'Worktrees:' in line:
+            in_worktrees = True
+            continue
+        if in_worktrees:
+            if not line or line.startswith('📬') or line.startswith('🔀') or line.startswith('📈'):
+                break
+            # Parse worktree path: overstory/capability-name/task-id
+            # e.g., "overstory/builder-162b29/workspace-57e"
+            if line.startswith('overstory/'):
+                parts = line.split('/')
+                if len(parts) >= 3:
+                    capability_part = parts[1]  # e.g., "builder-162b29"
+                    task_id = parts[2]  # e.g., "workspace-57e"
+                    # Extract capability from name (e.g., "builder-162b29" -> "builder")
+                    capability = capability_part.split('-')[0] if '-' in capability_part else capability_part
+                    agent_name = capability_part
+                    agents.append({
+                        "name": agent_name,
+                        "capability": capability,
+                        "task_id": task_id,
+                        "status": "running",  # If worktree exists, assume running
+                    })
+    return agents
 
 
 def _overstory_agents_to_dashboard_format(agents_list):
@@ -1870,7 +1911,10 @@ def _overstory_agents_to_dashboard_format(agents_list):
         key = f"overstory:{session_id}"
         task = a.get("task") or a.get("description") or a.get("task_id") or ""
         capability = a.get("capability") or a.get("model") or "overstory"
-        status = (a.get("status") or "").lower()
+        status = (a.get("status") or "").strip().lower()
+        terminal_statuses = ("completed", "failed", "terminated")
+        potentially_complete = ("potentially complete", "potentially_complete", "ok", "success")
+        is_terminal = status in terminal_statuses or status in potentially_complete
         updated_at = a.get("updatedAt") or a.get("updated_at") or a.get("start_time") or now_ms
         if isinstance(updated_at, (int, float)):
             updated_at_ms = int(updated_at * 1000) if updated_at < 1e12 else int(updated_at)
@@ -1890,8 +1934,8 @@ def _overstory_agents_to_dashboard_format(agents_list):
             "outputTokens": 0,
             "taskIndex": None,
             "totalTasks": None,
-            "completed": status in ("completed", "failed", "terminated"),
-            "outcomeStatus": status if status in ("completed", "failed", "terminated") else None,
+            "completed": is_terminal,
+            "outcomeStatus": status if is_terminal else None,
             "displayName": name,
         })
     return out
@@ -2000,10 +2044,13 @@ def _enrich_agents_with_runs(agents):
             agent["endedAt"] = run_info.get("endedAt")
             agent["outcome"] = run_info.get("outcome")
             agent["cleanup"] = run_info.get("cleanup", "keep")
-            if run_info.get("endedAt"):
+            outcome = run_info.get("outcome", {}) if isinstance(run_info.get("outcome"), dict) else {}
+            outcome_status = (outcome.get("status") or "").strip().lower()
+            completed_statuses = ("ok", "completed", "success")
+            is_complete = bool(run_info.get("endedAt")) or outcome_status in completed_statuses
+            if is_complete:
                 agent["completed"] = True
-                outcome = run_info.get("outcome", {})
-                if isinstance(outcome, dict):
+                if outcome:
                     agent["outcomeStatus"] = outcome.get("status")
                     agent["outcomeError"] = outcome.get("error")
                     agent["outcomeMessage"] = outcome.get("message")
