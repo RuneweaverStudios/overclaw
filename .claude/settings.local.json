@@ -1,14 +1,4 @@
 {
-	"mcpServers": {
-		"playwright": {
-			"command": "python3",
-			"args": ["/Users/ghost/.openclaw/workspace/skills/playwright-mcp/scripts/playwright_mcp_server.py"],
-			"env": {
-				"NANOBOT_WORKSPACE": "/Users/ghost/.openclaw/workspace",
-				"NANOBOT_SKILLS_DIR": "/Users/ghost/.openclaw/workspace/skills"
-			}
-		}
-	},
 	"hooks": {
 		"SessionStart": [
 			{
@@ -16,7 +6,7 @@
 				"hooks": [
 					{
 						"type": "command",
-						"command": "overstory prime --agent orchestrator"
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; overstory prime --agent merge-orphaned-branches"
 					}
 				]
 			}
@@ -27,18 +17,144 @@
 				"hooks": [
 					{
 						"type": "command",
-						"command": "overstory mail check --inject --agent orchestrator"
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; overstory mail check --inject --agent merge-orphaned-branches"
 					}
 				]
 			}
 		],
 		"PreToolUse": [
 			{
+				"matcher": "Write",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; [ -z \"$OVERSTORY_WORKTREE_PATH\" ] && exit 0; read -r INPUT; FILE_PATH=$(echo \"$INPUT\" | sed -n 's/.*\"file_path\": *\"\\([^\"]*\\)\".*/\\1/p'); [ -z \"$FILE_PATH\" ] && exit 0; case \"$FILE_PATH\" in /*) ;; *) FILE_PATH=\"$(pwd)/$FILE_PATH\" ;; esac; case \"$FILE_PATH\" in \"$OVERSTORY_WORKTREE_PATH\"/*) exit 0 ;; \"$OVERSTORY_WORKTREE_PATH\") exit 0 ;; esac; echo '{\"decision\":\"block\",\"reason\":\"Path boundary violation: file is outside your assigned worktree. All writes must target files within your worktree.\"}';"
+					}
+				]
+			},
+			{
+				"matcher": "Edit",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; [ -z \"$OVERSTORY_WORKTREE_PATH\" ] && exit 0; read -r INPUT; FILE_PATH=$(echo \"$INPUT\" | sed -n 's/.*\"file_path\": *\"\\([^\"]*\\)\".*/\\1/p'); [ -z \"$FILE_PATH\" ] && exit 0; case \"$FILE_PATH\" in /*) ;; *) FILE_PATH=\"$(pwd)/$FILE_PATH\" ;; esac; case \"$FILE_PATH\" in \"$OVERSTORY_WORKTREE_PATH\"/*) exit 0 ;; \"$OVERSTORY_WORKTREE_PATH\") exit 0 ;; esac; echo '{\"decision\":\"block\",\"reason\":\"Path boundary violation: file is outside your assigned worktree. All writes must target files within your worktree.\"}';"
+					}
+				]
+			},
+			{
+				"matcher": "NotebookEdit",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; [ -z \"$OVERSTORY_WORKTREE_PATH\" ] && exit 0; read -r INPUT; FILE_PATH=$(echo \"$INPUT\" | sed -n 's/.*\"notebook_path\": *\"\\([^\"]*\\)\".*/\\1/p'); [ -z \"$FILE_PATH\" ] && exit 0; case \"$FILE_PATH\" in /*) ;; *) FILE_PATH=\"$(pwd)/$FILE_PATH\" ;; esac; case \"$FILE_PATH\" in \"$OVERSTORY_WORKTREE_PATH\"/*) exit 0 ;; \"$OVERSTORY_WORKTREE_PATH\") exit 0 ;; esac; echo '{\"decision\":\"block\",\"reason\":\"Path boundary violation: file is outside your assigned worktree. All writes must target files within your worktree.\"}';"
+					}
+				]
+			},
+			{
 				"matcher": "Bash",
 				"hooks": [
 					{
 						"type": "command",
-						"command": "read -r INPUT; CMD=$(echo \"$INPUT\" | sed 's/.*\"command\": *\"\\([^\"]*\\)\".*/\\1/'); if echo \"$CMD\" | grep -qE '\\bgit\\s+push\\b'; then echo '{\"decision\":\"block\",\"reason\":\"git push is blocked by overstory — merge locally, push manually when ready\"}'; exit 0; fi;"
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; read -r INPUT; CMD=$(echo \"$INPUT\" | sed 's/.*\"command\": *\"\\([^\"]*\\)\".*/\\1/'); if echo \"$CMD\" | grep -qE '\\bgit\\s+push\\b'; then   echo '{\"decision\":\"block\",\"reason\":\"git push is blocked — use overstory merge to integrate changes, push manually when ready\"}';   exit 0; fi; if echo \"$CMD\" | grep -qE 'git\\s+reset\\s+--hard'; then   echo '{\"decision\":\"block\",\"reason\":\"git reset --hard is not allowed — it destroys uncommitted work\"}';   exit 0; fi; if echo \"$CMD\" | grep -qE 'git\\s+checkout\\s+-b\\s'; then   BRANCH=$(echo \"$CMD\" | sed 's/.*git\\s*checkout\\s*-b\\s*\\([^ ]*\\).*/\\1/');   if ! echo \"$BRANCH\" | grep -qE '^overstory/merge-orphaned-branches/'; then     echo '{\"decision\":\"block\",\"reason\":\"Branch must follow overstory/merge-orphaned-branches/{bead-id} convention\"}';     exit 0;   fi; fi;"
+					}
+				]
+			},
+			{
+				"matcher": "Task",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; echo '{\"decision\":\"block\",\"reason\":\"Overstory agents must use 'overstory sling' for delegation — Task is not allowed\"}'"
+					}
+				]
+			},
+			{
+				"matcher": "TeamCreate",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; echo '{\"decision\":\"block\",\"reason\":\"Overstory agents must use 'overstory sling' for delegation — TeamCreate is not allowed\"}'"
+					}
+				]
+			},
+			{
+				"matcher": "TeamDelete",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; echo '{\"decision\":\"block\",\"reason\":\"Overstory agents must use 'overstory sling' for delegation — TeamDelete is not allowed\"}'"
+					}
+				]
+			},
+			{
+				"matcher": "SendMessage",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; echo '{\"decision\":\"block\",\"reason\":\"Overstory agents must use 'overstory sling' for delegation — SendMessage is not allowed\"}'"
+					}
+				]
+			},
+			{
+				"matcher": "TaskCreate",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; echo '{\"decision\":\"block\",\"reason\":\"Overstory agents must use 'overstory sling' for delegation — TaskCreate is not allowed\"}'"
+					}
+				]
+			},
+			{
+				"matcher": "TaskUpdate",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; echo '{\"decision\":\"block\",\"reason\":\"Overstory agents must use 'overstory sling' for delegation — TaskUpdate is not allowed\"}'"
+					}
+				]
+			},
+			{
+				"matcher": "TaskList",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; echo '{\"decision\":\"block\",\"reason\":\"Overstory agents must use 'overstory sling' for delegation — TaskList is not allowed\"}'"
+					}
+				]
+			},
+			{
+				"matcher": "TaskGet",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; echo '{\"decision\":\"block\",\"reason\":\"Overstory agents must use 'overstory sling' for delegation — TaskGet is not allowed\"}'"
+					}
+				]
+			},
+			{
+				"matcher": "TaskOutput",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; echo '{\"decision\":\"block\",\"reason\":\"Overstory agents must use 'overstory sling' for delegation — TaskOutput is not allowed\"}'"
+					}
+				]
+			},
+			{
+				"matcher": "TaskStop",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; echo '{\"decision\":\"block\",\"reason\":\"Overstory agents must use 'overstory sling' for delegation — TaskStop is not allowed\"}'"
+					}
+				]
+			},
+			{
+				"matcher": "Bash",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; [ -z \"$OVERSTORY_WORKTREE_PATH\" ] && exit 0; read -r INPUT; CMD=$(echo \"$INPUT\" | sed 's/.*\"command\": *\"\\([^\"]*\\)\".*/\\1/'); if ! echo \"$CMD\" | grep -qE 'sed\\s+-i|sed\\s+--in-place|echo\\s+.*>|printf\\s+.*>|cat\\s+.*>|tee\\s|\\bmv\\s|\\bcp\\s|\\brm\\s|\\bmkdir\\s|\\btouch\\s|\\bchmod\\s|\\bchown\\s|>>|\\binstall\\s|\\brsync\\s'; then exit 0; fi; PATHS=$(echo \"$CMD\" | tr ' \\t' '\\n\\n' | grep '^/' | sed 's/[\";>]*$//'); [ -z \"$PATHS\" ] && exit 0; echo \"$PATHS\" | while IFS= read -r P; do   case \"$P\" in     \"$OVERSTORY_WORKTREE_PATH\"/*) ;;     \"$OVERSTORY_WORKTREE_PATH\") ;;     /dev/*) ;;     /tmp/*) ;;     *) echo '{\"decision\":\"block\",\"reason\":\"Bash path boundary violation: command targets a path outside your worktree. All file modifications must stay within your assigned worktree.\"}'; exit 0; ;;   esac; done;"
 					}
 				]
 			},
@@ -47,7 +163,16 @@
 				"hooks": [
 					{
 						"type": "command",
-						"command": "read -r INPUT; TOOL_NAME=$(echo \"$INPUT\" | sed 's/.*\"tool_name\": *\"\\([^\"]*\\)\".*/\\1/'); overstory log tool-start --agent orchestrator --tool-name \"$TOOL_NAME\""
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; overstory log tool-start --agent merge-orphaned-branches --stdin"
+					}
+				]
+			},
+			{
+				"matcher": "Bash",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "read -r INPUT; CMD=$(echo \"$INPUT\" | sed 's/.*\"command\": *\"\\([^\"]*\\)\".*/\\1/'); if echo \"$CMD\" | grep -qE '\\bgit\\s+push\\b'; then echo '{\"decision\":\"block\",\"reason\":\"git push is blocked — use overstory merge to integrate changes, push manually when ready\"}'; exit 0; fi;"
 					}
 				]
 			}
@@ -58,7 +183,20 @@
 				"hooks": [
 					{
 						"type": "command",
-						"command": "read -r INPUT; TOOL_NAME=$(echo \"$INPUT\" | sed 's/.*\"tool_name\": *\"\\([^\"]*\\)\".*/\\1/'); overstory log tool-end --agent orchestrator --tool-name \"$TOOL_NAME\""
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; overstory log tool-end --agent merge-orphaned-branches --stdin"
+					},
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; overstory mail check --inject --agent merge-orphaned-branches --debounce 500"
+					}
+				]
+			},
+			{
+				"matcher": "",
+				"hooks": [
+					{
+						"type": "command",
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; overstory mail check --inject --agent merge-orphaned-branches --debounce 30000"
 					}
 				]
 			}
@@ -69,11 +207,11 @@
 				"hooks": [
 					{
 						"type": "command",
-						"command": "overstory log session-end --agent orchestrator"
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; overstory log session-end --agent merge-orphaned-branches --stdin"
 					},
 					{
 						"type": "command",
-						"command": "command -v mulch >/dev/null 2>&1 && test -f .mulch/mulch.config.yaml && [ -z \"${OVERSTORY_AGENT_NAME}\" ] && (pwd | grep -q '.overstory/worktrees' || mulch learn) || true"
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; mulch learn"
 					}
 				]
 			}
@@ -84,7 +222,7 @@
 				"hooks": [
 					{
 						"type": "command",
-						"command": "overstory prime --agent orchestrator --compact"
+						"command": "[ -z \"$OVERSTORY_AGENT_NAME\" ] && exit 0; overstory prime --agent merge-orphaned-branches --compact"
 					}
 				]
 			}
