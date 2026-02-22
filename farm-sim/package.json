@@ -1,0 +1,24 @@
+{
+  "name": "farm-sim-visualizer",
+  "version": "1.0.0",
+  "description": "A cozy farm sim visualizer with Three.js",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:coverage": "vitest --coverage"
+  },
+  "dependencies": {
+    "three": "^0.183.1"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0",
+    "vitest": "^2.0.0",
+    "@vitest/ui": "^2.0.0",
+    "@vitest/coverage-v8": "^2.0.0",
+    "jsdom": "^25.0.0"
+  }
+}
