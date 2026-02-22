@@ -277,6 +277,7 @@ class Agent {
 
     const thought = this.thoughts[Math.floor(Math.random() * this.thoughts.length)];
     this.currentThought = thought;
+
     text.textContent = thought;
 
     // Position bubble above agent
@@ -598,6 +599,11 @@ const dialogueSystem = {
     this.currentDialogue = [];
     this.currentIndex = 0;
   },
+
+  // Cleanup method for proper shutdown
+  dispose() {
+    this.close();
+  },
 };
 
 // ============== WORLD GENERATION ==============
@@ -698,6 +704,12 @@ function cleanup() {
 // ============== INITIALIZATION ==============
 async function init() {
   try {
+    // Canvas validation
+    const canvas = document.getElementById('gameCanvas');
+    if (!canvas) {
+      throw new Error('Game canvas not found. Make sure index.html is loaded correctly.');
+    }
+
     // Scene setup
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x87CEEB);
@@ -709,11 +721,6 @@ async function init() {
     );
     camera.position.set(0, 30, 20);
     camera.lookAt(0, 0, 0);
-
-    const canvas = document.getElementById('gameCanvas');
-    if (!canvas) {
-      throw new Error('Game canvas not found');
-    }
 
     renderer = new THREE.WebGLRenderer({
       canvas,
@@ -804,6 +811,22 @@ async function init() {
   } catch (error) {
     console.error('Failed to initialize game:', error);
     cleanup();
+
+    // Show user-friendly error message
+    const canvas = document.getElementById('gameCanvas');
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = '#87CEEB';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#5c4033';
+        ctx.font = '20px Georgia, serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Failed to load Farm Sim', canvas.width / 2, canvas.height / 2 - 20);
+        ctx.font = '14px Georgia, serif';
+        ctx.fillText('Check console for details', canvas.width / 2, canvas.height / 2 + 20);
+      }
+    }
   }
 }
 
@@ -949,6 +972,7 @@ function animate() {
 
   // Update agents
   for (const agent of gameState.agents) {
+    // Random movement
     if (!agent.isMoving && Math.random() < 0.005) {
       const newX = agent.position.x + (Math.random() - 0.5) * 4;
       const newZ = agent.position.z + (Math.random() - 0.5) * 4;
