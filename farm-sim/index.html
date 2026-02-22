@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Farm Sim Visualizer</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      overflow: hidden;
+      background: #87CEEB;
+      font-family: 'Georgia', serif;
+    }
+
+    #gameCanvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    /* Traditional RPG Dialogue Box */
+    #dialogueBox {
+      display: none;
+      position: absolute;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 90%;
+      max-width: 800px;
+      background: linear-gradient(to bottom, #f5e6c8, #e8d4a8);
+      border: 4px solid #5c4033;
+      border-radius: 8px;
+      padding: 20px 25px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.5);
+    }
+
+    #dialogueBox.active {
+      display: block;
+      animation: dialogueIn 0.3s ease-out;
+    }
+
+    @keyframes dialogueIn {
+      from {
+        opacity: 0;
+        transform: translateX(-50%) translateY(20px);
+      }
+      to {
+        opacity: 1;
+        transform: translateX(-50%) translateY(0);
+      }
+    }
+
+    #dialoguePortrait {
+      float: left;
+      width: 80px;
+      height: 80px;
+      margin-right: 15px;
+      border: 3px solid #5c4033;
+      border-radius: 4px;
+      background: #333;
+      image-rendering: pixelated;
+    }
+
+    #dialogueName {
+      font-weight: bold;
+      font-size: 18px;
+      color: #5c4033;
+      margin-bottom: 8px;
+      text-shadow: 1px 1px 0 rgba(255,255,255,0.5);
+    }
+
+    #dialogueText {
+      font-size: 16px;
+      color: #2c1810;
+      line-height: 1.5;
+      min-height: 60px;
+    }
+
+    #dialogueContinue {
+      position: absolute;
+      bottom: 10px;
+      right: 15px;
+      font-size: 12px;
+      color: #5c4033;
+      animation: blink 1s infinite;
+    }
+
+    @keyframes blink {
+      0%, 50% { opacity: 1; }
+      51%, 100% { opacity: 0.3; }
+    }
+
+    /* Thought Bubble */
+    #thoughtBubble {
+      position: absolute;
+      display: none;
+      background: white;
+      border: 3px solid #333;
+      border-radius: 20px;
+      padding: 15px 20px;
+      max-width: 250px;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.2);
+      z-index: 100;
+      pointer-events: none;
+    }
+
+    #thoughtBubble::after {
+      content: '';
+      position: absolute;
+      bottom: -15px;
+      left: 20px;
+      width: 0;
+      height: 0;
+      border-left: 10px solid transparent;
+      border-right: 10px solid transparent;
+      border-top: 15px solid white;
+    }
+
+    #thoughtBubble::before {
+      content: '';
+      position: absolute;
+      bottom: -20px;
+      left: 15px;
+      width: 0;
+      height: 0;
+      border-left: 13px solid transparent;
+      border-right: 13px solid transparent;
+      border-top: 18px solid #333;
+      z-index: -1;
+    }
+
+    #thoughtBubble.active {
+      display: block;
+      animation: thoughtPop 0.3s ease-out;
+    }
+
+    @keyframes thoughtPop {
+      0% {
+        opacity: 0;
+        transform: scale(0.5);
+      }
+      70% {
+        transform: scale(1.05);
+      }
+      100% {
+        opacity: 1;
+        transform: scale(1);
+      }
+    }
+
+    #thoughtText {
+      font-style: italic;
+      font-size: 14px;
+      color: #333;
+      line-height: 1.4;
+    }
+
+    /* UI Panel */
+    #uiPanel {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      background: rgba(245, 230, 200, 0.95);
+      border: 3px solid #5c4033;
+      border-radius: 8px;
+      padding: 15px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+    }
+
+    #uiPanel h3 {
+      font-size: 14px;
+      color: #5c4033;
+      margin-bottom: 8px;
+    }
+
+    #timeDisplay {
+      font-size: 16px;
+      color: #2c1810;
+    }
+
+    #seasonDisplay {
+      font-size: 14px;
+      color: #5c4033;
+      margin-top: 5px;
+    }
+
+    /* Mailbox indicator */
+    #mailboxIndicator {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      background: rgba(255, 255, 255, 0.95);
+      border: 3px solid #5c4033;
+      border-radius: 8px;
+      padding: 10px 15px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+      display: none;
+    }
+
+    #mailboxIndicator.active {
+      display: block;
+      animation: mailPulse 1s infinite;
+    }
+
+    @keyframes mailPulse {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.05); }
+    }
+
+    #mailboxIndicator.has-mail {
+      background: rgba(144, 238, 144, 0.95);
+    }
+
+    /* Click hint */
+    #clickHint {
+      position: absolute;
+      bottom: 150px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.7);
+      color: white;
+      padding: 8px 16px;
+      border-radius: 20px;
+      font-size: 14px;
+      opacity: 0;
+      transition: opacity 0.3s;
+      pointer-events: none;
+    }
+
+    #clickHint.visible {
+      opacity: 1;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+
+  <!-- UI Panel showing time and season -->
+  <div id="uiPanel">
+    <h3>🌾 Farm Sim</h3>
+    <div id="timeDisplay">Time: 6:00 AM</div>
+    <div id="seasonDisplay">Season: Spring</div>
+  </div>
+
+  <!-- Mailbox indicator -->
+  <div id="mailboxIndicator">
+    📬 <span id="mailboxText">Check Mailbox</span>
+  </div>
+
+  <!-- Click hint -->
+  <div id="clickHint">Click on agents to interact</div>
+
+  <!-- Traditional Dialogue Box -->
+  <div id="dialogueBox">
+    <canvas id="dialoguePortrait" width="80" height="80"></canvas>
+    <div id="dialogueName">Agent Name</div>
+    <div id="dialogueText"></div>
+    <div id="dialogueContinue">Press SPACE or Click to continue...</div>
+  </div>
+
+  <!-- Thought Bubble -->
+  <div id="thoughtBubble">
+    <span id="thoughtText"></span>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
