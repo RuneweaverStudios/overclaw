@@ -1653,6 +1653,10 @@ def sw_static(filename):
 def tf_static(filename):
     return send_from_directory(os.path.join(_REPO_ROOT, "assets", "packs", "tinyfarm"), filename)
 
+@app.route("/static/farm/<path:filename>")
+def farm_static(filename):
+    return send_from_directory(os.path.join(_REPO_ROOT, "assets", "packs", "Farm"), filename)
+
 # Single-page HTML: Overstory-style left + tabbed Terminal/Output right
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -5480,83 +5484,49 @@ INDEX_HTML = """<!DOCTYPE html>
 
         preload: function() {
           var self = this;
-          var tfPaths = [
-            'characters/walk_idle.png',
-            'characters/walk_idle_old.png',
-            'characters/portrait_male.png',
-            'characters/portrait_female.png',
-            'characters/portrait_male_old.png',
-            'characters/portrait_female_old.png',
-            'objects/farm_objects.png',
-            'objects/plants.png',
-            'objects/furniture.png',
-            'objects/items.png',
-            'tilemaps/spring_farm.png',
-            'tilemaps/bridges.png',
-            'tilemaps/farm_inside.png',
-            'tilemaps/bg_tinyfarm.png'
+          var FARM_TWF = 'Tiny Wonder Farm Free 3/';
+          var FARM_SW = 'Sunnyside_World_ASSET_PACK_V2.1 2/Sunnyside_World_Assets/';
+          var farmTwfPaths = [
+            FARM_TWF + 'objects&items/farm objects free.png',
+            FARM_TWF + 'objects&items/plants free.png',
+            FARM_TWF + 'objects&items/furniture free.png',
+            FARM_TWF + 'objects&items/items free.png',
+            FARM_TWF + 'tilemaps/spring farm tilemap.png',
+            FARM_TWF + 'tilemaps/farm bridges free.png',
+            FARM_TWF + 'tilemaps/farm inside free.png',
+            FARM_TWF + 'characters/main character/walk and idle.png',
+            FARM_TWF + 'characters/main character/portrait male.png',
+            FARM_TWF + 'characters/main character/portrait female.png',
+            FARM_TWF + 'characters/main character old/walk and idle.png',
+            FARM_TWF + 'characters/main character old/portrait male.png',
+            FARM_TWF + 'characters/main character old/portrait female.png'
           ];
-          var swPaths = [
-            'Elements/Animals/spr_deco_chicken_01_strip4.png',
-            'Elements/Animals/spr_deco_cow_strip4.png',
-            'Elements/Animals/spr_deco_sheep_01_strip4.png',
-            'Elements/Animals/spr_deco_duck_01_strip4.png',
-            'Elements/Animals/spr_deco_pig_01_strip4.png',
-            'Elements/Animals/spr_deco_bird_01_strip4.png',
-            'Elements/Plants/spr_deco_tree_01_strip4.png',
-            'Elements/Plants/spr_deco_tree_02_strip4.png',
-            'Elements/Plants/spr_deco_mushroom_red_01_strip4.png',
-            'Elements/Plants/spr_deco_mushroom_blue_01_strip4.png',
-            'Elements/Other/spr_deco_windmill_strip9.png',
-            'Elements/VFX/Fire/spr_deco_fire_01_strip4.png',
-            'Elements/VFX/Glint/spr_deco_glint_01_strip6.png',
-            'Elements/Crops/sunflower_00.png', 'Elements/Crops/sunflower_01.png',
-            'Elements/Crops/sunflower_02.png', 'Elements/Crops/sunflower_03.png',
-            'Elements/Crops/sunflower_04.png', 'Elements/Crops/sunflower_05.png',
-            'Elements/Crops/cabbage_00.png', 'Elements/Crops/cabbage_01.png',
-            'Elements/Crops/cabbage_02.png', 'Elements/Crops/cabbage_03.png',
-            'Elements/Crops/cabbage_04.png', 'Elements/Crops/cabbage_05.png',
-            'Elements/Crops/carrot_00.png', 'Elements/Crops/carrot_01.png',
-            'Elements/Crops/carrot_02.png', 'Elements/Crops/carrot_03.png',
-            'Elements/Crops/carrot_04.png', 'Elements/Crops/carrot_05.png',
-            'Elements/Crops/seeds_generic.png', 'Elements/Crops/soil_00.png',
-            'Characters/Goblin/PNG/spr_idle_strip9.png',
-            'Characters/Goblin/PNG/spr_walk_strip8.png',
-            'Characters/Goblin/PNG/spr_attack_strip10.png',
-            'Characters/Goblin/PNG/spr_death_strip13.png',
-            'Characters/Skeleton/PNG/skeleton_idle_strip6.png',
-            'Characters/Skeleton/PNG/skeleton_walk_strip8.png',
-            'Characters/Skeleton/PNG/skeleton_attack_strip7.png',
-            'Characters/Skeleton/PNG/skeleton_death_strip10.png'
+          var farmElPaths = [
+            FARM_SW + 'Elements/Other/spr_deco_windmill_strip9.png',
+            FARM_SW + 'Elements/Animals/spr_deco_chicken_01_strip4.png',
+            FARM_SW + 'Elements/Animals/spr_deco_cow_strip4.png',
+            FARM_SW + 'Elements/Animals/spr_deco_sheep_01_strip4.png',
+            FARM_SW + 'Elements/Animals/spr_deco_duck_01_strip4.png',
+            FARM_SW + 'Elements/Animals/spr_deco_pig_01_strip4.png',
+            FARM_SW + 'Elements/Animals/spr_deco_bird_01_strip4.png',
+            FARM_SW + 'Elements/Plants/spr_deco_tree_01_strip4.png',
+            FARM_SW + 'Elements/Plants/spr_deco_tree_02_strip4.png',
+            FARM_SW + 'Elements/Plants/spr_deco_mushroom_red_01_strip4.png',
+            FARM_SW + 'Elements/Plants/spr_deco_mushroom_blue_01_strip4.png',
+            FARM_SW + 'Elements/VFX/Fire/spr_deco_fire_01_strip4.png',
+            FARM_SW + 'Elements/VFX/Glint/spr_deco_glint_01_strip6.png'
           ];
-          var ssHairs = ['base', 'spikeyhair', 'bowlhair', 'longhair', 'curlyhair', 'mophair'];
-          var ssActions = [
-            { folder: 'IDLE', suf: 'idle', frames: 9 },
-            { folder: 'ATTACK', suf: 'attack', frames: 10 },
-            { folder: 'WALKING', suf: 'walk', frames: 8 },
-            { folder: 'WATERING', suf: 'watering', frames: 5 },
-            { folder: 'MINING', suf: 'mining', frames: 10 },
-            { folder: 'AXE', suf: 'axe', frames: 10 },
-            { folder: 'CARRY', suf: 'carry', frames: 8 },
-            { folder: 'DIG', suf: 'dig', frames: 13 },
-            { folder: 'RUN', suf: 'run', frames: 8 },
-            { folder: 'DOING', suf: 'doing', frames: 8 }
-          ];
-          ssHairs.forEach(function(h) {
-            ssActions.forEach(function(a) {
-              swPaths.push('Characters/Human/' + a.folder + '/' + h + '_' + a.suf + '_strip' + a.frames + '.png');
-            });
-            swPaths.push('Characters/Human/HAMMERING/' + h + '_hamering_strip23.png');
+          var hairTypes = ['base', 'bowlhair', 'curlyhair', 'longhair', 'mophair', 'shorthair', 'spikeyhair'];
+          var farmCharPaths = [];
+          hairTypes.forEach(function(h) {
+            farmCharPaths.push(FARM_SW + 'Characters/Human/IDLE/' + h + '_idle_strip9.png');
+            farmCharPaths.push(FARM_SW + 'Characters/Human/WALKING/' + h + '_walk_strip8.png');
           });
-
-          var p1 = Promise.all(tfPaths.map(function(p) {
-            return loadTex('/static/tf/' + p).then(function(t) { self.textures[p] = t; }).catch(function() {});
-          }));
-          var p2 = Promise.all(swPaths.map(function(p) {
-            return loadTex('/static/sw/' + p).then(function(t) { self.textures['sw:' + p] = t; }).catch(function() {});
-          }));
-          return Promise.all([p1, p2]).then(function() {
-            console.log('[CEO:TinyFarm] Textures loaded (' + Object.keys(self.textures).length + ')');
+          var loadFarm = function(path) {
+            return loadTex('/static/farm/' + encodeURIComponent(path)).then(function(t) { self.textures[path] = t; }).catch(function() {});
+          };
+          return Promise.all(farmTwfPaths.map(loadFarm).concat(farmElPaths.map(loadFarm)).concat(farmCharPaths.map(loadFarm))).then(function() {
+            console.log('[CEO:TinyFarm] Farm pack textures loaded (' + Object.keys(self.textures).length + ')');
           });
         },
 
@@ -5579,368 +5549,356 @@ INDEX_HTML = """<!DOCTYPE html>
         _addObj: function(s, x, y, z) {
           if (!s) return;
           s.position.set(x, y, z);
-          scene.add(s); this.objects.push(s);
+          (this.objectsGroup || scene).add(s);
+          this.objects.push(s);
         },
 
-        _swTex: function(key) { return this.textures['sw:' + key]; },
+        _tfTex: function(key) { return this.textures[key]; },
+        farmTwfBase: 'Tiny Wonder Farm Free 3/',
+        farmSwBase: 'Sunnyside_World_ASSET_PACK_V2.1 2/Sunnyside_World_Assets/',
 
         initScene: function() {
           var self = this;
           self.objects = []; self.plants = []; self.plantTimer = 0;
           self.animals = []; self.crops = []; self.enemies = [];
           self.fireSprites = []; self.windmillSprite = null;
-          self.windmillAnimState = null; self.enemySpawnTimer = 0;
+          self.windmillAnimState = null;
           self.phaseTimer = 0; self.combatPhase = false;
           self.propPositions = [];
 
           function addProp(x, z) { self.propPositions.push({ x: x, z: z }); }
 
-          // ---- FLOOR ----
-          var bgTex = self.textures['tilemaps/bg_tinyfarm.png'];
-          var floorGeo = new THREE.PlaneGeometry(28, 16);
-          var floorMat;
-          if (bgTex) {
+          var PIX = 32;
+          var FARM_TWF = 'Tiny Wonder Farm Free 3/';
+          var FARM_SW = 'Sunnyside_World_ASSET_PACK_V2.1 2/Sunnyside_World_Assets/';
+          var fo = FARM_TWF + 'objects&items/farm objects free.png';
+          var springTile = FARM_TWF + 'tilemaps/spring farm tilemap.png';
+          var bridgesKey = FARM_TWF + 'tilemaps/farm bridges free.png';
+          var insideKey = FARM_TWF + 'tilemaps/farm inside free.png';
+
+          // 25.1 WorldData grid (single source of truth)
+          var worldW = 28, worldD = 16;
+          var cellsX = 28, cellsZ = 16;
+          var worldData = {};
+          function getTile(tx, tz) {
+            var k = tx + ',' + tz;
+            if (!worldData[k]) worldData[k] = { type: 'grass', object: null, variant: 0 };
+            return worldData[k];
+          }
+          function setTile(tx, tz, type, object, variant) {
+            var k = tx + ',' + tz;
+            worldData[k] = { type: type, object: object || null, variant: variant || 0 };
+          }
+          for (var tz = 0; tz < cellsZ; tz++) {
+            for (var tx = 0; tx < cellsX; tx++) { setTile(tx, tz, 'grass'); }
+          }
+          // 25.3 Four 5x5 plots with 1-tile path between (plots in lower-center)
+          var plots = [[2,5,6,9],[10,5,14,9],[2,11,6,15],[10,11,14,15]];
+          plots.forEach(function(p) {
+            for (var tz = p[1]; tz <= p[3]; tz++) {
+              for (var tx = p[0]; tx <= p[2]; tx++) { setTile(tx, tz, 'tilled'); }
+            }
+          });
+          // 25.4 Paths: horizontal bottom (tz=4), between rows (tz=10), vertical between (tx=7,8)
+          for (var tx = 0; tx < cellsX; tx++) { setTile(tx, 4, 'path'); setTile(tx, 10, 'path'); }
+          for (var tz = 0; tz < cellsZ; tz++) { setTile(7, tz, 'path'); setTile(8, tz, 'path'); }
+          // Water feature for ducks: 4x3 pond (right side)
+          for (var tz = 2; tz <= 4; tz++) { for (var tx = 15; tx <= 18; tx++) { setTile(tx, tz, 'water'); } }
+          self.worldData = worldData; self.cellsX = cellsX; self.cellsZ = cellsZ;
+
+          // 25.2 Ground from atlas (manifest: grass 1,0; path 1,1; tilled 2,3; water 0,3)
+          var tilemapCols = 9, tilemapRows = 20;
+          var manifest = { grass: [1,0], path: [1,1], tilled: [2,3], water: [0,3], dirt: [1,0] };
+          var objectsGroup = new THREE.Group();
+          scene.add(objectsGroup);
+          self.objectsGroup = objectsGroup;
+          var bgTex = self.textures[springTile];
+          if (bgTex && bgTex.image) {
+            bgTex.wrapS = bgTex.wrapT = THREE.ClampToEdgeWrapping;
             bgTex.magFilter = THREE.NearestFilter;
-            bgTex.minFilter = THREE.NearestMipmapNearestFilter;
-            floorMat = new THREE.MeshBasicMaterial({ map: bgTex, side: THREE.DoubleSide });
+            bgTex.minFilter = THREE.NearestFilter;
+            var positions = []; var uvs = []; var indices = [];
+            for (var tz = 0; tz < cellsZ; tz++) {
+              for (var tx = 0; tx < cellsX; tx++) {
+                var t = getTile(tx, tz);
+                var m = manifest[t.type] || manifest.grass;
+                var tileCol = Math.max(0, Math.min(tilemapCols - 1, m[0]));
+                var tileRow = Math.max(0, Math.min(tilemapRows - 1, m[1]));
+                var u0 = tileCol / tilemapCols, u1 = (tileCol + 1) / tilemapCols;
+                var v0 = 1 - (tileRow + 1) / tilemapRows, v1 = 1 - tileRow / tilemapRows;
+                var x0 = -worldW/2 + tx, x1 = x0 + 1;
+                var z0 = -worldD/2 + tz, z1 = z0 + 1;
+                var base = (tz * cellsX + tx) * 4;
+                positions.push(x0, 0, z0,  x1, 0, z0,  x1, 0, z1,  x0, 0, z1);
+                uvs.push(u0, v0,  u1, v0,  u1, v1,  u0, v1);
+                indices.push(base, base+1, base+2,  base, base+2, base+3);
+              }
+            }
+            var floorGeo = new THREE.BufferGeometry();
+            floorGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            floorGeo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+            floorGeo.setIndex(indices);
+            floorGeo.rotateX(-Math.PI / 2);
+            var floor = new THREE.Mesh(floorGeo, new THREE.MeshBasicMaterial({ map: bgTex, side: THREE.DoubleSide }));
+            floor.position.y = -0.01;
+            objectsGroup.add(floor); self.objects.push(floor);
           } else {
-            floorMat = new THREE.MeshBasicMaterial({ color: 0xa5c543, side: THREE.DoubleSide });
-          }
-          var floor = new THREE.Mesh(floorGeo, floorMat);
-          floor.rotation.x = -Math.PI / 2; floor.position.y = -0.01;
-          scene.add(floor); self.objects.push(floor);
-
-          // Path/road overlay (tan strip along z:-1..0.5)
-          var pathGeo = new THREE.PlaneGeometry(26, 2.2);
-          var pathMat = new THREE.MeshBasicMaterial({ color: 0xd4a574, side: THREE.DoubleSide });
-          var pathMesh = new THREE.Mesh(pathGeo, pathMat);
-          pathMesh.rotation.x = -Math.PI / 2;
-          pathMesh.position.set(0, 0, -0.25);
-          scene.add(pathMesh); self.objects.push(pathMesh);
-
-          // ==== ZONE 1: HOUSE (x:-5..-1, z:-7.5..-5) ====
-          var house = self._regionSprite('objects/farm_objects.png', 0, 96, 128, 95);
-          self._addObj(house, -3, 1.5, -6.5);
-          addProp(-3, -6.5);
-
-          // Door ON the house front (farm_objects.png ~px 130,130 16x48)
-          var door = self._regionSprite('objects/farm_objects.png', 128, 128, 16, 48, 1.2);
-          self._addObj(door, -3, 0.9, -5.7);
-          addProp(-3, -5.7);
-
-          // Mill structure from farm_inside.png near the house
-          var millTex = self.textures['tilemaps/farm_inside.png'];
-          if (millTex) {
-            var mill = self._regionSprite('tilemaps/farm_inside.png', 0, 0, 96, 80, 1.2);
-            self._addObj(mill, -0.5, 1.5, -6.8);
+            var floorGeo = new THREE.PlaneGeometry(worldW, worldD);
+            var floor = new THREE.Mesh(floorGeo, new THREE.MeshBasicMaterial({ color: 0x7cb342, side: THREE.DoubleSide }));
+            floor.rotation.x = -Math.PI / 2; floor.position.y = -0.01;
+            objectsGroup.add(floor); self.objects.push(floor);
           }
 
-          // Furniture grouped around house (all 15 frames, 5x3 grid @16px)
-          var furnTex = self.textures['objects/furniture.png'];
+          // 25.6 House: base on tile center (center-top / right), Y = scale/2 + 0.5
+          var houseTx = 12, houseTz = 1;
+          var houseWx = -worldW/2 + houseTx + 0.5, houseWz = -worldD/2 + houseTz + 0.5;
+          var house = self._regionSprite(fo, 0, 96, 128, 95, 1);
+          if (house) {
+            house.renderOrder = 100;
+            var houseY = house.scale.y / 2 + 0.5;
+            house.position.set(houseWx, houseY, houseWz);
+            objectsGroup.add(house); self.objects.push(house);
+            addProp(houseWx, houseWz);
+          }
+          var door = self._regionSprite(fo, 128, 128, 16, 48, 1.2);
+          if (door) {
+            door.renderOrder = 101;
+            door.position.set(houseWx, door.scale.y / 2 + 0.5, houseWz + 0.8);
+            objectsGroup.add(door); self.objects.push(door);
+            addProp(houseWx, houseWz + 0.8);
+          }
+
+          // Interior/mill (farm inside free 96x128)
+          var insideTex = self.textures[insideKey];
+          if (insideTex) {
+            var mill = self._regionSprite(insideKey, 0, 0, 96, 128, 1.0);
+            if (mill) { mill.position.set(houseWx - 1.2, 1.2, houseWz); objectsGroup.add(mill); self.objects.push(mill); }
+          }
+
+          // Furniture (5x3 grid)
+          var furnTex = self.textures[FARM_TWF + 'objects&items/furniture free.png'];
           if (furnTex) {
-            var furnPlacements = [
-              [0, 0, -2.0, 0.4, -5.6],
-              [1, 0, -4.5, 0.4, -6.0],
-              [2, 0, -1.5, 0.4, -5.5],
-              [3, 0, -4.0, 0.4, -5.5],
-              [4, 0, -1.0, 0.4, -6.3],
-              [0, 1, -4.5, 0.4, -6.5],
-              [1, 1, -3.5, 0.4, -5.3],
-              [2, 1, -2.5, 0.4, -5.3],
-              [3, 1, -0.5, 0.4, -5.5],
-              [4, 1, -5.0, 0.4, -5.8],
-              [0, 2, -5.2, 0.4, -6.2],
-              [1, 2, -1.0, 0.4, -5.5],
-              [2, 2, -4.2, 0.4, -7.0],
-              [3, 2, -2.0, 0.4, -7.0],
-              [4, 2, -3.2, 0.4, -7.0]
+            var furn = [
+              [0,0,houseWx-1.2,0.4,houseWz-1.5],[1,0,houseWx-2.2,0.4,houseWz-2],[2,0,houseWx-0.6,0.4,houseWz-1.4],[3,0,houseWx-2.6,0.4,houseWz-2.4],[4,0,houseWx-1.2,0.4,houseWz-1.6],
+              [0,1,houseWx-3,0.4,houseWz-2.2],[1,1,houseWx-1.6,0.4,houseWz-1.2],[2,1,houseWx-0.4,0.4,houseWz-2.6],[3,1,houseWx+1,0.4,houseWz-1.4],[4,1,houseWx-2.8,0.4,houseWz-1.8],
+              [0,2,houseWx-3.2,0.4,houseWz-2.5],[1,2,houseWx-1.8,0.4,houseWz-2.8],[2,2,houseWx-2,0.4,houseWz-3],[3,2,houseWx-0.4,0.4,houseWz-2.2],[4,2,houseWx-1.4,0.4,houseWz-2.8]
             ];
-            furnPlacements.forEach(function(f) {
-              var ft = gridFrame(furnTex, f[0], f[1], 5, 3);
-              var fs = makeSprite(ft, 0.75, 0.75);
-              fs.position.set(f[2], f[3], f[4]);
-              scene.add(fs); self.objects.push(fs);
+            furn.forEach(function(f) {
+              var sp = makeSprite(gridFrame(furnTex, f[0], f[1], 5, 3), 0.7, 0.7);
+              sp.position.set(f[2], f[3], f[4]);
+              objectsGroup.add(sp); self.objects.push(sp);
             });
           }
 
-          // ==== ZONE 2: FARM FIELD (x:-5..3, z:-4.5..-1.5) on tilled soil ====
-          // TF crops from plants.png (16px grid, 5x6) in neat rows
-          var plantsTex = self.textures['objects/plants.png'];
-          if (plantsTex) {
-            for (var row = 0; row < 3; row++) {
-              for (var col = 0; col < 5; col++) {
-                var cx = -4.5 + col * 1.6;
-                var cz = -4.2 + row * 1.2;
-                var pf = gridFrame(plantsTex, col, row, 5, 6);
-                var ps = makeSprite(pf, 0.75, 0.75);
-                ps.position.set(cx, 0.3, cz);
-                scene.add(ps); self.objects.push(ps);
-                self.plants.push({ sprite: ps, col: col, row: row, timer: Math.random() * 20 });
-                addProp(cx, cz);
-              }
-            }
+          // 25.5 Fences: neighbor-aware (N,S,E,W) → vertical / horizontal / corners
+          function hasFence(tx, tz) { var t = worldData[tx + ',' + tz]; return t && t.object === 'fence'; }
+          function fenceVariant(tx, tz) {
+            var n = hasFence(tx, tz - 1), s = hasFence(tx, tz + 1), e = hasFence(tx + 1, tz), w = hasFence(tx - 1, tz);
+            if (n && s && !e && !w) return 'v';
+            if (e && w && !n && !s) return 'h';
+            if (n && e) return 'ne'; if (n && w) return 'nw'; if (s && e) return 'se'; if (s && w) return 'sw';
+            if (n || s) return 'v'; if (e || w) return 'h';
+            return 'v';
           }
-
-          // SS crops (sunflower, cabbage, carrot) in alternate rows on the farm
-          var cropTypes = ['sunflower', 'cabbage', 'carrot'];
-          cropTypes.forEach(function(ct, ci) {
-            var stage = Math.floor(Math.random() * 4) + 1;
-            var key = 'sw:Elements/Crops/' + ct + '_0' + stage + '.png';
-            var tex = self.textures[key];
-            if (!tex) return;
-            for (var j = 0; j < 3; j++) {
-              var cx = -3.5 + j * 2.5;
-              var cz = -4.0 + ci * 1.2 - 0.6;
-              var cs = makeSprite(tex, 0.5, 0.5);
-              scaleSprite(cs, tex);
-              cs.position.set(cx, cs.scale.y / 2, cz);
-              scene.add(cs); self.objects.push(cs);
-              self.crops.push({ sprite: cs, type: ct, stage: stage, x: cx, z: cz, timer: Math.random() * 25 });
-              addProp(cx, cz);
+          var fenceTiles = [];
+          plots.forEach(function(p) {
+            for (var tx = p[0]; tx <= p[2]; tx++) { fenceTiles.push([tx, p[1]]); fenceTiles.push([tx, p[3]]); }
+            for (var tz = p[1]; tz <= p[3]; tz++) { fenceTiles.push([p[0], tz]); fenceTiles.push([p[2], tz]); }
+          });
+          var seen = {};
+          fenceTiles = fenceTiles.filter(function(pt) { var k = pt[0]+','+pt[1]; if (seen[k]) return false; seen[k]=1; return true; });
+          fenceTiles.forEach(function(pt) {
+            var tx = pt[0], tz = pt[1];
+            setTile(tx, tz, getTile(tx, tz).type, 'fence', 0);
+          });
+          fenceTiles.forEach(function(pt) {
+            var tx = pt[0], tz = pt[1];
+            var v = fenceVariant(tx, tz);
+            var wx = -worldW/2 + tx + 0.5, wz = -worldD/2 + tz + 0.5;
+            var seg = (v === 'h') ? self._regionSprite(fo, 0, 16, 48, 16, 1.2) : self._regionSprite(fo, 0, 0, 16, 48, 1.2);
+            if (seg) {
+              seg.position.set(wx, (v === 'h') ? 0.35 : 0.6, wz);
+              objectsGroup.add(seg); self.objects.push(seg);
+              addProp(wx, wz);
             }
           });
 
-          // Farm items at field edges (harvest pile near path)
-          var itemsTex = self.textures['objects/items.png'];
+          // 25.7 Crops: 4x4 grid inside each plot (organized rows)
+          var plantsTex = self.textures[FARM_TWF + 'objects&items/plants free.png'];
+          if (plantsTex) {
+            plots.forEach(function(p) {
+              var ptx0 = p[0], ptz0 = p[1], ptx1 = p[2], ptz1 = p[3];
+              var innerW = (ptx1 - ptx0 - 1), innerD = (ptz1 - ptz0 - 1);
+              if (innerW < 2 || innerD < 2) return;
+              for (var row = 0; row < 4 && row < innerD; row++) {
+                for (var col = 0; col < 4 && col < innerW; col++) {
+                  var cx = -worldW/2 + ptx0 + 1 + col + 0.5, cz = -worldD/2 + ptz0 + 1 + row + 0.5;
+                  var ps = makeSprite(gridFrame(plantsTex, col % 5, row % 6, 5, 6), 0.7, 0.7);
+                  ps.position.set(cx, 0.3, cz);
+                  objectsGroup.add(ps); self.objects.push(ps);
+                  self.plants.push({ sprite: ps, col: col % 5, row: row % 6, timer: Math.random() * 20 });
+                  addProp(cx, cz);
+                }
+              }
+            });
+          }
+
+          // Farm items (baskets, tools) at field edges and by path
+          var itemsTex = self.textures[FARM_TWF + 'objects&items/items free.png'];
           if (itemsTex) {
-            var itemPlacements = [
-              [0, 0, -5.5, 0.3, -1.8],
-              [1, 0, -4.5, 0.3, -1.6],
-              [2, 0, -3.5, 0.3, -1.8],
-              [3, 0,  3.5, 0.3, -1.8],
-              [4, 0,  4.0, 0.3, -1.6],
-              [0, 1, -5.0, 0.3, -4.8],
-              [1, 1,  3.0, 0.3, -4.8],
-              [2, 1, -4.0, 0.3, -4.6],
-              [3, 1,  2.0, 0.3, -1.6],
-              [4, 1, -2.5, 0.3, -1.6],
-              [0, 2, -5.5, 0.3, -3.2],
-              [1, 2,  3.5, 0.3, -3.2],
-              [2, 2,  4.5, 0.3, -3.4],
-              [3, 2, -1.5, 0.3, -4.8],
-              [4, 2,  1.5, 0.3, -4.6]
-            ];
-            itemPlacements.forEach(function(it) {
-              var itt = gridFrame(itemsTex, it[0], it[1], 5, 3);
-              var its = makeSprite(itt, 0.65, 0.65);
-              its.position.set(it[2], it[3], it[4]);
-              scene.add(its); self.objects.push(its);
+            var pathY = -worldD/2 + 4.5, pathY2 = -worldD/2 + 10.5;
+            [[0,0,-5.4,0.3,-1.6],[1,0,-4.2,0.3,-1.5],[2,0,-3,0.3,-1.6],[3,0,3.2,0.3,-1.5],[4,0,4,0.3,-1.6],
+             [0,1,-5,0.3,-4.6],[1,1,2.8,0.3,-4.6],[2,1,-3.8,0.3,-4.4],[3,1,-2,0.3,-1.5],[4,1,-2.4,0.3,-1.6],
+             [0,2,-5.4,0.3,-3],[1,2,3.4,0.3,-3],[2,2,4.4,0.3,-3.2],[3,2,-1.4,0.3,-4.6],[4,2,1.4,0.3,-4.4]].forEach(function(it) {
+              var sp = makeSprite(gridFrame(itemsTex, it[0], it[1], 5, 3), 0.6, 0.6);
+              sp.position.set(it[2], it[3], it[4]);
+              objectsGroup.add(sp); self.objects.push(sp);
               addProp(it[2], it[4]);
             });
           }
 
-          // Sprite fences around farm (continuous: 48px@1.2 = 1.8 units per segment, no gaps)
-          for (var fx = -6; fx <= 3.2; fx += 1.8) {
-            var fTop = self._regionSprite('objects/farm_objects.png', 0, 16, 48, 16, 1.2);
-            self._addObj(fTop, fx, 0.35, -4.8);
-            addProp(fx, -4.8);
-            var fBot = self._regionSprite('objects/farm_objects.png', 0, 16, 48, 16, 1.2);
-            self._addObj(fBot, fx, 0.35, -1.3);
-            addProp(fx, -1.3);
-          }
-          for (var fz = -4.5; fz <= -1.5; fz += 1.0) {
-            var fL = self._regionSprite('objects/farm_objects.png', 0, 0, 16, 48, 1.2);
-            self._addObj(fL, -6.2, 0.6, fz);
-            addProp(-6.2, fz);
-            var fR = self._regionSprite('objects/farm_objects.png', 0, 0, 16, 48, 1.2);
-            self._addObj(fR, 3.8, 0.6, fz);
-            addProp(3.8, fz);
-          }
-
-          // ==== ZONE 3: PATH (z:-1..0.5) ====
-          // SS campfire by the path
-          var fireTex = self._swTex('Elements/VFX/Fire/spr_deco_fire_01_strip4.png');
+          // Campfire by path
+          var fireTex = self._tfTex(FARM_SW + 'Elements/VFX/Fire/spr_deco_fire_01_strip4.png');
           if (fireTex) {
-            var ff = stripFrame(fireTex, 0, 4);
-            var fs = makeSprite(ff, 0.5, 0.5);
+            var fs = makeSprite(stripFrame(fireTex, 0, 4), 0.6, 0.6);
             scaleSpriteFromStrip(fs, fireTex, 4);
-            fs.position.set(3.5, fs.scale.y / 2, -0.3);
-            scene.add(fs); self.objects.push(fs);
+            fs.position.set(3.2, (fs.scale && fs.scale.y) ? fs.scale.y / 2 : 0.3, -0.2);
+            objectsGroup.add(fs); self.objects.push(fs);
             self.fireSprites.push({ sprite: fs, animState: new SpriteAnimState(4, 8) });
           }
 
-          // ==== ZONE 4: INFRASTRUCTURE (x:5..8, z:-7..-5) ====
-          // Windmill base (tower) so blades are not floating
-          var baseTex = self.textures['objects/farm_objects.png'];
-          if (baseTex) {
-            var baseSpr = self._regionSprite('objects/farm_objects.png', 64, 64, 64, 32, 2.2);
-            self._addObj(baseSpr, 7, 0.9, -6);
+          // 25.6 Windmill: base on tile, Y = scale/2 + 0.5
+          var wmTx = 21, wmTz = 2;
+          var wmWx = -worldW/2 + wmTx + 0.5, wmWz = -worldD/2 + wmTz + 0.5;
+          var baseSpr = self._regionSprite(fo, 64, 64, 64, 32, 2);
+          if (baseSpr) {
+            baseSpr.position.set(wmWx, baseSpr.scale.y / 2 + 0.5, wmWz);
+            objectsGroup.add(baseSpr); self.objects.push(baseSpr);
           } else {
-            var baseGeo = new THREE.PlaneGeometry(2.5, 2);
-            var baseMat = new THREE.MeshBasicMaterial({ color: 0x8b4513, side: THREE.DoubleSide });
-            var baseMesh = new THREE.Mesh(baseGeo, baseMat);
-            baseMesh.rotation.x = -Math.PI / 2;
-            baseMesh.position.set(7, 0.5, -6);
-            scene.add(baseMesh); self.objects.push(baseMesh);
+            var baseM = new THREE.Mesh(new THREE.PlaneGeometry(2.2, 1.8), new THREE.MeshBasicMaterial({ color: 0x6d4c2a, side: THREE.DoubleSide }));
+            baseM.rotation.x = -Math.PI / 2; baseM.position.set(wmWx, 0.4, wmWz);
+            objectsGroup.add(baseM); self.objects.push(baseM);
           }
-          // SS windmill (blades on top of base)
-          var wmTex = self._swTex('Elements/Other/spr_deco_windmill_strip9.png');
+          var wmTex = self._tfTex(FARM_SW + 'Elements/Other/spr_deco_windmill_strip9.png');
           if (wmTex) {
-            var wmf = stripFrame(wmTex, 0, 9);
-            self.windmillSprite = makeSprite(wmf, 3.5, 3.5);
+            self.windmillSprite = makeSprite(stripFrame(wmTex, 0, 9), 2.5, 2.5);
             scaleSpriteFromStrip(self.windmillSprite, wmTex, 9);
-            self.windmillSprite.position.set(7, 2.2, -6);
-            scene.add(self.windmillSprite); self.objects.push(self.windmillSprite);
+            self.windmillSprite.position.set(wmWx, 2, wmWz);
+            objectsGroup.add(self.windmillSprite); self.objects.push(self.windmillSprite);
             self.windmillAnimState = new SpriteAnimState(9, 5);
           }
+          addProp(wmWx, wmWz);
 
-          // Neighboring shed (small building)
-          var shed = self._regionSprite('objects/farm_objects.png', 0, 96, 64, 48, 1.0);
-          self._addObj(shed, 10, 0.8, -3);
-          addProp(10, -3);
-
-          // Storage items near windmill
+          // Storage crates by windmill
           if (itemsTex) {
-            [[2, 2, 5.5, 0.3, -5.5], [3, 2, 6.5, 0.3, -5.3], [4, 2, 5.0, 0.3, -5.8]].forEach(function(it) {
-              var itt = gridFrame(itemsTex, it[0], it[1], 5, 3);
-              var its = makeSprite(itt, 0.65, 0.65);
-              its.position.set(it[2], it[3], it[4]);
-              scene.add(its); self.objects.push(its);
+            [[2,2,wmWx-1.2,0.3,wmWz+0.6],[3,2,wmWx-0.2,0.3,wmWz+0.8],[4,2,wmWx-0.8,0.3,wmWz+0.4]].forEach(function(it) {
+              var sp = makeSprite(gridFrame(itemsTex, it[0], it[1], 5, 3), 0.6, 0.6);
+              sp.position.set(it[2], it[3], it[4]);
+              objectsGroup.add(sp); self.objects.push(sp);
               addProp(it[2], it[4]);
             });
           }
-          addProp(7, -6);
 
-          // ==== ZONE 5: WATER (x:-12..-8, z:3..6) ====
-          var bridgeTex = self.textures['tilemaps/bridges.png'];
-          if (bridgeTex) {
-            // Main bridge (48x48 piece)
+          // Water feature: pond for ducks (worldData pond at tx 15-18, tz 2-4 → center 16.5, 3)
+          var pondWx = -worldW/2 + 16.5, pondWz = -worldD/2 + 3;
+          var pondPlane = new THREE.Mesh(new THREE.PlaneGeometry(4, 3), new THREE.MeshBasicMaterial({ color: 0x4488cc, transparent: true, opacity: 0.9, side: THREE.DoubleSide }));
+          pondPlane.rotation.x = -Math.PI / 2;
+          pondPlane.position.set(pondWx, 0.02, pondWz);
+          objectsGroup.add(pondPlane); self.objects.push(pondPlane);
+
+          // Bridge over pond
+          var bridgeTex = self.textures[bridgesKey];
+          if (bridgeTex && bridgeTex.image) {
+            var bw = bridgeTex.image.width, bh = bridgeTex.image.height;
             var bt = bridgeTex.clone();
-            bt.repeat.set(48/192, 48/176);
-            bt.offset.set(0/192, 1 - (16+48)/176);
-            bt.magFilter = THREE.NearestFilter; bt.minFilter = THREE.NearestFilter;
+            bt.repeat.set(80/bw, 48/bh);
+            bt.offset.set(0, 1 - (16+48)/bh);
+            bt.magFilter = bt.minFilter = THREE.NearestFilter;
             bt.needsUpdate = true;
-            var bs = makeSprite(bt, 1.8, 1.8);
-            bs.position.set(-9.5, 0.15, 4.0);
-            scene.add(bs); self.objects.push(bs);
-
-            // Larger bridge variant (64x48 piece from middle of sheet)
-            var bt2 = bridgeTex.clone();
-            bt2.repeat.set(64/192, 48/176);
-            bt2.offset.set(80/192, 1 - (16+48)/176);
-            bt2.magFilter = THREE.NearestFilter; bt2.minFilter = THREE.NearestFilter;
-            bt2.needsUpdate = true;
-            var bs2 = makeSprite(bt2, 2.0, 1.5);
-            bs2.position.set(-10.5, 0.12, 5.0);
-            scene.add(bs2); self.objects.push(bs2);
+            var bs = makeSprite(bt, 2, 1.2);
+            bs.position.set(pondWx, 0.05, pondWz);
+            objectsGroup.add(bs); self.objects.push(bs);
           }
 
-          // ==== ZONE 6: PASTURE (x:-8..4, z:1..5) ====
-          // SS animals -- spawn into their zones
+          // Animals (ducks near pond at pondWx, pondWz)
           self._spawnAnimals();
 
-          // Bushes from spring_farm.png along pasture edges
-          var sfTex = self.textures['tilemaps/spring_farm.png'];
-          if (sfTex) {
-            // Large bush: ~px(0,48,48,32) from spring_farm
-            var bushPositions = [[-7, 0.5, 1.5], [4, 0.5, 2], [-6, 0.5, 5], [5, 0.5, 4], [-3, 0.5, 5.5], [7, 0.5, 3]];
-            bushPositions.forEach(function(bp) {
-              var bush = self._regionSprite('tilemaps/spring_farm.png', 0, 48, 48, 32, 1.5);
-              self._addObj(bush, bp[0], bp[1], bp[2]);
-            });
-
-            // Grass tufts: ~px(0,96,16,16) scattered on open grass
-            var grassPositions = [[-5, 1], [-2, 3], [1, 2], [3, 4], [-4, 4.5], [2, 1.5], [-7, 3.5], [6, 2.5]];
-            grassPositions.forEach(function(gp) {
-              var grass = self._regionSprite('tilemaps/spring_farm.png', 0, 96, 16, 16, 1.5);
-              self._addObj(grass, gp[0], 0.2, gp[1]);
-            });
-
-            // Stumps: ~px(80,112,16,16) near trees
-            var stumpPositions = [[-9, -4], [10, -2.5], [-10, 3]];
-            stumpPositions.forEach(function(sp) {
-              var stump = self._regionSprite('tilemaps/spring_farm.png', 80, 112, 16, 16, 1.5);
-              self._addObj(stump, sp[0], 0.3, sp[1]);
-            });
-          }
-
-          // ==== ZONE 7: FOREST EDGES (perimeter) ====
-          // TF trees (green + autumn) around edges
-          var edgeTrees = [
-            [-11, -6], [-9, -7], [-12, -3], [-11, 1], [-12, 5], [-10, 7],
-            [9, -7], [11, -5], [12, -2], [11, 1], [12, 4], [10, 7],
-            [-7, -7.5], [-4, -7.5], [3, -7.5], [6, -7.5],
-            [-6, 7], [-2, 7], [3, 7], [7, 7]
-          ];
+          // 25.8 Trees & decor from farm objects free.png
+          var edgeTrees = [[-11,-6],[-9,-7],[-12,-2],[-11,2],[-12,6],[-10,7],[9,-7],[11,-5],[12,-1],[11,2],[12,5],[10,7],[-7,-7.5],[-4,-7.5],[3,-7.5],[6,-7.5],[-6,7],[-2,7],[3,7],[7,7]];
           edgeTrees.forEach(function(p, i) {
             var srcX = (i % 3 === 2) ? 96 : 48;
-            var tree = self._regionSprite('objects/farm_objects.png', srcX, 0, 48, 64);
-            self._addObj(tree, p[0], 1.0, p[1]);
-            addProp(p[0], p[1]);
+            var tree = self._regionSprite(fo, srcX, 0, 48, 64);
+            if (tree) {
+              tree.position.set(p[0], 1, p[1]);
+              objectsGroup.add(tree); self.objects.push(tree);
+              addProp(p[0], p[1]);
+            }
           });
 
-          // SS animated trees mixed in
-          var ssTree1 = self._swTex('Elements/Plants/spr_deco_tree_01_strip4.png');
-          var ssTree2 = self._swTex('Elements/Plants/spr_deco_tree_02_strip4.png');
-          if (ssTree1) {
-            [[-8, -6.5], [8, -6], [-9, 4], [9, 5.5]].forEach(function(p) {
-              var tf = stripFrame(ssTree1, 0, 4);
-              var ts = makeSprite(tf, 1.0, 1.06);
-              scaleSpriteFromStrip(ts, ssTree1, 4);
-              ts.position.set(p[0], 0.53, p[1]);
-              scene.add(ts); self.objects.push(ts);
+          var tree1 = self._tfTex(FARM_SW + 'Elements/Plants/spr_deco_tree_01_strip4.png');
+          var tree2 = self._tfTex(FARM_SW + 'Elements/Plants/spr_deco_tree_02_strip4.png');
+          if (tree1) {
+            [[-8,-6],[8,-6],[-9,4],[9,5]].forEach(function(p) {
+              var s = makeSprite(stripFrame(tree1, 0, 4), 1, 1);
+              scaleSpriteFromStrip(s, tree1, 4);
+              s.position.set(p[0], 0.5, p[1]);
+              objectsGroup.add(s); self.objects.push(s);
             });
           }
-          if (ssTree2) {
-            [[-6, -7], [7, -7], [8, 6]].forEach(function(p) {
-              var tf = stripFrame(ssTree2, 0, 4);
-              var ts = makeSprite(tf, 1.0, 1.06);
-              scaleSpriteFromStrip(ts, ssTree2, 4);
-              ts.position.set(p[0], 0.53, p[1]);
-              scene.add(ts); self.objects.push(ts);
+          if (tree2) {
+            [[-6,-7],[7,-7],[8,6]].forEach(function(p) {
+              var s = makeSprite(stripFrame(tree2, 0, 4), 1, 1);
+              scaleSpriteFromStrip(s, tree2, 4);
+              s.position.set(p[0], 0.5, p[1]);
+              objectsGroup.add(s); self.objects.push(s);
             });
           }
 
-          // SS mushrooms near tree bases
-          var mushRed = self._swTex('Elements/Plants/spr_deco_mushroom_red_01_strip4.png');
-          var mushBlue = self._swTex('Elements/Plants/spr_deco_mushroom_blue_01_strip4.png');
-          if (mushRed) {
-            [[-10, -5], [11, -4], [-11, 2], [9, 3]].forEach(function(p) {
-              var mf = stripFrame(mushRed, 0, 4);
-              var ms = makeSprite(mf, 0.5, 0.5);
-              scaleSpriteFromStrip(ms, mushRed, 4);
-              ms.position.set(p[0], ms.scale.y / 2, p[1]);
-              scene.add(ms); self.objects.push(ms);
+          var mushR = self._tfTex(FARM_SW + 'Elements/Plants/spr_deco_mushroom_red_01_strip4.png');
+          var mushB = self._tfTex(FARM_SW + 'Elements/Plants/spr_deco_mushroom_blue_01_strip4.png');
+          if (mushR) {
+            [[-10,-5],[11,-4],[-11,2],[9,3]].forEach(function(p) {
+              var s = makeSprite(stripFrame(mushR, 0, 4), 0.5, 0.5);
+              scaleSpriteFromStrip(s, mushR, 4);
+              s.position.set(p[0], (s.scale && s.scale.y) ? s.scale.y/2 : 0.25, p[1]);
+              objectsGroup.add(s); self.objects.push(s);
             });
           }
-          if (mushBlue) {
-            [[10, -6], [-12, 4], [12, 5], [-8, -4]].forEach(function(p) {
-              var mf = stripFrame(mushBlue, 0, 4);
-              var ms = makeSprite(mf, 0.5, 0.5);
-              scaleSpriteFromStrip(ms, mushBlue, 4);
-              ms.position.set(p[0], ms.scale.y / 2, p[1]);
-              scene.add(ms); self.objects.push(ms);
+          if (mushB) {
+            [[10,-6],[-12,4],[12,5],[-8,-4]].forEach(function(p) {
+              var s = makeSprite(stripFrame(mushB, 0, 4), 0.5, 0.5);
+              scaleSpriteFromStrip(s, mushB, 4);
+              s.position.set(p[0], (s.scale && s.scale.y) ? s.scale.y/2 : 0.25, p[1]);
+              objectsGroup.add(s); self.objects.push(s);
             });
           }
 
-          // SS glint sparkle near windmill and campfire
-          var glintTex = self._swTex('Elements/VFX/Glint/spr_deco_glint_01_strip6.png');
+          var glintTex = self._tfTex(FARM_SW + 'Elements/VFX/Glint/spr_deco_glint_01_strip6.png');
           if (glintTex) {
-            [[7.5, 1.2, -5.5], [3.8, 0.6, -0.1]].forEach(function(gp) {
-              var gf = stripFrame(glintTex, 0, 6);
-              var gs = makeSprite(gf, 0.4, 0.4);
+            [[6.8,1,-5.4],[3.5,0.5,-0.1]].forEach(function(gp) {
+              var gs = makeSprite(stripFrame(glintTex, 0, 6), 0.4, 0.4);
               scaleSpriteFromStrip(gs, glintTex, 6);
               gs.position.set(gp[0], gp[1], gp[2]);
-              scene.add(gs); self.objects.push(gs);
+              objectsGroup.add(gs); self.objects.push(gs);
               self.fireSprites.push({ sprite: gs, animState: new SpriteAnimState(6, 4), tex: glintTex, isGlint: true });
             });
           }
 
-          console.log('[CEO:TinyFarm] Merged scene built');
+          console.log('[CEO:TinyFarm] Scene built (Section 25: WorldData, 4 plots, paths, pond, fences)');
         },
 
         _spawnAnimals: function() {
           var self = this;
           var animalDefs = [
-            { key: 'Elements/Animals/spr_deco_chicken_01_strip4.png', type: 'chicken', count: 3, xBase: -4, zBase: 1.5, xRange: 3, zRange: 1.5 },
-            { key: 'Elements/Animals/spr_deco_pig_01_strip4.png', type: 'pig', count: 2, xBase: -6, zBase: 2, xRange: 2, zRange: 1.5 },
-            { key: 'Elements/Animals/spr_deco_cow_strip4.png', type: 'cow', count: 2, xBase: -1, zBase: 3.5, xRange: 4, zRange: 1.5 },
-            { key: 'Elements/Animals/spr_deco_sheep_01_strip4.png', type: 'sheep', count: 2, xBase: 1, zBase: 3.5, xRange: 3, zRange: 1.5 },
-            { key: 'Elements/Animals/spr_deco_duck_01_strip4.png', type: 'duck', count: 2, xBase: -10.5, zBase: 4, xRange: 2, zRange: 1.5 },
-            { key: 'Elements/Animals/spr_deco_bird_01_strip4.png', type: 'bird', count: 2, xBase: -8, zBase: -2, xRange: 16, zRange: 1 }
+            { key: self.farmSwBase + 'Elements/Animals/spr_deco_chicken_01_strip4.png', type: 'chicken', count: 3, xBase: -4, zBase: 1.5, xRange: 3, zRange: 1.5 },
+            { key: self.farmSwBase + 'Elements/Animals/spr_deco_pig_01_strip4.png', type: 'pig', count: 2, xBase: -6, zBase: 2, xRange: 2, zRange: 1.5 },
+            { key: self.farmSwBase + 'Elements/Animals/spr_deco_cow_strip4.png', type: 'cow', count: 2, xBase: -1, zBase: 3.5, xRange: 4, zRange: 1.5 },
+            { key: self.farmSwBase + 'Elements/Animals/spr_deco_sheep_01_strip4.png', type: 'sheep', count: 2, xBase: 1, zBase: 3.5, xRange: 3, zRange: 1.5 },
+            { key: self.farmSwBase + 'Elements/Animals/spr_deco_duck_01_strip4.png', type: 'duck', count: 3, xBase: 1.5, zBase: -5, xRange: 2.5, zRange: 2 },
+            { key: self.farmSwBase + 'Elements/Animals/spr_deco_bird_01_strip4.png', type: 'bird', count: 2, xBase: -8, zBase: -2, xRange: 16, zRange: 1 }
           ];
           animalDefs.forEach(function(ad) {
-            var tex = self._swTex(ad.key);
+            var tex = self._tfTex(ad.key);
             if (!tex) return;
             for (var i = 0; i < ad.count; i++) {
               var af = stripFrame(tex, 0, 4);
@@ -5961,163 +5919,88 @@ INDEX_HTML = """<!DOCTYPE html>
           });
         },
 
-        _spawnEnemy: function(type) {
-          var self = this;
-          var defs = {
-            goblin: { idle: 'Characters/Goblin/PNG/spr_idle_strip9.png', walk: 'Characters/Goblin/PNG/spr_walk_strip8.png', atk: 'Characters/Goblin/PNG/spr_attack_strip10.png', death: 'Characters/Goblin/PNG/spr_death_strip13.png', wf: 8, af: 10, df: 13, if_: 9 },
-            skeleton: { idle: 'Characters/Skeleton/PNG/skeleton_idle_strip6.png', walk: 'Characters/Skeleton/PNG/skeleton_walk_strip8.png', atk: 'Characters/Skeleton/PNG/skeleton_attack_strip7.png', death: 'Characters/Skeleton/PNG/skeleton_death_strip10.png', wf: 8, af: 7, df: 10, if_: 6 }
-          };
-          var d = defs[type]; if (!d) return;
-          var walkTex = self._swTex(d.walk); if (!walkTex) return;
-          var ef = stripFrame(walkTex, 0, d.wf);
-          var es = makeSprite(ef, 3.0, 2.0);
-          scaleSpriteFromStrip(es, walkTex, d.wf);
-          var startX = Math.random() > 0.5 ? 14 : -14;
-          var startZ = -1 + Math.random() * 2;
-          var targetX = (Math.random() - 0.5) * 6;
-          es.position.set(startX, 1.0, startZ);
-          scene.add(es); self.objects.push(es);
-          self.enemies.push({
-            sprite: es, type: type, x: startX, z: startZ, targetX: targetX,
-            vx: startX > 0 ? -0.6 : 0.6, state: 'walk', hp: 2, deathTimer: 0,
-            walkTex: walkTex, walkFrames: d.wf, walkAnim: new SpriteAnimState(d.wf, 7),
-            atkTex: self._swTex(d.atk), atkFrames: d.af, atkAnim: new SpriteAnimState(d.af, 7),
-            deathTex: self._swTex(d.death), deathFrames: d.df, deathAnim: new SpriteAnimState(d.df, 8),
-            idleTex: self._swTex(d.idle), idleFrames: d.if_
-          });
-        },
-
         updateAgents: function(agents, posMap, delta) {
           var self = this;
-          var combat = self.combatPhase;
+          var hairTypes = ['base', 'bowlhair', 'curlyhair', 'longhair', 'mophair', 'shorthair', 'spikeyhair'];
+          var charDefs = hairTypes.map(function(h) {
+            return {
+              idle: self.farmSwBase + 'Characters/Human/IDLE/' + h + '_idle_strip9.png',
+              walk: self.farmSwBase + 'Characters/Human/WALKING/' + h + '_walk_strip8.png',
+              idleFrames: 9,
+              walkFrames: 8
+            };
+          });
+          var d = delta || 0.016;
+          var BASE_SCALE = 1.2;
           for (var i = 0; i < agents.length && i < CAP_AGENTS; i++) {
             var a = agents[i];
             var pos = posMap[a.name];
             if (!pos) continue;
-            var role = getAgentRole(a);
-            var hair = self._hairForRole(role);
-            var act = self._actionForRole(role, combat);
-            var texKey = 'sw:Characters/Human/' + act.folder + '/' + hair + '_' + act.suf + '_strip' + act.frames + '.png';
-            var tex = self.textures[texKey];
-            if (!tex) {
-              texKey = 'sw:Characters/Human/' + act.folder + '/base_' + act.suf + '_strip' + act.frames + '.png';
-              tex = self.textures[texKey];
-            }
-            if (!tex || !tex.image || !tex.image.width) {
-              var fallback = self.textures['characters/walk_idle.png'];
-              if (!fallback) continue;
-              if (!agentAnimStates[a.name]) {
-                agentAnimStates[a.name] = { animState: new SpriteAnimState(4, 6), currentRow: i % 3, tex: fallback, useFallback: true };
-              }
-              var stf = agentAnimStates[a.name];
-              if (!agentSprites[a.name]) {
-                var ftf = gridFrame(fallback, 0, stf.currentRow, 8, 3);
-                var sf = makeSprite(ftf, 1.5, 1.5);
-                sf._baseScaleX = sf.scale.x; sf._baseScaleY = sf.scale.y;
-                sf.position.set(pos.x, pos.y + 0.8, pos.z);
-                scene.add(sf); agentSprites[a.name] = sf;
-              } else {
-                stf.animState.timer += delta || 0.016;
-                if (stf.animState.timer >= 1 / stf.animState.fps) {
-                  stf.animState.timer = 0;
-                  stf.animState.frame = (stf.animState.frame + 1) % 4;
-                  agentSprites[a.name].material.map = gridFrame(fallback, 4 + stf.animState.frame, stf.currentRow, 8, 3);
-                  agentSprites[a.name].material.map.needsUpdate = true;
-                }
-                agentSprites[a.name].position.x += (pos.x - agentSprites[a.name].position.x) * 0.05;
-                agentSprites[a.name].position.y = pos.y + 0.8;
-                agentSprites[a.name].position.z = pos.z;
-              }
-              continue;
-            }
-
+            var charIdx = i % charDefs.length;
+            var def = charDefs[charIdx];
+            var idleTex = self.textures[def.idle];
+            var walkTex = self.textures[def.walk];
+            if (!idleTex && !walkTex) continue;
+            var tex = walkTex || idleTex;
+            var frames = def.walkFrames;
             if (!agentAnimStates[a.name]) {
-              agentAnimStates[a.name] = { animState: new SpriteAnimState(act.frames, 7), currentTex: tex, currentFrames: act.frames };
+              agentAnimStates[a.name] = {
+                face: 1,
+                charIdx: charIdx,
+                idleAnim: new SpriteAnimState(def.idleFrames, 6),
+                walkAnim: new SpriteAnimState(def.walkFrames, 10)
+              };
             }
             var st = agentAnimStates[a.name];
-            if (st.currentTex !== tex) { st.currentTex = tex; st.currentFrames = act.frames; st.animState = new SpriteAnimState(act.frames, 7); }
-
+            st.charIdx = charIdx;
+            var curX = agentSprites[a.name] ? agentSprites[a.name].position.x : pos.x;
+            var targetX = pos.x;
+            var dx = targetX - curX;
+            var moving = Math.abs(dx) > 0.02;
+            var facingRight = (dx > 0) ? true : (dx < 0) ? false : (st.face === 1);
+            if (dx > 0) st.face = 1; else if (dx < 0) st.face = 2;
+            var animTex = moving ? (walkTex || idleTex) : (idleTex || walkTex);
+            var animState = moving ? st.walkAnim : st.idleAnim;
+            var animFrames = moving ? def.walkFrames : def.idleFrames;
+            if (!animTex) animTex = tex;
             if (!agentSprites[a.name]) {
-              var ft = stripFrame(tex, 0, act.frames);
-              var s = makeSprite(ft, 3.0, 2.0);
-              scaleSpriteFromStrip(s, tex, act.frames);
-              s._baseScaleX = s.scale.x; s._baseScaleY = s.scale.y;
-              s.position.set(pos.x, pos.y + 1.0, pos.z);
+              var frameTex = stripFrame(animTex, 0, animFrames);
+              var s = makeSprite(frameTex, BASE_SCALE, BASE_SCALE);
+              scaleSpriteFromStrip(s, animTex, animFrames);
+              s.position.set(pos.x, pos.y + 0.6, pos.z);
               scene.add(s); agentSprites[a.name] = s;
             } else {
-              animateStrip(agentSprites[a.name], tex, st.animState, delta || 0.016);
-              var targetX = combat ? pos.x + 3 : pos.x;
-              var curX = agentSprites[a.name].position.x;
-              agentSprites[a.name].position.x += (targetX - curX) * 0.05;
-              agentSprites[a.name].position.y = pos.y + 1.0;
+              animateStrip(agentSprites[a.name], animTex, animState, d);
+              agentSprites[a.name].position.x += dx * 0.08;
+              agentSprites[a.name].position.y = pos.y + 0.6;
               agentSprites[a.name].position.z = pos.z;
-              if (targetX > curX) agentSprites[a.name].scale.x = Math.abs(agentSprites[a.name].scale.x);
-              else if (targetX < curX) agentSprites[a.name].scale.x = -Math.abs(agentSprites[a.name].scale.x);
+              var scy = agentSprites[a.name].scale.y;
+              agentSprites[a.name].scale.x = facingRight ? Math.abs(agentSprites[a.name].scale.x) : -Math.abs(agentSprites[a.name].scale.x);
+              agentSprites[a.name].scale.y = scy;
             }
 
-            // Portrait badge above agent
-            var portraitKey = (i % 4 === 0) ? 'characters/portrait_male.png' :
-                             (i % 4 === 1) ? 'characters/portrait_female.png' :
-                             (i % 4 === 2) ? 'characters/portrait_male_old.png' :
-                             'characters/portrait_female_old.png';
+            var portraitKeys = [self.farmTwfBase + 'characters/main character/portrait male.png', self.farmTwfBase + 'characters/main character/portrait female.png', self.farmTwfBase + 'characters/main character old/portrait male.png', self.farmTwfBase + 'characters/main character old/portrait female.png'];
+            var portraitKey = portraitKeys[i % 4];
             if (!agentSprites[a.name + '_portrait']) {
               var pTex = self.textures[portraitKey];
               if (pTex) {
-                var ps = makeSprite(pTex, 0.6, 0.6);
+                var ps = makeSprite(pTex, 0.5, 0.5);
                 scene.add(ps); agentSprites[a.name + '_portrait'] = ps;
               }
             }
             if (agentSprites[a.name + '_portrait'] && agentSprites[a.name]) {
-              agentSprites[a.name + '_portrait'].position.set(
-                agentSprites[a.name].position.x,
-                agentSprites[a.name].position.y + agentSprites[a.name].scale.y * 0.6,
-                agentSprites[a.name].position.z
-              );
+              agentSprites[a.name + '_portrait'].position.set(agentSprites[a.name].position.x, agentSprites[a.name].position.y + 0.7, agentSprites[a.name].position.z);
             }
-
-            if (combat && self.enemies.length && agentSprites[a.name]) {
-              var closest = null, closeDist = 999;
-              self.enemies.forEach(function(e) {
-                if (e.state === 'dead') return;
-                var dx = e.x - agentSprites[a.name].position.x;
-                if (Math.abs(dx) < closeDist) { closeDist = Math.abs(dx); closest = e; }
-              });
-              if (closest && closeDist < 3) {
-                agentSprites[a.name].position.x += (closest.x - agentSprites[a.name].position.x) * 0.02;
-              }
-            }
-          }
-
-          // Scale animals with agent count
-          var tgtChickens = Math.min(5, 3 + Math.floor(agents.length / 3));
-          var curC = self.animals.filter(function(a) { return a.type === 'chicken'; }).length;
-          if (curC < tgtChickens && self._swTex('Elements/Animals/spr_deco_chicken_01_strip4.png')) {
-            var tex = self._swTex('Elements/Animals/spr_deco_chicken_01_strip4.png');
-            var af = stripFrame(tex, 0, 4);
-            var as = makeSprite(af, 1.0, 1.0);
-            scaleSpriteFromStrip(as, tex, 4);
-            var ax = -4 + Math.random() * 3;
-            var az = 1.5 + Math.random() * 1.5;
-            as.position.set(ax, as.scale.y / 2, az);
-            scene.add(as); self.objects.push(as);
-            self.animals.push({ sprite: as, type: 'chicken', x: ax, z: az, vx: (Math.random()-0.5)*0.3, tex: tex, animState: new SpriteAnimState(4, 5), xMin: -4, xMax: -1, zMin: 1.5, zMax: 3 });
           }
         },
 
         tickAmbient: function(delta) {
           var self = this;
-
-          // Phase cycling: 20s farm, 12s combat
-          self.phaseTimer += delta;
-          if (!self.combatPhase && self.phaseTimer > 20) { self.combatPhase = true; self.phaseTimer = 0; }
-          else if (self.combatPhase && self.phaseTimer > 12) { self.combatPhase = false; self.phaseTimer = 0; }
-
-          // TF crop growth animation
-          var plantsTex = self.textures['objects/plants.png'];
+          var plantsTex = self.textures[self.farmTwfBase + 'objects&items/plants free.png'];
           if (plantsTex) {
             self.plants.forEach(function(pl) {
               pl.timer += delta;
-              if (pl.timer > 20) {
+              if (pl.timer > 18) {
                 pl.timer = 0;
                 pl.row = (pl.row + 1) % 6;
                 pl.sprite.material.map = gridFrame(plantsTex, pl.col, pl.row, 5, 6);
@@ -6125,20 +6008,6 @@ INDEX_HTML = """<!DOCTYPE html>
               }
             });
           }
-
-          // SS crop growth animation
-          self.crops.forEach(function(cr) {
-            cr.timer += delta;
-            if (cr.timer > 25) {
-              cr.timer = 0;
-              cr.stage = (cr.stage + 1) % 6;
-              var key = 'sw:Elements/Crops/' + cr.type + '_0' + cr.stage + '.png';
-              var t = self.textures[key];
-              if (t) { cr.sprite.material.map = t; cr.sprite.material.map.needsUpdate = true; }
-            }
-          });
-
-          // Animal wandering within zones
           self.animals.forEach(function(an) {
             an.x += an.vx * delta;
             if (an.x < an.xMin || an.x > an.xMax) an.vx = -an.vx;
@@ -6147,102 +6016,35 @@ INDEX_HTML = """<!DOCTYPE html>
             else an.sprite.scale.x = Math.abs(an.sprite.scale.x);
             animateStrip(an.sprite, an.tex, an.animState, delta);
           });
-
-          // Windmill spin
           if (self.windmillSprite && self.windmillAnimState) {
-            var wmTex = self._swTex('Elements/Other/spr_deco_windmill_strip9.png');
+            var wmTex = self._tfTex(self.farmSwBase + 'Elements/Other/spr_deco_windmill_strip9.png');
             if (wmTex) animateStrip(self.windmillSprite, wmTex, self.windmillAnimState, delta);
           }
-
-          // Fire + glint animation
           self.fireSprites.forEach(function(f) {
             if (f.isGlint) {
-              var gt = f.tex || self._swTex('Elements/VFX/Glint/spr_deco_glint_01_strip6.png');
-              if (gt) animateStrip(f.sprite, gt, f.animState, delta);
+              if (f.tex) animateStrip(f.sprite, f.tex, f.animState, delta);
             } else {
-              var ft = self._swTex('Elements/VFX/Fire/spr_deco_fire_01_strip4.png');
+              var ft = self._tfTex(self.farmSwBase + 'Elements/VFX/Fire/spr_deco_fire_01_strip4.png');
               if (ft) animateStrip(f.sprite, ft, f.animState, delta);
             }
           });
-
-          // Combat: spawn enemies
-          if (self.combatPhase) {
-            self.enemySpawnTimer += delta;
-            if (self.enemySpawnTimer > 4 && self.enemies.length < 3) {
-              self.enemySpawnTimer = 0;
-              self._spawnEnemy(Math.random() > 0.5 ? 'goblin' : 'skeleton');
-            }
-          }
-
-          // Enemy AI: respect prop collision, only attack when near an agent
-          var agentXList = [];
-          for (var ak in agentSprites) {
-            if (agentSprites[ak] && agentSprites[ak].position && ak.indexOf('_portrait') === -1)
-              agentXList.push(agentSprites[ak].position.x);
-          }
-          function hitProp(x, z) {
-            var list = self.propPositions || [];
-            for (var pi = 0; pi < list.length; pi++) {
-              var p = list[pi];
-              if (Math.abs(p.x - x) < 0.8 && Math.abs(p.z - z) < 0.8) return true;
-            }
-            return false;
-          }
-          for (var ei = self.enemies.length - 1; ei >= 0; ei--) {
-            var e = self.enemies[ei];
-            if (e.state === 'walk') {
-              var nextX = e.x + e.vx * delta;
-              if (!hitProp(nextX, e.z)) e.x = nextX;
-              else e.vx = -e.vx;
-              e.sprite.position.x = e.x;
-              if (e.vx < 0) e.sprite.scale.x = -Math.abs(e.sprite.scale.x);
-              else e.sprite.scale.x = Math.abs(e.sprite.scale.x);
-              animateStrip(e.sprite, e.walkTex, e.walkAnim, delta);
-              var nearestAgentX = null, nearestDist = 3;
-              for (var ai = 0; ai < agentXList.length; ai++) {
-                var d = Math.abs(agentXList[ai] - e.x);
-                if (d < nearestDist) { nearestDist = d; nearestAgentX = agentXList[ai]; }
-              }
-              if (nearestAgentX !== null && nearestDist < 1.2) e.state = 'attack';
-              else if (Math.abs(e.x - e.targetX) < 0.5) e.targetX = (agentXList.length ? agentXList[0] : e.x + (Math.random() - 0.5) * 4);
-            } else if (e.state === 'attack') {
-              var nearAgent = false;
-              for (var ai = 0; ai < agentXList.length; ai++) {
-                if (Math.abs(agentXList[ai] - e.x) < 1.5) { nearAgent = true; break; }
-              }
-              if (!nearAgent) { e.state = 'walk'; e.targetX = (agentXList.length ? agentXList[0] : e.x); e.vx = (e.targetX > e.x) ? 0.8 : -0.8; }
-              else if (e.atkTex) {
-                var prevFrame = e.atkAnim.frame;
-                animateStrip(e.sprite, e.atkTex, e.atkAnim, delta);
-                if (e.atkAnim.frame < prevFrame) {
-                  e.hp -= 1;
-                  if (e.hp <= 0) { e.state = 'dying'; e.deathAnim.frame = 0; e.deathAnim.timer = 0; }
-                }
-              }
-            } else if (e.state === 'dying') {
-              if (e.deathTex) {
-                var prevDf = e.deathAnim.frame;
-                animateStrip(e.sprite, e.deathTex, e.deathAnim, delta);
-                if (e.deathAnim.frame < prevDf || e.deathAnim.frame >= e.deathFrames - 1) { e.state = 'dead'; e.deathTimer = 0; }
-              } else { e.state = 'dead'; e.deathTimer = 0; }
-            } else if (e.state === 'dead') {
-              e.deathTimer += delta;
-              e.sprite.material.opacity = Math.max(0, 1 - e.deathTimer);
-              if (e.deathTimer > 1.5) {
-                disposeObject(e.sprite);
-                self.enemies.splice(ei, 1);
-              }
-            }
+          // 25.9 Depth sort every frame (painter's algorithm)
+          if (self.objectsGroup && self.objectsGroup.children.length) {
+            self.objectsGroup.children.sort(function(a, b) {
+              var ay = a.position ? (a.position.y + (a.position.z || 0) * 0.01) : 0;
+              var by = b.position ? (b.position.y + (b.position.z || 0) * 0.01) : 0;
+              return by - ay;
+            });
           }
         },
 
         dispose: function() {
           var self = this;
           self.objects.forEach(function(o) { disposeObject(o); });
-          self.enemies.forEach(function(e) { disposeObject(e.sprite); });
           self.objects = []; self.plants = []; self.animals = []; self.crops = []; self.enemies = [];
           self.propPositions = []; self.windmillSprite = null; self.fireSprites = []; self.windmillAnimState = null;
-          self.combatPhase = false; self.phaseTimer = 0; self.enemySpawnTimer = 0;
+          if (self.objectsGroup && self.objectsGroup.parent) self.objectsGroup.parent.remove(self.objectsGroup);
+          self.objectsGroup = null; self.worldData = null;
         }
       };
 

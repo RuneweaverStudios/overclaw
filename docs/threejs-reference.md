@@ -1248,3 +1248,130 @@ When enemies share the scene with fences, plants, and buildings:
 - **Face movement:** When lerping agent position toward `targetX`, set `sprite.scale.x = (targetX > curX) ? Math.abs(sprite.scale.x) : -Math.abs(sprite.scale.x)` so the sprite faces the direction of movement.
 - **Defensive strip scaling:** In `scaleSpriteFromStrip(sprite, texture, frameCount)`, guard against unloaded textures: if `!texture || !texture.image || !texture.image.width`, set `sprite.scale.set(1, 1, 1)` and return. Otherwise you get 0 or NaN scale and invisible/broken sprites.
 - **Fallback character:** If the primary character texture (e.g. from a merged pack) is missing or not yet loaded (`!tex.image || !tex.image.width`), fall back to a grid sprite (e.g. `walk_idle.png` with `gridFrame`) so characters always render.
+
+---
+
+## 25. Stardew-Style Farming Sim – Strict Generation Rules (Tiny Wonder Farm / Butter Milk Pack)
+
+**When the user asks to generate, rebuild, or fix the farm world, you MUST follow these steps in order. Do not freestyle placement.**
+
+### 25.1 World Data Grid – Single Source of Truth
+- Create a `WorldData` class or object with a `Map<string, TileData>` (key = `"x,z"`).
+- `TileData = { type: 'grass' | 'dirt' | 'tilled' | 'water' | 'path', object?: 'fence' | 'crop' | 'building' | null, variant?: number }`
+- All placement, fences, crops, paths update this grid first, then regenerate visuals.
+
+### 25.2 Ground Tiles – Atlas + InstancedMesh (1 draw call per chunk)
+- Use the **spring farm tilemap.png** as atlas (NearestFilter, no mipmaps).
+- Define `manifest.tiles` with exact col/row for each type (grass=0,0, dirt=1,0, tilled=2,0, path=3,0 etc.).
+- In `loadChunk`:
+  - Loop through tiles.
+  - Set `uvOffsetAttribute.setXY(idx, col/cols, 1 - (row+1)/rows)`
+  - Use custom shader or `onBeforeCompile` to apply per-instance `uvOffset`.
+
+### 25.3 Farm Plots – Organized Rectangular Areas
+- Always create plots as 5×5 or 6×4 rectangles of tilled soil.
+- Minimum 3–4 plots visible on screen.
+- Separate plots with **1-tile-wide dirt/path** (never butt plots directly together).
+- Place plots in the lower-center area of the screen (player starting zone).
+
+### 25.4 Paths – Mandatory Dirt/Gravel Network
+- After placing plots, automatically create connecting paths:
+  - Horizontal path along the bottom of all plots.
+  - Vertical paths between every two plots.
+  - One main path from player spawn to the house entrance.
+- Use the path tile from the atlas (brown/beige tiles in the sheet).
+
+### 25.5 Fences – Neighbor-Aware Auto-Variants (NO BROKEN FENCES)
+- When placing a fence at (tx, tz):
+  1. Check 4 neighbors (N, S, E, W).
+  2. Choose correct frame from the fence atlas:
+     - Both N+S → vertical straight
+     - Both E+W → horizontal straight
+     - N+E → NE corner
+     - N+W → NW corner
+     - S+E → SE corner
+     - S+W → SW corner
+     - T-junctions and gate use remaining frames.
+  3. Store `variant` in `worldData`.
+  4. Use `regionSprite` or `gridFrame` from section 19 to extract the exact frame.
+- Regenerate only the 8 surrounding fence sprites when one changes.
+
+### 25.6 Buildings – Correct Alignment
+- House, windmill, barn: use large sprites from **farm objects free.png**.
+- Use `regionSprite(texture, px, py, pw, ph, PIXELS_PER_UNIT)` (exact pixel coords from the sheet).
+- Position so the **base of the building** sits exactly on a tile center.
+- Offset Y by +0.5 so the building sits on the ground, not floating.
+- Add `renderOrder = 100` or sort in the objects group.
+
+### 25.7 Plants & Crops – Organized Rows
+- Inside every tilled plot: place crops in neat 4×4 or 5×5 grids.
+- Use the crop sprites from **spring farm tilemap.png** (bottom rows).
+- Each crop has growth stages 0–7 → update `variant` over time.
+- Never scatter plants randomly — always aligned to tile grid.
+
+### 25.8 Sprite Facing – NO MOONWALKING / BACKWARDS WALKING
+**Mandatory rule in every Character / NPC / Animal `useFrame`:**
+
+```ts
+// After calculating movement direction
+const velX = rigidBody?.linvel()?.x ?? velocity.x ?? 0;
+sprite.scale.x = velX >= -0.01 ? Math.abs(baseScale) : -Math.abs(baseScale);
+```
+
+Do this for player, all NPCs, chickens, cows, etc.
+
+### 25.9 Depth Sorting (Painter's Algorithm)
+Every frame, after updating positions:
+```ts
+objectsGroup.children.sort((a, b) => (b.position.y + b.position.z * 0.01) - (a.position.y + a.position.z * 0.01));
+```
+
+### 25.10 Placement System (Player Click)
+1. Raycast to ground (use BVH from section 12).
+2. Snap to nearest tile center: `tx = Math.round(worldPoint.x / TILE_SIZE)`
+3. Update `worldData` first.
+4. Regenerate only the affected chunk + surrounding objects (fences, crops).
+
+### 25.11 Strict Order When Generating a New Farm World
+1. Create `WorldData` grid.
+2. Fill background with grass tiles.
+3. Place 3–5 rectangular tilled plots with path borders.
+4. Add connecting dirt paths.
+5. Place the house first (center-top or right side).
+6. Add fences around plots and house using neighbor logic.
+7. Place organized crops inside plots.
+8. Add trees and decorations from **farm objects free.png** using `regionSprite`.
+9. Spawn player and animals with correct facing code.
+10. Call depth sort and chunk update.
+
+---
+
+### Ready-to-Copy Prompts for Cursor (use these verbatim)
+
+**Prompt 1 – Full correct farm rebuild**
+```
+Using @docs/threejs-reference.md section 25 EXACTLY (Stardew-Style Farming Sim rules),
+rebuild the entire farm world from scratch.
+Follow the 11 strict steps in order.
+Use Tiny Wonder Farm assets (spring farm tilemap.png, farm objects free.png, etc.).
+Do not freestyle placement. Output the complete updated App.tsx and WorldData class.
+```
+
+**Prompt 2 – Fix only fences**
+```
+Using @docs/threejs-reference.md section 25.5, replace the current fence system
+with neighbor-aware auto-variants. Use the exact frame logic for straight, corners, T-junctions.
+Regenerate all fences based on the worldData grid.
+```
+
+**Prompt 3 – Fix sprite facing / moonwalking**
+```
+Using @docs/threejs-reference.md section 25.8, add the mandatory sprite facing code
+to EVERY character, NPC, and animal. Fix all moonwalking and backwards walking.
+```
+
+**Prompt 4 – Add proper farm plots & paths**
+```
+Using @docs/threejs-reference.md sections 25.3 and 25.4,
+add 4 organized 5x5 tilled plots with dirt paths between them and around the house.
+```
