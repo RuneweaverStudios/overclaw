@@ -17,23 +17,27 @@ const CONFIG = {
   THOUGHT_DURATION: 4000, // ms how long thoughts show
 };
 
-// ============== ASSET PATHS ==============
-// Configurable asset base path - can be overridden via window.FARM_SIM_ASSET_BASE
-const ASSET_BASE = typeof window !== 'undefined' && window.FARM_SIM_ASSET_BASE
-  ? window.FARM_SIM_ASSET_BASE
-  : '/assets/packs/Farm';
+// ============== ASSET PATHS (Configurable) ==============
+// Can be overridden via window.ASSET_BASE_URL before init()
+const getAssetPath = (relativePath) => {
+  const baseUrl = window.ASSET_BASE_URL || '/assets/packs/Farm';
+  return `${baseUrl}${relativePath}`;
+};
 
 const ASSETS = {
   // Character sprites (PIPOYA)
   characters: {
-    male: `${ASSET_BASE}/PIPOYA FREE RPG Character Sprites 32x32/Male/Male 01-1.png`,
+    male: () => getAssetPath('/PIPOYA FREE RPG Character Sprites 32x32/Male/Male 01-1.png'),
   },
   // Farm tilemap (Tiny Wonder Farm)
-  tiles: `${ASSET_BASE}/Tiny Wonder Farm Free 3/tilemaps/spring farm tilemap.png`,
+  tiles: () => getAssetPath('/Tiny Wonder Farm Free 3/tilemaps/spring farm tilemap.png'),
   // Farm objects
-  objects: `${ASSET_BASE}/Tiny Wonder Farm Free 3/objects&items/farm objects free.png`,
+  objects: () => getAssetPath('/Tiny Wonder Farm Free 3/objects&items/farm objects free.png'),
+  // Mailbox flag (separate sprite for flag animation)
+  mailboxFlagDown: () => getAssetPath('/Tiny Wonder Farm Free 3/objects&items/farm objects free.png'),
+  mailboxFlagUp: () => getAssetPath('/Tiny Wonder Farm Free 3/objects&items/farm objects free.png'),
   // UI elements (Sunnyside)
-  ui: `${ASSET_BASE}/Sunnyside_World_ASSET_PACK_V2.1 2/Sunnyside_World_Assets/UI/9slice_box_white/`,
+  ui: () => getAssetPath('/Sunnyside_World_ASSET_PACK_V2.1 2/Sunnyside_World_Assets/UI/9slice_box_white/'),
 };
 
 // ============== GAME STATE ==============
@@ -46,6 +50,7 @@ const gameState = {
   mailbox: null,
   mail: [],
   selectedAgent: null,
+  isInitialized: false,
 };
 
 // ============== THREE.JS SETUP ==============
@@ -53,13 +58,17 @@ let scene, camera, renderer, raycaster, mouse;
 let worldGroup, agentsGroup, uiGroup;
 let clock = new THREE.Clock();
 
-// ============== TEXTURE CACHE ==============
+// ============== TEXTURE CACHE WITH CLEANUP ==============
 const textureCache = new Map();
+const clonedTextures = new Set(); // Track cloned textures for cleanup
 
-async function loadTexture(url) {
-  if (textureCache.has(url)) return textureCache.get(url);
-
+function loadTexture(url) {
   return new Promise((resolve, reject) => {
+    if (textureCache.has(url)) {
+      resolve(textureCache.get(url));
+      return;
+    }
+
     new THREE.TextureLoader().load(
       url,
       (texture) => {
@@ -69,40 +78,51 @@ async function loadTexture(url) {
         resolve(texture);
       },
       undefined,
-      reject
+      (error) => {
+        console.error(`Failed to load texture: ${url}`, error);
+        reject(error);
+      }
     );
   });
 }
 
-// Cleanup function for texture cache
 function cleanupTextureCache() {
+  // Dispose all cached textures
   for (const [url, texture] of textureCache) {
     texture.dispose();
   }
   textureCache.clear();
+
+  // Dispose all cloned textures
+  for (const texture of clonedTextures) {
+    if (texture) texture.dispose();
+  }
+  clonedTextures.clear();
 }
 
-// Cleanup specific texture from cache
-function releaseTexture(url) {
-  const texture = textureCache.get(url);
-  if (texture) {
-    texture.dispose();
-    textureCache.delete(url);
+// ============== DOM NULL CHECKS ==============
+function safeGetElement(id) {
+  const el = document.getElementById(id);
+  if (!el) {
+    console.warn(`DOM element not found: ${id}`);
   }
+  return el;
 }
 
 // ============== SPRITE UTILITIES ==============
 function createGridSprite(texture, col, row, cols, rows, width, height) {
+  const clonedTex = texture.clone();
+  clonedTextures.add(clonedTex);
+
+  clonedTex.repeat.set(1 / cols, 1 / rows);
+  clonedTex.offset.set(col / cols, 1 - (row + 1) / rows);
+  clonedTex.needsUpdate = true;
+
   const material = new THREE.SpriteMaterial({
-    map: texture.clone(),
+    map: clonedTex,
     transparent: true,
     depthTest: false,
   });
-
-  const tex = material.map;
-  tex.repeat.set(1 / cols, 1 / rows);
-  tex.offset.set(col / cols, 1 - (row + 1) / rows);
-  tex.needsUpdate = true;
 
   const sprite = new THREE.Sprite(material);
   sprite.scale.set(width, height, 1);
@@ -111,16 +131,23 @@ function createGridSprite(texture, col, row, cols, rows, width, height) {
 }
 
 function createRegionSprite(texture, px, py, pw, ph, ppu) {
+  if (!texture || !texture.image) {
+    console.warn('Invalid texture for region sprite');
+    return null;
+  }
+
+  const clonedTex = texture.clone();
+  clonedTextures.add(clonedTex);
+
+  clonedTex.repeat.set(pw / texture.image.width, ph / texture.image.height);
+  clonedTex.offset.set(px / texture.image.width, 1 - (py + ph) / texture.image.height);
+  clonedTex.needsUpdate = true;
+
   const material = new THREE.SpriteMaterial({
-    map: texture.clone(),
+    map: clonedTex,
     transparent: true,
     depthTest: false,
   });
-
-  const tex = material.map;
-  tex.repeat.set(pw / texture.image.width, ph / texture.image.height);
-  tex.offset.set(px / texture.image.width, 1 - (py + ph) / texture.image.height);
-  tex.needsUpdate = true;
 
   const sprite = new THREE.Sprite(material);
   sprite.scale.set(pw / ppu, ph / ppu, 1);
@@ -185,23 +212,33 @@ class Agent {
   }
 
   async init() {
-    const texture = await loadTexture(ASSETS.characters.male);
-    this.sprite = createGridSprite(
-      texture,
-      0, 0, 4, 4, // col, row, cols, rows
-      CONFIG.AGENT_SCALE,
-      CONFIG.AGENT_SCALE * 1.5
-    );
+    try {
+      const texture = await loadTexture(ASSETS.characters.male());
+      this.sprite = createGridSprite(
+        texture,
+        0, 0, 4, 4, // col, row, cols, rows
+        CONFIG.AGENT_SCALE,
+        CONFIG.AGENT_SCALE * 1.5
+      );
 
-    this.sprite.position.copy(this.position);
-    this.sprite.position.y = CONFIG.AGENT_SCALE * 0.75;
-    this.sprite.userData.agent = this;
-    this.sprite.renderOrder = 10;
+      if (!this.sprite) {
+        throw new Error('Failed to create agent sprite');
+      }
 
-    agentsGroup.add(this.sprite);
+      this.sprite.position.copy(this.position);
+      this.sprite.position.y = CONFIG.AGENT_SCALE * 0.75;
+      this.sprite.userData.agent = this;
+      this.sprite.renderOrder = 10;
+
+      agentsGroup.add(this.sprite);
+    } catch (error) {
+      console.error(`Failed to initialize agent ${this.name}:`, error);
+    }
   }
 
   update(delta) {
+    if (!this.sprite) return;
+
     // Movement
     const speed = 3;
     const direction = new THREE.Vector3()
@@ -235,15 +272,13 @@ class Agent {
   }
 
   showThought() {
+    const bubble = safeGetElement('thoughtBubble');
+    const text = safeGetElement('thoughtText');
+
+    if (!bubble || !text || !this.sprite || !camera) return;
+
     const thought = this.thoughts[Math.floor(Math.random() * this.thoughts.length)];
     this.currentThought = thought;
-
-    // Update thought bubble UI with null checks
-    const bubble = document.getElementById('thoughtBubble');
-    const text = document.getElementById('thoughtText');
-
-    if (!bubble || !text || !camera) return;
-
     text.textContent = thought;
 
     // Position bubble above agent
@@ -269,6 +304,10 @@ class Agent {
 
   dispose() {
     if (this.sprite) {
+      if (this.sprite.material.map) {
+        clonedTextures.delete(this.sprite.material.map);
+        this.sprite.material.map.dispose();
+      }
       this.sprite.material.dispose();
       agentsGroup.remove(this.sprite);
     }
@@ -287,65 +326,87 @@ class Garden {
   }
 
   async init() {
-    const texture = await loadTexture(ASSETS.tiles);
-    this.sprite = createRegionSprite(
-      texture,
-      32, 32, 16 * this.width, 16 * this.height, // tilled soil from tilemap
-      CONFIG.PIXELS_PER_UNIT
-    );
+    try {
+      const texture = await loadTexture(ASSETS.tiles());
+      this.sprite = createRegionSprite(
+        texture,
+        32, 32, 16 * this.width, 16 * this.height, // tilled soil from tilemap
+        CONFIG.PIXELS_PER_UNIT
+      );
 
-    this.sprite.position.copy(this.position);
-    this.sprite.scale.set(
-      this.width * CONFIG.TILE_SIZE,
-      this.height * CONFIG.TILE_SIZE,
-      1
-    );
-
-    worldGroup.add(this.sprite);
-
-    // Create crops
-    const cropSpacing = 1.5;
-    for (let i = 0; i < this.width; i++) {
-      for (let j = 0; j < this.height; j++) {
-        const cropX = this.position.x - (this.width * CONFIG.TILE_SIZE / 2) + (i + 0.5) * CONFIG.TILE_SIZE;
-        const cropZ = this.position.z - (this.height * CONFIG.TILE_SIZE / 2) + (j + 0.5) * CONFIG.TILE_SIZE;
-        this.crops.push({
-          position: new THREE.Vector3(cropX, 0.5, cropZ),
-          stage: Math.floor(Math.random() * 8),
-          sprite: null,
-        });
+      if (!this.sprite) {
+        throw new Error('Failed to create garden sprite');
       }
-    }
 
-    await this.initCrops();
+      this.sprite.position.copy(this.position);
+      this.sprite.scale.set(
+        this.width * CONFIG.TILE_SIZE,
+        this.height * CONFIG.TILE_SIZE,
+        1
+      );
+      this.sprite.renderOrder = 2;
+
+      worldGroup.add(this.sprite);
+
+      // Create crops
+      for (let i = 0; i < this.width; i++) {
+        for (let j = 0; j < this.height; j++) {
+          const cropX = this.position.x - (this.width * CONFIG.TILE_SIZE / 2) + (i + 0.5) * CONFIG.TILE_SIZE;
+          const cropZ = this.position.z - (this.height * CONFIG.TILE_SIZE / 2) + (j + 0.5) * CONFIG.TILE_SIZE;
+          this.crops.push({
+            position: new THREE.Vector3(cropX, 0.5, cropZ),
+            stage: Math.floor(Math.random() * 8),
+            sprite: null,
+          });
+        }
+      }
+
+      await this.initCrops();
+    } catch (error) {
+      console.error(`Failed to initialize garden for ${this.owner?.name}:`, error);
+    }
   }
 
   async initCrops() {
-    const texture = await loadTexture(ASSETS.tiles);
+    try {
+      const texture = await loadTexture(ASSETS.tiles());
 
-    for (const crop of this.crops) {
-      const stageCol = crop.stage % 8;
-      const stageRow = Math.floor(crop.stage / 8) + 4; // crops start at row 4 in tilemap
+      for (const crop of this.crops) {
+        const stageCol = crop.stage % 8;
+        const stageRow = Math.floor(crop.stage / 8) + 4; // crops start at row 4 in tilemap
 
-      crop.sprite = createGridSprite(
-        texture,
-        stageCol, stageRow, 8, 8,
-        1.2, 1.2
-      );
+        crop.sprite = createGridSprite(
+          texture,
+          stageCol, stageRow, 8, 8,
+          1.2, 1.2
+        );
 
-      crop.sprite.position.copy(crop.position);
-      crop.sprite.renderOrder = 5;
-      worldGroup.add(crop.sprite);
+        if (crop.sprite) {
+          crop.sprite.position.copy(crop.position);
+          crop.sprite.renderOrder = 5;
+          worldGroup.add(crop.sprite);
+        }
+      }
+    } catch (error) {
+      console.error('Failed to initialize crops:', error);
     }
   }
 
   dispose() {
     if (this.sprite) {
+      if (this.sprite.material.map) {
+        clonedTextures.delete(this.sprite.material.map);
+        this.sprite.material.map.dispose();
+      }
       this.sprite.material.dispose();
       worldGroup.remove(this.sprite);
     }
     this.crops.forEach(crop => {
       if (crop.sprite) {
+        if (crop.sprite.material.map) {
+          clonedTextures.delete(crop.sprite.material.map);
+          crop.sprite.material.map.dispose();
+        }
         crop.sprite.material.dispose();
         worldGroup.remove(crop.sprite);
       }
@@ -358,30 +419,57 @@ class Mailbox {
   constructor(x, z) {
     this.position = new THREE.Vector3(x, 0, z);
     this.sprite = null;
+    this.flagSprite = null;
     this.flagUp = false;
   }
 
   async init() {
-    const texture = await loadTexture(ASSETS.objects);
-    this.sprite = createRegionSprite(
-      texture,
-      1, 1, 30, 48, // mailbox from farm objects
-      CONFIG.PIXELS_PER_UNIT
-    );
+    try {
+      const texture = await loadTexture(ASSETS.objects());
+      this.sprite = createRegionSprite(
+        texture,
+        1, 1, 30, 48, // mailbox from farm objects
+        CONFIG.PIXELS_PER_UNIT
+      );
 
-    this.sprite.position.copy(this.position);
-    this.sprite.position.y = 1.5;
-    this.sprite.renderOrder = 8;
+      if (!this.sprite) {
+        throw new Error('Failed to create mailbox sprite');
+      }
 
-    worldGroup.add(this.sprite);
+      this.sprite.position.copy(this.position);
+      this.sprite.position.y = 1.5;
+      this.sprite.renderOrder = 8;
+
+      worldGroup.add(this.sprite);
+
+      // Create flag sprite
+      this.flagSprite = createRegionSprite(
+        texture,
+        35, 5, 8, 12, // flag from farm objects
+        CONFIG.PIXELS_PER_UNIT
+      );
+
+      if (this.flagSprite) {
+        this.flagSprite.position.set(
+          this.position.x + 0.3,
+          this.position.y + 1.2,
+          this.position.z
+        );
+        this.flagSprite.visible = false;
+        this.flagSprite.renderOrder = 9;
+        worldGroup.add(this.flagSprite);
+      }
+    } catch (error) {
+      console.error('Failed to initialize mailbox:', error);
+    }
   }
 
   toggleFlag() {
     this.flagUp = !this.flagUp;
     this.updateFlag();
 
-    const indicator = document.getElementById('mailboxIndicator');
-    const mailboxText = document.getElementById('mailboxText');
+    const indicator = safeGetElement('mailboxIndicator');
+    const mailboxText = safeGetElement('mailboxText');
 
     if (indicator) {
       indicator.classList.toggle('has-mail', this.flagUp);
@@ -394,23 +482,32 @@ class Mailbox {
   }
 
   updateFlag() {
-    // Update flag sprite - create a small flag indicator
-    if (!this.sprite) return;
-
-    // Flag is represented by a small colored rectangle above mailbox
-    // The flag could be added as a child sprite, but for now we use UI indicator
-    // This method can be extended to add a visual 3D flag sprite
+    if (this.flagSprite) {
+      this.flagSprite.visible = this.flagUp;
+    }
   }
 
   dispose() {
     if (this.sprite) {
+      if (this.sprite.material.map) {
+        clonedTextures.delete(this.sprite.material.map);
+        this.sprite.material.map.dispose();
+      }
       this.sprite.material.dispose();
       worldGroup.remove(this.sprite);
+    }
+    if (this.flagSprite) {
+      if (this.flagSprite.material.map) {
+        clonedTextures.delete(this.flagSprite.material.map);
+        this.flagSprite.material.map.dispose();
+      }
+      this.flagSprite.material.dispose();
+      worldGroup.remove(this.flagSprite);
     }
   }
 }
 
-// ============== DIALOGUE SYSTEM ==============
+// ============== DIALOGUE SYSTEM WITH MEMORY LEAK FIX ==============
 const dialogueSystem = {
   isOpen: false,
   currentDialogue: [],
@@ -418,12 +515,18 @@ const dialogueSystem = {
   typewriterTimer: null,
 
   open(agentName, portrait, lines) {
-    const box = document.getElementById('dialogueBox');
-    const nameEl = document.getElementById('dialogueName');
-    const textEl = document.getElementById('dialogueText');
-    const portraitCanvas = document.getElementById('dialoguePortrait');
+    const box = safeGetElement('dialogueBox');
+    const nameEl = safeGetElement('dialogueName');
+    const textEl = safeGetElement('dialogueText');
+    const portraitCanvas = safeGetElement('dialoguePortrait');
 
-    if (!box || !nameEl || !textEl) return;
+    if (!box || !nameEl || !textEl) {
+      console.error('Required dialogue elements not found');
+      return;
+    }
+
+    // Clear any existing timer first
+    this.clearTimer();
 
     nameEl.textContent = agentName;
     this.currentDialogue = lines;
@@ -444,16 +547,13 @@ const dialogueSystem = {
   },
 
   showCurrentLine() {
-    const textEl = document.getElementById('dialogueText');
+    const textEl = safeGetElement('dialogueText');
     if (!textEl) return;
 
     const line = this.currentDialogue[this.currentIndex];
 
-    // Clear existing timer to prevent memory leak
-    if (this.typewriterTimer) {
-      clearInterval(this.typewriterTimer);
-      this.typewriterTimer = null;
-    }
+    // Clear any existing timer first
+    this.clearTimer();
 
     // Typewriter effect
     textEl.textContent = '';
@@ -464,10 +564,16 @@ const dialogueSystem = {
         textEl.textContent += line[charIndex];
         charIndex++;
       } else {
-        clearInterval(this.typewriterTimer);
-        this.typewriterTimer = null;
+        this.clearTimer();
       }
     }, 30);
+  },
+
+  clearTimer() {
+    if (this.typewriterTimer) {
+      clearInterval(this.typewriterTimer);
+      this.typewriterTimer = null;
+    }
   },
 
   next() {
@@ -483,74 +589,117 @@ const dialogueSystem = {
   },
 
   close() {
-    const box = document.getElementById('dialogueBox');
+    this.clearTimer();
+
+    const box = safeGetElement('dialogueBox');
     if (box) {
       box.classList.remove('active');
     }
+
     this.isOpen = false;
     this.currentDialogue = [];
     this.currentIndex = 0;
-
-    // Always clear timer to prevent memory leak
-    if (this.typewriterTimer) {
-      clearInterval(this.typewriterTimer);
-      this.typewriterTimer = null;
-    }
-  },
-
-  // Cleanup method for proper shutdown
-  dispose() {
-    this.close();
   },
 };
 
 // ============== WORLD GENERATION ==============
 async function createGround() {
-  const texture = await loadTexture(ASSETS.tiles);
+  try {
+    const texture = await loadTexture(ASSETS.tiles());
 
-  // Create grass ground
-  const groundGeo = new THREE.PlaneGeometry(100, 100);
-  const groundMat = new THREE.MeshBasicMaterial({
-    map: createRegionSprite(texture, 0, 0, 16, 16, CONFIG.PIXELS_PER_UNIT).material.map,
+    // Create grass ground
+    const groundGeo = new THREE.PlaneGeometry(100, 100);
+    const groundMat = new THREE.MeshBasicMaterial({
+      map: createRegionSprite(texture, 0, 0, 16, 16, CONFIG.PIXELS_PER_UNIT)?.material.map,
+    });
+
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    ground.renderOrder = 0;
+
+    worldGroup.add(ground);
+
+    // Add dirt paths
+    for (let i = -5; i <= 5; i++) {
+      const pathTile = createRegionSprite(texture, 16, 0, 16, 16, CONFIG.PIXELS_PER_UNIT);
+      if (pathTile) {
+        pathTile.position.set(i * CONFIG.TILE_SIZE, 0.05, 8);
+        pathTile.scale.set(CONFIG.TILE_SIZE, CONFIG.TILE_SIZE, 1);
+        pathTile.renderOrder = 1;
+        worldGroup.add(pathTile);
+      }
+    }
+
+    // Add fence
+    for (let i = -15; i <= 15; i++) {
+      if (Math.abs(i) > 3 || Math.abs(i) < 3) { // Leave gap for entrance
+        const fence = createRegionSprite(texture, 48, 0, 16, 16, CONFIG.PIXELS_PER_UNIT);
+        if (fence) {
+          fence.position.set(i * CONFIG.TILE_SIZE * 0.5, 1, -15);
+          fence.scale.set(1, 2, 1);
+          fence.renderOrder = 7;
+          worldGroup.add(fence);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Failed to create ground:', error);
+  }
+}
+
+// ============== DEPTH SORTING (Respects renderOrder) ==============
+function depthSortChildren(group) {
+  if (!group || !group.children) return;
+
+  group.children.sort((a, b) => {
+    // First sort by renderOrder
+    if (a.renderOrder !== undefined && b.renderOrder !== undefined) {
+      if (a.renderOrder !== b.renderOrder) {
+        return a.renderOrder - b.renderOrder;
+      }
+    }
+
+    // Then by depth (y + slight z bias for 2.5D effect)
+    const depthA = (a.position?.y ?? 0) + ((a.position?.z ?? 0) * 0.01);
+    const depthB = (b.position?.y ?? 0) + ((b.position?.z ?? 0) * 0.01);
+
+    return depthA - depthB;
   });
+}
 
-  const ground = new THREE.Mesh(groundGeo, groundMat);
-  ground.rotation.x = -Math.PI / 2;
-  ground.position.y = 0;
-  ground.renderOrder = 0;
-
-  worldGroup.add(ground);
-
-  // Add dirt paths
-  for (let i = -5; i <= 5; i++) {
-    const pathTile = createRegionSprite(texture, 16, 0, 16, 16, CONFIG.PIXELS_PER_UNIT);
-    pathTile.position.set(i * CONFIG.TILE_SIZE, 0.05, 8);
-    pathTile.scale.set(CONFIG.TILE_SIZE, CONFIG.TILE_SIZE, 1);
-    pathTile.renderOrder = 1;
-    worldGroup.add(pathTile);
+// ============== CLEANUP ==============
+function cleanup() {
+  // Dispose agents
+  for (const agent of gameState.agents) {
+    agent.dispose();
   }
 
-  // Add fence
-  for (let i = -15; i <= 15; i++) {
-    if (Math.abs(i) > 3 || Math.abs(i) < 3) { // Leave gap for entrance
-      const fence = createRegionSprite(texture, 48, 0, 16, 16, CONFIG.PIXELS_PER_UNIT);
-      fence.position.set(i * CONFIG.TILE_SIZE * 0.5, 1, -15);
-      fence.scale.set(1, 2, 1);
-      fence.renderOrder = 7;
-      worldGroup.add(fence);
-    }
+  // Dispose gardens
+  for (const garden of gameState.gardens) {
+    garden.dispose();
+  }
+
+  // Dispose mailbox
+  if (gameState.mailbox) {
+    gameState.mailbox.dispose();
+  }
+
+  // Clear dialogue timer
+  dialogueSystem.clearTimer();
+
+  // Cleanup textures
+  cleanupTextureCache();
+
+  // Dispose renderer
+  if (renderer) {
+    renderer.dispose();
   }
 }
 
 // ============== INITIALIZATION ==============
 async function init() {
   try {
-    // Canvas validation
-    const canvas = document.getElementById('gameCanvas');
-    if (!canvas) {
-      throw new Error('Game canvas not found. Make sure index.html is loaded correctly.');
-    }
-
     // Scene setup
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x87CEEB);
@@ -563,8 +712,13 @@ async function init() {
     camera.position.set(0, 30, 20);
     camera.lookAt(0, 0, 0);
 
+    const canvas = document.getElementById('gameCanvas');
+    if (!canvas) {
+      throw new Error('Game canvas not found');
+    }
+
     renderer = new THREE.WebGLRenderer({
-      canvas: canvas,
+      canvas,
       antialias: true,
     });
     renderer.setSize(window.innerWidth, window.innerHeight);
@@ -582,10 +736,10 @@ async function init() {
     scene.add(agentsGroup);
     scene.add(uiGroup);
 
-    // Create world with error handling
+    // Create world
     await createGround();
 
-    // Create agents with error handling
+    // Create agents
     const farmer = new Agent('Farmer John', 'Farmer', -5, 0, '#8B4513');
     await farmer.init();
     gameState.agents.push(farmer);
@@ -616,30 +770,35 @@ async function init() {
       }
     }
 
-    // Create mailbox with error handling
+    // Create mailbox
     const mailbox = new Mailbox(0, 12);
     await mailbox.init();
     gameState.mailbox = mailbox;
 
-    // Show click hint with null check
-    setTimeout(() => {
-      const clickHint = document.getElementById('clickHint');
-      if (clickHint) {
+    // Show click hint
+    const clickHint = safeGetElement('clickHint');
+    if (clickHint) {
+      setTimeout(() => {
         clickHint.classList.add('visible');
         setTimeout(() => {
           clickHint.classList.remove('visible');
         }, 5000);
-      }
-    }, 2000);
+      }, 2000);
+    }
 
     // Event listeners
     window.addEventListener('resize', onWindowResize);
     window.addEventListener('click', onClick);
     window.addEventListener('keydown', onKeyDown);
 
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', cleanup);
+
     // Add some mail
     setTimeout(() => {
-      mailbox.toggleFlag();
+      if (gameState.mailbox) {
+        gameState.mailbox.toggleFlag();
+      }
       gameState.mail.push({
         from: 'Farm Association',
         subject: 'Spring Festival',
@@ -647,30 +806,18 @@ async function init() {
       });
     }, 5000);
 
+    gameState.isInitialized = true;
     animate();
   } catch (error) {
-    console.error('Failed to initialize farm sim:', error);
-
-    // Show user-friendly error message
-    const canvas = document.getElementById('gameCanvas');
-    if (canvas) {
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.fillStyle = '#87CEEB';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = '#5c4033';
-        ctx.font = '20px Georgia, serif';
-        ctx.textAlign = 'center';
-        ctx.fillText('Failed to load Farm Sim', canvas.width / 2, canvas.height / 2 - 20);
-        ctx.font = '14px Georgia, serif';
-        ctx.fillText('Check console for details', canvas.width / 2, canvas.height / 2 + 20);
-      }
-    }
+    console.error('Failed to initialize game:', error);
+    cleanup();
   }
 }
 
 // ============== EVENT HANDLERS ==============
 function onWindowResize() {
+  if (!camera || !renderer) return;
+
   const aspect = window.innerWidth / window.innerHeight;
   const viewSize = 30;
 
@@ -684,6 +831,8 @@ function onWindowResize() {
 }
 
 function onClick(event) {
+  if (!raycaster || !camera || !mouse) return;
+
   // Update mouse coordinates
   mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
   mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
@@ -708,11 +857,13 @@ function onClick(event) {
   }
 
   // Check for mailbox click
-  const mailboxIntersects = raycaster.intersectObjects(worldGroup.children);
-  for (const intersect of mailboxIntersects) {
-    if (intersect.object.position.distanceTo(gameState.mailbox.position) < 2) {
-      showMailbox();
-      return;
+  if (gameState.mailbox) {
+    const mailboxIntersects = raycaster.intersectObjects(worldGroup.children);
+    for (const intersect of mailboxIntersects) {
+      if (intersect.object.position.distanceTo(gameState.mailbox.position) < 2) {
+        showMailbox();
+        return;
+      }
     }
   }
 }
@@ -754,8 +905,6 @@ function showAgentDialogue(agent) {
 }
 
 function showMailbox() {
-  if (!gameState.mailbox) return;
-
   if (gameState.mail.length === 0) {
     dialogueSystem.open('Mailbox', null, ['No mail right now.', 'Check back later!']);
     return;
@@ -765,7 +914,10 @@ function showMailbox() {
   const lines = [`From: ${mail.from}`, `Subject: ${mail.subject}`, '', ...mail.body];
 
   dialogueSystem.open('📬 Mailbox', null, lines);
-  gameState.mailbox.toggleFlag();
+
+  if (gameState.mailbox) {
+    gameState.mailbox.toggleFlag();
+  }
 }
 
 // ============== GAME LOOP ==============
@@ -778,20 +930,22 @@ function updateTime(delta) {
   }
 
   // Update time display with null checks
-  const timeDisplay = document.getElementById('timeDisplay');
-  const seasonDisplay = document.getElementById('seasonDisplay');
+  const timeDisplay = safeGetElement('timeDisplay');
+  const seasonDisplay = safeGetElement('seasonDisplay');
 
-  if (timeDisplay) {
+  if (timeDisplay || seasonDisplay) {
     const hours = Math.floor(gameState.time / 60);
     const minutes = Math.floor(gameState.time % 60);
     const ampm = hours >= 12 ? 'PM' : 'AM';
     const displayHours = hours % 12 || 12;
     const displayMinutes = minutes.toString().padStart(2, '0');
-    timeDisplay.textContent = `Time: ${displayHours}:${displayMinutes} ${ampm}`;
-  }
 
-  if (seasonDisplay) {
-    seasonDisplay.textContent = `Day ${gameState.day} - ${gameState.season}`;
+    if (timeDisplay) {
+      timeDisplay.textContent = `Time: ${displayHours}:${displayMinutes} ${ampm}`;
+    }
+    if (seasonDisplay) {
+      seasonDisplay.textContent = `Day ${gameState.day} - ${gameState.season}`;
+    }
   }
 }
 
@@ -802,7 +956,6 @@ function animate() {
 
   // Update agents
   for (const agent of gameState.agents) {
-    // Random movement
     if (!agent.isMoving && Math.random() < 0.005) {
       const newX = agent.position.x + (Math.random() - 0.5) * 4;
       const newZ = agent.position.z + (Math.random() - 0.5) * 4;
@@ -815,25 +968,26 @@ function animate() {
   // Update time
   updateTime(delta);
 
-  // Depth sort for proper rendering - respect renderOrder first, then depth
-  const sortByDepthAndRenderOrder = (a, b) => {
-    // First sort by renderOrder (lower values render first, in background)
-    const aOrder = a.renderOrder ?? 0;
-    const bOrder = b.renderOrder ?? 0;
-    if (aOrder !== bOrder) {
-      return aOrder - bOrder;
-    }
-    // Then sort by depth (y + z position for 2.5D)
-    const aDepth = a.position?.y ?? 0 + (a.position?.z ?? 0) * 0.01;
-    const bDepth = b.position?.y ?? 0 + (b.position?.z ?? 0) * 0.01;
-    return aDepth - bDepth;
-  };
+  // Depth sort for proper rendering (respects renderOrder)
+  depthSortChildren(worldGroup);
+  depthSortChildren(agentsGroup);
 
-  worldGroup.children.sort(sortByDepthAndRenderOrder);
-  agentsGroup.children.sort(sortByDepthAndRenderOrder);
-
-  renderer.render(scene, camera);
+  if (renderer && scene && camera) {
+    renderer.render(scene, camera);
+  }
 }
 
 // Start the game
 init().catch(console.error);
+
+// Export for testing
+if (typeof window !== 'undefined') {
+  window.FarmSim = {
+    Agent,
+    Garden,
+    Mailbox,
+    dialogueSystem,
+    gameState,
+    cleanup,
+  };
+}
