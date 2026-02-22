@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import httpx
-from flask import Flask, Response, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request, send_from_directory
 
 # Paths
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -55,7 +55,7 @@ def _task_description_for_agent(name: str, bead_id: str) -> tuple[str, str]:
     """Resolve short and full task description from spec files. Returns (task_short, task_full)."""
     task_short = ""
     task_full = ""
-    if not name or name == "Ollama supervisor":
+    if not name or name == "Approval supervisor":
         return task_short, task_full
     # Try oc-{suffix}.md from agent name (e.g. lead-acf799e7 -> oc-acf799e7.md)
     suffix = ""
@@ -115,10 +115,12 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 # UI settings: default/current project folder (default = overstory workspace)
 # ---------------------------------------------------------------------------
+# Sentinel for "no project" (agents ignore repos); distinct from "" which falls back to default
+CURRENT_PROJECT_NONE = "__none__"
 
 _DEFAULT_UI_SETTINGS = {
     "default_project_folder": "overstory",  # "overstory" = ROOT_WORKSPACE; or absolute path under root
-    "current_project_folder": "",           # "" = use default; or path (must be under ROOT_WORKSPACE)
+    "current_project_folder": "",           # "" = use default; __none__ = no project; or path (must be under ROOT_WORKSPACE)
     "create_project_on_next_prompt": False, # when True, next chat message creates a new folder from prompt
     "refresh_interval_ms": 3000,            # dashboard poll (MacBook-friendly default; 500, 1000, 2000, 3000, 5000)
     "sidebar_collapsed_default": False,    # start with sidebar collapsed
@@ -162,14 +164,16 @@ def _path_under_root(path_val: str) -> Optional[Path]:
 
 
 def get_effective_project_folder() -> Path:
-    """Current project folder: overstory workspace by default, or selected subfolder (changeable in settings)."""
+    """Current project folder: overstory workspace by default, or selected subfolder (changeable in settings). CURRENT_PROJECT_NONE falls back to ROOT_WORKSPACE for tree/paths."""
     s = _load_ui_settings()
     current = (s.get("current_project_folder") or "").strip()
     default = (s.get("default_project_folder") or "overstory").strip()
-    if current:
+    if current and current != CURRENT_PROJECT_NONE:
         candidate = _path_under_root(current)
         if candidate is not None:
             return candidate
+    if current == CURRENT_PROJECT_NONE:
+        return ROOT_WORKSPACE  # no project selected; use root for file tree etc.
     if default and default != "overstory":
         candidate = _path_under_root(default)
         if candidate is not None:
@@ -311,10 +315,10 @@ def overstory_status():
                             "task_full": task_full,
                         })
 
-        # Always show Ollama approval supervisor first (runs in gateway, not an overstory tmux agent)
+        # Always show Approval supervisor first (runs in gateway, not an overstory tmux agent)
         agents.insert(0, {
             "state_icon": "●",
-            "name": "Ollama supervisor",
+            "name": "Approval supervisor",
             "capability": "supervisor",
             "state": "active",
             "bead_id": "—",
@@ -595,11 +599,15 @@ GITHUB_REPOS_CACHE_TTL_S = 300
 
 
 def get_workspace_info() -> Dict[str, any]:
-    """Current project folder, git root, GitHub remote URL, branch (uses effective project folder from settings)."""
+    """Current project folder, git root, GitHub remote URL, branch (uses effective project folder from settings). When user chose None, project_none=True and folder='None'."""
+    s = _load_ui_settings()
+    current = (s.get("current_project_folder") or "").strip()
+    project_none = current == CURRENT_PROJECT_NONE
     project = get_effective_project_folder()
     info = {
-        "folder": project.name,
-        "path": str(project),
+        "folder": "None" if project_none else project.name,
+        "path": "" if project_none else str(project),
+        "project_none": project_none,
         "root_workspace": str(ROOT_WORKSPACE),
         "git_root": None,
         "branch": None,
@@ -1009,19 +1017,38 @@ def _sessions_json_path() -> Optional[Path]:
     return p if p.is_file() else None
 
 
+def _session_matches_project(session: dict, project_path: str) -> bool:
+    """True if session is associated with the given project path (workspace/cwd)."""
+    if not project_path or not project_path.strip():
+        return False
+    pp = project_path.strip().rstrip("/")
+    for key in ("workspace", "workspacePath", "projectPath", "cwd", "path"):
+        val = (session.get(key) or "").strip().rstrip("/")
+        if val and (val == pp or val.startswith(pp + "/")):
+            return True
+    return False
+
+
 @app.route("/api/session-usage")
 def api_session_usage():
-    """Aggregate input/output token usage from OpenClaw sessions.json (all sessions)."""
+    """Aggregate input/output token usage from OpenClaw sessions.json.
+    Query: scope=all (default) | project; when scope=project pass project_path= for filtering."""
     out = {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0, "sessions": 0}
     path = _sessions_json_path()
     if not path:
         return jsonify(out)
+    scope = (request.args.get("scope") or "all").strip().lower()
+    project_path = (request.args.get("project_path") or "").strip()
+    if scope != "project":
+        project_path = ""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return jsonify(out)
         for key, session in data.items():
-            if not key.startswith("agent:"):
+            if not key.startswith("agent:") or not isinstance(session, dict):
+                continue
+            if scope == "project" and project_path and not _session_matches_project(session, project_path):
                 continue
             out["sessions"] += 1
             out["inputTokens"] += int(session.get("inputTokens") or 0)
@@ -1030,6 +1057,26 @@ def api_session_usage():
     except (json.JSONDecodeError, OSError):
         pass
     return jsonify(out)
+
+
+def get_workspace_subfolders() -> List[Dict[str, str]]:
+    """Direct subfolders of ROOT_WORKSPACE (one level, dirs only). For custom path dropdown."""
+    if not ROOT_WORKSPACE.is_dir():
+        return []
+    out = []
+    try:
+        for p in sorted(ROOT_WORKSPACE.iterdir(), key=lambda x: x.name.lower()):
+            if p.is_dir() and not p.name.startswith(".") and p.name not in ("node_modules", "__pycache__"):
+                out.append({"name": p.name, "path": str(p)})
+    except (OSError, PermissionError):
+        pass
+    return out
+
+
+@app.route("/api/workspace/subfolders")
+def api_workspace_subfolders():
+    """List direct subfolders of the workspace root for the custom path dropdown."""
+    return jsonify(get_workspace_subfolders())
 
 
 @app.route("/api/file-tree")
@@ -1209,7 +1256,7 @@ def api_chat():
     # When no folder selected (current empty, default overstory) and this is the initial prompt (no history), create project from prompt
     s = _load_ui_settings()
     has_history = bool(data.get("history"))
-    if not has_history and (s.get("current_project_folder") or "").strip() == "" and (s.get("default_project_folder") or "overstory").strip() == "overstory":
+    if not has_history and (s.get("current_project_folder") or "").strip() == "" and (s.get("default_project_folder") or "overstory").strip() == "overstory" and (s.get("current_project_folder") or "").strip() != CURRENT_PROJECT_NONE:
         s["create_project_on_next_prompt"] = True
         _save_ui_settings(s)
     # When "create project on next prompt" is set, create folder from this message and enter it
@@ -1224,7 +1271,7 @@ def api_chat():
             "history": data.get("history", []),
             "system": data.get("system"),
         }
-        with httpx.Client(timeout=120.0) as client:
+        with httpx.Client(timeout=180.0) as client:
             r = client.post(gateway_url, json=payload)
             r.raise_for_status()
             response_data = r.json()
@@ -1234,7 +1281,10 @@ def api_chat():
             return jsonify(response_data)
     except httpx.ConnectError as e:
         add_terminal_log(f"Gateway connection failed: {str(e)}", "error")
-        return jsonify({"error": f"Gateway connection failed: {str(e)}", "gateway_url": gateway_url}), 502
+        return jsonify({
+            "error": "Gateway unreachable. Start the OverClaw gateway (port 18800) and ensure ZAI_API_KEY is set in .env.",
+            "gateway_url": gateway_url,
+        }), 502
     except httpx.HTTPStatusError as e:
         add_terminal_log(f"Gateway error {e.response.status_code}: {e.response.text[:200]}", "error")
         return jsonify({"error": f"Gateway {e.response.status_code}", "detail": e.response.text[:500]}), 502
@@ -1254,13 +1304,17 @@ def api_message():
     s = _load_ui_settings()
     history = data.get("history") or []
     has_history = bool(history)
-    if not has_history and (s.get("current_project_folder") or "").strip() == "" and (s.get("default_project_folder") or "overstory").strip() == "overstory":
+    if not has_history and (s.get("current_project_folder") or "").strip() == "" and (s.get("default_project_folder") or "overstory").strip() == "overstory" and (s.get("current_project_folder") or "").strip() != CURRENT_PROJECT_NONE:
         s["create_project_on_next_prompt"] = True
         _save_ui_settings(s)
     created_path = _ensure_create_project_from_prompt(message)
+    # So agents only read/edit under current project (omit when None or default root)
+    s = _load_ui_settings()
+    current = (s.get("current_project_folder") or "").strip()
+    project_path = None if current == CURRENT_PROJECT_NONE or not current else str(get_effective_project_folder())
     gateway_url = f"{GATEWAY_URL.rstrip('/')}/api/message"
     try:
-        with httpx.Client(timeout=120.0) as client:
+        with httpx.Client(timeout=180.0) as client:
             r = client.post(
                 gateway_url,
                 json={
@@ -1269,6 +1323,7 @@ def api_message():
                     "route_to_agents": data.get("route_to_agents", False),
                     "follow_up_answers": data.get("follow_up_answers"),
                     "context": data.get("context", {}),
+                    "project_path": project_path,
                 },
             )
             r.raise_for_status()
@@ -1277,16 +1332,24 @@ def api_message():
                 out["created_project"] = created_path.name
             return jsonify(out)
     except httpx.ConnectError as e:
-        return jsonify({"error": f"Gateway connection failed: {str(e)}"}), 502
+        return jsonify({
+            "error": "Gateway unreachable. Start the OverClaw gateway (port 18800) and ensure ZAI_API_KEY is set in .env.",
+            "detail": str(e),
+        }), 502
     except httpx.HTTPStatusError as e:
-        return jsonify({"error": f"Gateway {e.response.status_code}", "detail": (e.response.text or "")[:500]}), 502
+        try:
+            err_body = e.response.json()
+            err_msg = err_body.get("error") or e.response.text or str(e)
+        except Exception:
+            err_msg = (e.response.text or str(e))[:500]
+        return jsonify({"error": err_msg, "detail": (e.response.text or "")[:500]}), 502
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/route", methods=["POST"])
 def api_route():
-    """Proxy route/spawn to gateway. Gateway expects { task, spawn?, context? }. Creates project from task when no folder selected."""
+    """Proxy route/spawn to gateway. Gateway expects { task, spawn?, context?, project_path? }. Creates project from task when no folder selected."""
     data = request.get_json() or {}
     task = data.get("task", "").strip()
     if not task:
@@ -1294,10 +1357,13 @@ def api_route():
     s = _load_ui_settings()
     ctx = data.get("context") or {}
     has_history = bool(ctx.get("history"))
-    if not has_history and (s.get("current_project_folder") or "").strip() == "" and (s.get("default_project_folder") or "overstory").strip() == "overstory":
+    if not has_history and (s.get("current_project_folder") or "").strip() == "" and (s.get("default_project_folder") or "overstory").strip() == "overstory" and (s.get("current_project_folder") or "").strip() != CURRENT_PROJECT_NONE:
         s["create_project_on_next_prompt"] = True
         _save_ui_settings(s)
     created_path = _ensure_create_project_from_prompt(task)
+    s = _load_ui_settings()
+    current = (s.get("current_project_folder") or "").strip()
+    project_path = None if current == CURRENT_PROJECT_NONE or not current else str(get_effective_project_folder())
     gateway_url = f"{GATEWAY_URL.rstrip('/')}/api/route"
     try:
         with httpx.Client(timeout=60.0) as client:
@@ -1307,6 +1373,7 @@ def api_route():
                     "task": task,
                     "spawn": data.get("spawn", True),
                     "context": data.get("context", {}),
+                    "project_path": project_path,
                 },
             )
             r.raise_for_status()
@@ -1561,6 +1628,30 @@ def api_gateway_health():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
+
+@app.route("/api/gateway/status")
+def api_gateway_status():
+    """Proxy gateway full status (orchestrator, overstory, etc.) for setup wizard."""
+    try:
+        r = httpx.get(f"{GATEWAY_URL.rstrip('/')}/api/status", timeout=10.0)
+        return jsonify(r.json())
+    except Exception as e:
+        return jsonify({"error": str(e), "orchestrator": {}, "overstory": {}})
+
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+
+@app.route("/static/pa/<path:filename>")
+def pa_static(filename):
+    return send_from_directory(os.path.join(_REPO_ROOT, "assets", "packs", "postapocalypse"), filename)
+
+@app.route("/static/sw/<path:filename>")
+def sw_static(filename):
+    return send_from_directory(os.path.join(_REPO_ROOT, "assets", "packs", "sunnyside"), filename)
+
+@app.route("/static/tf/<path:filename>")
+def tf_static(filename):
+    return send_from_directory(os.path.join(_REPO_ROOT, "assets", "packs", "tinyfarm"), filename)
 
 # Single-page HTML: Overstory-style left + tabbed Terminal/Output right
 INDEX_HTML = """<!DOCTYPE html>
@@ -1849,6 +1940,8 @@ INDEX_HTML = """<!DOCTYPE html>
     .file-tree .tree-item .tree-arrow { width: 14px; text-align: center; font-size: 10px; color: #6e7681; }
     .file-tree .tree-item.dir .tree-arrow::before { content: '▶'; }
     .file-tree .tree-item.dir.open .tree-arrow::before { content: '▼'; }
+    .file-tree .tree-item-project { font-weight: 600; color: #58a6ff; }
+    .file-tree .file-tree-children { padding-left: 4px; }
     .skills-browser-tabs { display: flex; gap: 4px; margin-bottom: 8px; }
     .skills-browser-tabs button {
       padding: 4px 10px;
@@ -1897,6 +1990,9 @@ INDEX_HTML = """<!DOCTYPE html>
     }
     .project-create-folder-btn:hover { background: #2ea043; }
     #showNewFolderBtn { width: 100%; margin-top: 2px; }
+    .project-new-folder-row { display: flex; align-items: center; gap: 6px; }
+    .project-new-folder-row .project-path-input { flex: 1; min-width: 0; margin-top: 0; }
+    .project-new-create-btn { flex-shrink: 0; margin-top: 0; }
     .project-new-btn {
       margin-top: 8px;
       width: 100%;
@@ -2239,6 +2335,9 @@ INDEX_HTML = """<!DOCTYPE html>
     .thinking-row .dot { display: inline-block; width: 4px; height: 4px; background: #58a6ff; border-radius: 50%; margin-left: 2px; animation: pulse 0.8s ease-in-out infinite; }
     .thinking-row .dot:nth-child(2) { animation-delay: 0.2s; }
     .thinking-row .dot:nth-child(3) { animation-delay: 0.4s; }
+    .thinking-console { opacity: 0.45; font-family: var(--mono-font, ui-monospace, monospace); font-size: 11px; color: #8b949e; padding: 3px 0; min-height: 1.2em; }
+    .thinking-console.active { display: block; }
+    .thinking-console:not(.active) { display: none; }
     @keyframes pulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
     .claude-cli-section { padding: 12px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; }
     .claude-cli-header { font-weight: 600; margin-bottom: 8px; color: #e6edf3; }
@@ -2278,6 +2377,20 @@ INDEX_HTML = """<!DOCTYPE html>
       align-items: center;
       gap: 12px;
     }
+    .footer-token-toggle { display: flex; gap: 0; }
+    .footer-token-scope {
+      padding: 2px 6px;
+      font-size: 10px;
+      background: #21262d;
+      border: 1px solid #30363d;
+      color: #8b949e;
+      cursor: pointer;
+      border-radius: 3px;
+    }
+    .footer-token-scope:first-child { border-radius: 3px 0 0 3px; border-right-width: 0; }
+    .footer-token-scope:last-child { border-radius: 0 3px 3px 0; }
+    .footer-token-scope:hover { color: #e6edf3; background: #30363d; }
+    .footer-token-scope.active { background: #388bfd; color: #fff; border-color: #388bfd; }
     .footer-tokens span { color: #e6edf3; }
     .footer-tokens .token-in { color: #58a6ff; }
     .footer-tokens .token-out { color: #7ee787; }
@@ -2368,6 +2481,39 @@ INDEX_HTML = """<!DOCTYPE html>
     .settings-panel .settings-actions button { padding: 6px 14px; font-size: 12px; }
     .settings-panel .settings-actions button.secondary { background: #21262d; color: #8b949e; border: 1px solid #30363d; }
     .settings-panel .settings-actions button.secondary:hover { background: #30363d; color: #e6edf3; }
+    .nanoclaw-wizard-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 10000; }
+    .nanoclaw-wizard-modal.visible { display: flex; }
+    .nanoclaw-wizard-panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; width: 90%; max-width: 560px; max-height: 85vh; display: flex; flex-direction: column; overflow: hidden; }
+    .nanoclaw-wizard-panel h3 { padding: 12px 16px; border-bottom: 1px solid #30363d; font-size: 14px; color: #58a6ff; }
+    .nanoclaw-wizard-console { flex: 1; min-height: 220px; max-height: 360px; overflow-y: auto; padding: 12px; font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.45; background: #0d1117; color: #e6edf3; }
+    .nanoclaw-wizard-console .wizard-line { white-space: pre-wrap; word-break: break-word; padding: 2px 0; }
+    .nanoclaw-wizard-console .wizard-ts { color: #6e7681; margin-right: 8px; }
+    .nanoclaw-wizard-console .wizard-ok { color: #7ee787; }
+    .nanoclaw-wizard-console .wizard-fail { color: #f85149; }
+    .nanoclaw-wizard-console .wizard-pending { color: #8b949e; }
+    .nanoclaw-wizard-actions { padding: 12px 16px; border-top: 1px solid #30363d; display: flex; gap: 8px; justify-content: flex-end; }
+    .nanoclaw-wizard-actions button { padding: 8px 16px; font-size: 12px; border-radius: 6px; cursor: pointer; border: 1px solid #30363d; background: #21262d; color: #e6edf3; }
+    .nanoclaw-wizard-actions button.primary { background: #238636; border-color: #238636; }
+    .nanoclaw-wizard-actions button.primary:hover { background: #2ea043; }
+    .nanoclaw-wizard-actions button.primary:disabled { opacity: 0.6; cursor: not-allowed; }
+    .nanoclaw-wizard-actions button:hover { background: #30363d; }
+
+    .ceo-fullscreen { position: fixed; inset: 0; z-index: 10001; background: #0d1117; display: none; flex-direction: column; align-items: stretch; justify-content: stretch; }
+    .ceo-fullscreen.visible { display: flex; }
+    .ceo-fullscreen #ceoCanvas { flex: 1; width: 100%; height: 100%; display: block; }
+    .ceo-close { position: absolute; top: 12px; right: 12px; z-index: 10002; width: 36px; height: 36px; border-radius: 6px; border: 1px solid #30363d; background: #21262d; color: #e6edf3; font-size: 20px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+    .ceo-close:hover { background: #30363d; }
+    .ceo-theme-select { position: absolute; top: 12px; left: 12px; z-index: 10002; padding: 6px 10px; border-radius: 6px; border: 1px solid #30363d; background: #21262d; color: #e6edf3; font-size: 12px; font-family: inherit; cursor: pointer; }
+    .ceo-theme-select:hover { background: #30363d; }
+    .ceo-credit { position: absolute; bottom: 8px; right: 12px; z-index: 10002; font-size: 10px; color: rgba(139,148,158,0.5); pointer-events: none; }
+    .agent-dialog { position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%); z-index: 10003; width: 90%; max-width: 640px; background: rgba(22,27,34,0.95); border: 2px solid #58a6ff; border-radius: 8px; padding: 16px; display: flex; gap: 16px; align-items: flex-start; cursor: pointer; image-rendering: pixelated; box-shadow: 0 0 20px rgba(88,166,255,0.15); }
+    .agent-dialog-portrait { width: 80px; height: 80px; flex-shrink: 0; image-rendering: pixelated; border: 1px solid #30363d; border-radius: 4px; background: #161b22; overflow: hidden; }
+    .agent-dialog-portrait canvas { width: 100%; height: 100%; image-rendering: pixelated; display: block; }
+    .agent-dialog-content { flex: 1; min-width: 0; }
+    .agent-dialog-name { font-size: 13px; font-weight: 600; color: #58a6ff; margin-bottom: 6px; font-family: ui-monospace, monospace; }
+    .agent-dialog-name .agent-dialog-role { font-size: 11px; font-weight: 400; color: #8b949e; margin-left: 8px; }
+    .agent-dialog-text { font-size: 12px; color: #e6edf3; font-family: ui-monospace, monospace; line-height: 1.6; min-height: 40px; white-space: pre-wrap; }
+    .agent-dialog-hint { font-size: 10px; color: #484f58; margin-top: 8px; text-align: right; }
 
     /* --- Mobile: single-column chat-first layout (like conversation UI) --- */
     @media (max-width: 768px) {
@@ -2674,6 +2820,10 @@ INDEX_HTML = """<!DOCTYPE html>
           </button>
           <div id="openFolderDropdown" class="open-folder-dropdown">
             <button type="button" class="of-item" id="openFolderBrowse">Browse folders…</button>
+            <button type="button" class="of-item" id="openFolderNone">None</button>
+            <div class="of-divider"></div>
+            <div class="of-head" id="openFolderWorkspaceHead">Workspace</div>
+            <div id="openFolderWorkspaceList"></div>
             <div class="of-divider"></div>
             <div class="of-head" id="openFolderReposHead">Your repos</div>
             <div id="openFolderReposList"></div>
@@ -2697,6 +2847,7 @@ INDEX_HTML = """<!DOCTYPE html>
       <button id="injectLeadBtn" class="header-btn-long" title="Spawn a lead and reassign all unread lead/supervisor mail to it (use when agents have no lead)">Inject Lead</button>
       <button id="pruneWorktreesBtn" class="header-btn-long" title="Prune completed worktrees (overstory worktree clean --completed)">Prune completed</button>
       <button id="killAllAgentsBtn" class="header-btn-long header-btn-danger" title="Stop all agents, clear all mail and task queue so you can open a new project fresh">Kill all agents</button>
+      <button type="button" id="ceoBtn" class="header-btn-long" title="CEO view: animated office">CEO</button>
       <button type="button" class="mobile-panels-btn" id="mobilePanelsBtn" aria-label="Toggle agents and mail panels" title="Agents &amp; Mail">▦</button>
       <button onclick="refreshNow()" title="Refresh">↻</button>
     </div>
@@ -2721,11 +2872,13 @@ INDEX_HTML = """<!DOCTYPE html>
               <button type="button" id="showNewFolderBtn" class="project-create-folder-btn" title="Create a new subfolder in the workspace and set it as default">+ New folder</button>
             </div>
             <div id="customProjectPathWrap" class="project-setting-row" style="display:none;">
-              <input type="text" id="customProjectPath" class="project-path-input" placeholder="Path under workspace">
+              <select id="customProjectPath" class="project-select project-subfolders-select" title="Choose a workspace subfolder">
+                <option value="">— Select folder —</option>
+              </select>
             </div>
-            <div id="newProjectFolderWrap" class="project-setting-row" style="display:none;">
+            <div id="newProjectFolderWrap" class="project-setting-row project-new-folder-row" style="display:none;">
               <input type="text" id="newProjectFolderName" class="project-path-input" placeholder="New folder name">
-              <button type="button" id="newProjectFolderBtn" class="project-create-folder-btn">Create & set default</button>
+              <button type="button" id="newProjectFolderBtn" class="project-create-folder-btn project-new-create-btn" title="Create folder and set as default">Create</button>
             </div>
           </div>
         </div>
@@ -2782,7 +2935,7 @@ INDEX_HTML = """<!DOCTYPE html>
     </div>
     <div class="right">
       <div class="tabs">
-        <div class="tab active" data-tab="chat">Chat (Ollama)</div>
+        <div class="tab active" data-tab="chat">Chat (Z AI)</div>
         <div class="tab" data-tab="terminal">TERMINAL</div>
         <div class="tab" data-tab="kanban">KANBAN</div>
         <div class="tab" data-tab="problems">PROBLEMS</div>
@@ -2798,8 +2951,10 @@ INDEX_HTML = """<!DOCTYPE html>
           </div>
         </div>
         <div class="chat-bottom-half" style="flex: 0 0 50%; min-height: 0; display: flex; flex-direction: column; padding: 12px;">
-          <div class="terminal-output" id="chatHistory" class="chat-history-scroll" style="flex: 1; min-height: 0; overflow-y: auto; margin-bottom: 8px;"></div>
-          <label class="route-toggle"><input type="checkbox" id="routeToAgents" checked> Route to agents (spawn task; when off, Ollama replies directly)</label>
+          <div class="terminal-output chat-history-scroll" id="chatHistory" style="flex: 1; min-height: 0; overflow-y: auto; margin-bottom: 8px;"></div>
+          <div id="thinkingConsole" class="thinking-console" aria-live="polite"></div>
+          <label class="route-toggle"><input type="checkbox" id="showThinking" checked> Show thinking (low-opacity console)</label>
+          <label class="route-toggle"><input type="checkbox" id="routeToAgents" checked> Route to agents (spawn task; when off, orchestrator replies directly)</label>
           <textarea id="chatInput" placeholder="Type a message or task for the orchestrator…" style="width: 100%; min-height: 60px; padding: 8px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d; border-radius: 4px; font-family: inherit; resize: vertical; margin-bottom: 8px;"></textarea>
           <div class="chat-footer">
             <button id="sendBtn">Send</button>
@@ -2838,8 +2993,11 @@ INDEX_HTML = """<!DOCTYPE html>
   </div>
   <div class="footer" id="footerBar">
     <div class="footer-left">
-      <div class="footer-tokens" id="footerTokens" title="Sum of input/output tokens across all agents (main + subagents) in sessions.json">
-        <span>Tokens (all agents):</span>
+      <div class="footer-tokens" id="footerTokens" title="Token usage from sessions">
+        <span class="footer-token-toggle">
+          <button type="button" id="tokenScopeAll" class="footer-token-scope active" title="All sessions">All</button>
+          <button type="button" id="tokenScopeProject" class="footer-token-scope" title="Current project only">Project</button>
+        </span>
         <span class="token-in" id="footerTokenIn">0</span> in
         <span class="token-out" id="footerTokenOut">0</span> out
         <span id="footerTokenTotal" style="color: #8b949e;">(0 total)</span>
@@ -2907,13 +3065,47 @@ INDEX_HTML = """<!DOCTYPE html>
           <input type="checkbox" id="settingSkipPermissions">
         </div>
       </div>
+      <div class="settings-section">
+        <div class="settings-section-title">Nanoclaw</div>
+        <div class="settings-row">
+          <label>Gateway and orchestrator setup</label>
+          <button type="button" id="nanoclawWizardBtn" class="secondary">Run setup wizard</button>
+        </div>
+      </div>
       <div class="settings-actions">
         <button type="button" class="secondary" id="settingsCancelBtn">Cancel</button>
         <button type="button" id="settingsSaveBtn">Save</button>
       </div>
     </div>
   </div>
-  <script>
+  <div id="nanoclawWizardModal" class="nanoclaw-wizard-modal">
+    <div class="nanoclaw-wizard-panel">
+      <h3>Nanoclaw setup wizard</h3>
+      <div id="nanoclawWizardConsole" class="nanoclaw-wizard-console">Run the wizard to check gateway, Z AI, and chat.</div>
+      <div class="nanoclaw-wizard-actions">
+        <button type="button" id="nanoclawWizardClose">Close</button>
+        <button type="button" id="nanoclawWizardRun" class="primary">Run</button>
+      </div>
+    </div>
+  </div>
+  <div id="ceoModal" class="ceo-fullscreen" aria-hidden="true">
+    <select id="ceoTheme" class="ceo-theme-select">
+      <option value="tinyfarm">Tiny Wonder Farm</option>
+      <option value="zombie">Zombie Survival</option>
+    </select>
+    <button type="button" class="ceo-close" id="ceoClose" aria-label="Close CEO view">&times;</button>
+    <canvas id="ceoCanvas"></canvas>
+    <div id="agentDialog" class="agent-dialog" style="display:none;">
+      <div class="agent-dialog-portrait" id="agentDialogPortrait"></div>
+      <div class="agent-dialog-content">
+        <div class="agent-dialog-name" id="agentDialogName"></div>
+        <div class="agent-dialog-text" id="agentDialogText"></div>
+      </div>
+    </div>
+    <span class="ceo-credit" id="ceoCredit"></span>
+  </div>
+  <script src="https://unpkg.com/three@0.149.0/build/three.min.js"></script>
+  <script defer>
     const GATEWAY_URL = {{ gateway_url|tojson }};
     let refreshIntervalId = null;
     let REFRESH_INTERVAL = 3000; // 3s default (MacBook-friendly); overridden from ui-settings
@@ -2939,6 +3131,7 @@ INDEX_HTML = """<!DOCTYPE html>
     }
     function repoLabelFromWorkspace(workspaceData) {
       if (!workspaceData) return 'Open folder or repo';
+      if (workspaceData.project_none) return 'None';
       var url = workspaceData.github_url || workspaceData.remote_url || '';
       if (url && url.indexOf('github.com') !== -1) {
         var match = url.match(/github\.com[/:]([^/]+\/[^/]+?)(?:\.git)?\/?$/);
@@ -2951,7 +3144,7 @@ INDEX_HTML = """<!DOCTYPE html>
       const repoLabelEl = document.getElementById('repoDropdownLabel');
       if (repoLabelEl) repoLabelEl.textContent = repoLabelFromWorkspace(workspaceData);
       if (workspaceData) {
-        updateCurrentPath(workspaceData.path || '');
+        updateCurrentPath(workspaceData.project_none ? '—' : (workspaceData.path || ''));
       }
       if (!btn) return;
       const repoUrl = (workspaceData && workspaceData.github_url) || '';
@@ -2974,6 +3167,7 @@ INDEX_HTML = """<!DOCTYPE html>
     }
     function loadWorkspace() {
       fetch('/api/workspace').then(r => r.json()).then(workspaceData => {
+        if (window.syncSidebarDropdownToWorkspace) window.syncSidebarDropdownToWorkspace(workspaceData);
         fetch('/api/github-auth').then(r => r.json()).then(ghData => {
           updateGitHubButton(workspaceData, ghData);
         }).catch(() => updateGitHubButton(workspaceData, null));
@@ -3036,11 +3230,33 @@ INDEX_HTML = """<!DOCTYPE html>
       var browseTreeRoot = document.getElementById('browseModalTreeRoot');
       var browseClose = document.getElementById('browseModalClose');
 
+      var workspaceHead = document.getElementById('openFolderWorkspaceHead');
+      var workspaceList = document.getElementById('openFolderWorkspaceList');
       if (btn && dropdown) {
         btn.addEventListener('click', function(e) {
           e.stopPropagation();
           dropdown.classList.toggle('visible');
           if (dropdown.classList.contains('visible')) {
+            workspaceList.innerHTML = '<div class="of-loading">Loading…</div>';
+            fetch('/api/workspace/subfolders').then(function(r) { return r.json(); }).then(function(subfolders) {
+              workspaceList.innerHTML = '';
+              (subfolders || []).forEach(function(f) {
+                var el = document.createElement('button');
+                el.type = 'button';
+                el.className = 'of-item';
+                el.textContent = f.name || f.path || '';
+                el.dataset.path = f.path || '';
+                el.addEventListener('click', function(e) {
+                  e.stopPropagation();
+                  dropdown.classList.remove('visible');
+                  openProjectThenRefresh({ path: this.dataset.path });
+                });
+                workspaceList.appendChild(el);
+              });
+              if (!workspaceList.children.length) workspaceList.innerHTML = '<div class="of-head" style="padding:8px 12px;">No subfolders</div>';
+            }).catch(function() {
+              workspaceList.innerHTML = '<div class="of-head" style="padding:8px 12px; color:#f85149;">Failed to load</div>';
+            });
             reposHead.style.display = 'block';
             reposList.innerHTML = '<div class="of-loading">Loading repos</div>';
             fetch('/api/github-auth').then(function(r) { return r.json(); }).then(function(gh) {
@@ -3087,6 +3303,14 @@ INDEX_HTML = """<!DOCTYPE html>
         });
         document.addEventListener('click', function() { dropdown.classList.remove('visible'); });
       }
+      var noneBtn = document.getElementById('openFolderNone');
+      if (noneBtn) noneBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        dropdown.classList.remove('visible');
+        fetch('/api/ui-settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ current_project_folder: '__none__' }) })
+          .then(function() { if (window.refreshProjectUI) window.refreshProjectUI(); })
+          .catch(function() { alert('Failed to set None'); });
+      });
       if (browseBtn) browseBtn.addEventListener('click', function() {
         dropdown.classList.remove('visible');
         browseModal.classList.add('visible');
@@ -3151,8 +3375,42 @@ INDEX_HTML = """<!DOCTYPE html>
     function loadFileTree() {
       const rootEl = document.getElementById('fileTreeRoot');
       if (!rootEl) return;
-      fetch('/api/file-tree').then(r => { if (!r.ok) throw new Error(r.statusText); return r.json(); }).then(nodes => {
-        renderFileTree(nodes || [], rootEl);
+      fetch('/api/workspace').then(r => r.ok ? r.json() : {}).then(function(workspace) {
+        workspace = workspace || {};
+        var projectPath = workspace.path || '';
+        var rootForTree = (workspace.project_none && workspace.root_workspace) ? workspace.root_workspace : '';
+        var fileTreeUrl = '/api/file-tree';
+        if (rootForTree) fileTreeUrl += '?root=' + encodeURIComponent(rootForTree);
+        return fetch(fileTreeUrl).then(function(r) { return r.ok ? r.json() : []; }).then(function(nodes) {
+          const projectName = workspace.project_none ? 'Workspace' : (workspace.folder || (workspace.path || '').split('/').pop() || 'Project');
+          rootEl.innerHTML = '';
+          var projectLi = document.createElement('li');
+          var projectSpan = document.createElement('span');
+          projectSpan.className = 'tree-item dir tree-item-project';
+          projectSpan.innerHTML = '<span class="tree-arrow"></span>' + (projectName || 'Project');
+          projectSpan.dataset.path = projectPath || rootForTree || '';
+          projectSpan.title = projectPath || rootForTree || 'No project selected';
+          var childrenUl = document.createElement('ul');
+          childrenUl.classList.add('file-tree-children');
+          if (nodes.length) {
+            projectSpan.classList.add('open');
+            renderFileTree(nodes, childrenUl);
+          } else if (projectPath || rootForTree) {
+            projectSpan.classList.add('open');
+            childrenUl.innerHTML = '<li class="tree-item" style="color:#6e7681;padding-left:18px">Empty folder</li>';
+          } else {
+            projectSpan.classList.add('open');
+            childrenUl.innerHTML = '<li class="tree-item" style="color:#6e7681;padding-left:18px">Select a folder or repo above</li>';
+          }
+        projectSpan.addEventListener('click', function() {
+          this.classList.toggle('open');
+          var sub = this.nextElementSibling;
+          if (sub) sub.style.display = sub.style.display === 'none' ? 'block' : 'none';
+        });
+        projectLi.appendChild(projectSpan);
+        projectLi.appendChild(childrenUl);
+        rootEl.appendChild(projectLi);
+        });
       }).catch(function(err) {
         rootEl.innerHTML = '<li class="tree-item" style="color:#f85149">Failed to load file tree</li>';
       });
@@ -3234,11 +3492,38 @@ INDEX_HTML = """<!DOCTYPE html>
         const newBtn = document.getElementById('newProjectFolderBtn');
         const showNewBtn = document.getElementById('showNewFolderBtn');
         if (!sel) return;
-        function showFolderWraps() {
+        function showFolderWraps(selectedPath) {
           const v = sel.value;
           customWrap.style.display = v === '__custom__' ? 'block' : 'none';
           if (newWrap) newWrap.style.display = v === '__new__' ? 'block' : 'none';
-          if (v !== '__custom__' && v !== '__new__') saveProjectSetting('default_project_folder', 'overstory');
+          if (v === '__custom__' && selectedPath === undefined) populateCustomDropdown();
+          if (v !== '__custom__' && v !== '__new__') saveProjectSettingBoth('default_project_folder', 'overstory', 'current_project_folder', '');
+        }
+        async function populateCustomDropdown(selectedPath) {
+          if (!customInput || customInput.tagName !== 'SELECT') return;
+          const currentVal = selectedPath != null ? selectedPath : (customInput.value || '');
+          try {
+            const r = await fetch('/api/workspace/subfolders');
+            const subfolders = await r.json();
+            customInput.innerHTML = '<option value="">— Select folder —</option><option value="__new__">＋ New folder…</option>';
+            (subfolders || []).forEach(function(f) {
+              const opt = document.createElement('option');
+              opt.value = f.path || '';
+              opt.textContent = f.name || f.path || '';
+              customInput.appendChild(opt);
+            });
+            if (currentVal && currentVal !== '__new__') {
+              const hasOpt = Array.from(customInput.options).some(function(o) { return o.value === currentVal; });
+              if (!hasOpt) {
+                const label = currentVal.split('/').pop() || currentVal;
+                const opt = document.createElement('option');
+                opt.value = currentVal;
+                opt.textContent = label + ' (current)';
+                customInput.appendChild(opt);
+              }
+              customInput.value = currentVal;
+            }
+          } catch (_) {}
         }
         try {
           const r = await fetch('/api/ui-settings');
@@ -3246,11 +3531,15 @@ INDEX_HTML = """<!DOCTYPE html>
           const def = (s.default_project_folder || 'overstory').trim();
           if (def && def !== 'overstory') {
             sel.value = '__custom__';
-            customInput.value = def;
+            showFolderWraps(def);
+            await populateCustomDropdown(def);
           } else {
             sel.value = 'overstory';
+            showFolderWraps();
           }
-          showFolderWraps();
+          fetch('/api/workspace').then(function(wr) { return wr.ok ? wr.json() : {}; }).then(function(ws) {
+            if (ws && window.syncSidebarDropdownToWorkspace) window.syncSidebarDropdownToWorkspace(ws);
+          });
         } catch (_) { showFolderWraps(); }
         sel.addEventListener('change', showFolderWraps);
         if (showNewBtn) showNewBtn.addEventListener('click', function() {
@@ -3259,7 +3548,14 @@ INDEX_HTML = """<!DOCTYPE html>
           if (newInput) { newInput.value = ''; newInput.focus(); }
         });
         customInput.addEventListener('change', function() {
-          saveProjectSetting('default_project_folder', this.value.trim() || 'overstory');
+          if (this.value === '__new__') {
+            sel.value = '__new__';
+            showFolderWraps();
+            if (newInput) { newInput.value = ''; newInput.focus(); }
+            return;
+          }
+          var path = this.value.trim() || 'overstory';
+          saveProjectSettingBoth('default_project_folder', path, 'current_project_folder', path);
         });
         if (newBtn && newInput) {
           newBtn.addEventListener('click', async function() {
@@ -3269,11 +3565,12 @@ INDEX_HTML = """<!DOCTYPE html>
               const res = await fetch('/api/project/create-folder', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name }) });
               const data = await res.json();
               if (!res.ok) { alert(data.error || 'Failed to create folder'); return; }
-              saveProjectSetting('default_project_folder', data.path);
+              saveProjectSettingBoth('default_project_folder', data.path, 'current_project_folder', data.path);
               sel.value = '__custom__';
-              customInput.value = data.path;
+              showFolderWraps(data.path);
+              await populateCustomDropdown(data.path);
+              if (customInput) customInput.value = data.path;
               newInput.value = '';
-              showFolderWraps();
               loadWorkspace();
               loadFileTree();
             } catch (e) { alert('Failed: ' + (e.message || 'Unknown error')); }
@@ -3282,6 +3579,34 @@ INDEX_HTML = """<!DOCTYPE html>
         function saveProjectSetting(key, value) {
           fetch('/api/ui-settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ [key]: value }) }).then(function() { loadWorkspace(); loadFileTree(); }).catch(function(){});
         }
+        function saveProjectSettingBoth(k1, v1, k2, v2) {
+          var payload = {};
+          payload[k1] = v1;
+          payload[k2] = v2;
+          fetch('/api/ui-settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }).then(function() { loadWorkspace(); loadFileTree(); }).catch(function(){});
+        }
+        function syncSidebarDropdownToWorkspace(workspace) {
+          if (!sel || !workspace) return;
+          var path = (workspace.path || '').trim();
+          var projectNone = workspace.project_none === true;
+          if (projectNone) {
+            sel.value = 'overstory';
+            if (customWrap) customWrap.style.display = 'none';
+            return;
+          }
+          var root = (workspace.root_workspace || '').replace(/\/$/, '');
+          if (path && path !== root) {
+            sel.value = '__custom__';
+            if (customWrap) customWrap.style.display = 'block';
+            populateCustomDropdown(path).then(function() {
+              if (customInput) customInput.value = path;
+            });
+          } else {
+            sel.value = 'overstory';
+            if (customWrap) customWrap.style.display = 'none';
+          }
+        }
+        window.syncSidebarDropdownToWorkspace = syncSidebarDropdownToWorkspace;
       })();
     }
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initSidebar); else initSidebar();
@@ -3864,48 +4189,95 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }
 
-    // Gateway health (bottom bar)
+    // Gateway health (bottom bar) — only update DOM when value changes
+    var lastGatewayOk = null;
+    var lastGatewayText = '';
+    var lastGatewayTitle = '';
     async function refreshGatewayHealth() {
       const el = document.getElementById('footerGatewayStatus');
       if (!el) return;
+      var ok = false;
+      var text = 'Gateway NOT OK';
+      var title = 'Gateway unreachable';
       try {
         const r = await fetch('/api/gateway/health', { cache: 'no-store' });
         const data = await r.json().catch(function() { return { ok: false }; });
-        const ok = r.ok && (data.ok === true || data.status === 'ok');
-        el.textContent = ok ? 'Gateway OK' : 'Gateway NOT OK';
-        el.className = 'footer-gateway ' + (ok ? 'ok' : 'not-ok');
-        el.title = ok ? 'Gateway is reachable' : (data.error || 'Gateway unreachable');
-      } catch (_) {
-        el.textContent = 'Gateway NOT OK';
-        el.className = 'footer-gateway not-ok';
-        el.title = 'Gateway unreachable';
-      }
+        ok = r.ok && (data.ok === true || data.status === 'ok');
+        text = ok ? 'Gateway OK' : 'Gateway NOT OK';
+        title = ok ? 'Gateway is reachable' : (data.error || 'Gateway unreachable');
+      } catch (_) {}
+      if (lastGatewayOk === ok && lastGatewayText === text && lastGatewayTitle === title) return;
+      lastGatewayOk = ok;
+      lastGatewayText = text;
+      lastGatewayTitle = title;
+      el.textContent = text;
+      el.className = 'footer-gateway ' + (ok ? 'ok' : 'not-ok');
+      el.title = title;
     }
 
-    // Session token usage (bottom bar)
+    // Session token usage (bottom bar) — scope toggle All / Project, only update DOM when values change
     function formatTokens(n) {
       if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
       if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
       return String(n);
     }
-    var lastSessionUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+    var tokenScope = 'all'; // 'all' | 'project'
+    var lastDisplayedIn = null, lastDisplayedOut = null, lastDisplayedTotal = null;
+    var lastDisplayedTotalError = false;
     async function refreshSessionUsage() {
+      var url = '/api/session-usage?scope=' + (tokenScope === 'project' ? 'project' : 'all');
+      if (tokenScope === 'project') {
+        try {
+          const w = await fetch('/api/workspace', { cache: 'no-store' });
+          const ws = await w.json();
+          var projectPath = (ws && ws.path) ? encodeURIComponent(ws.path) : '';
+          if (projectPath) url += '&project_path=' + projectPath;
+        } catch (_) {}
+      }
       try {
-        const r = await fetch('/api/session-usage');
+        const r = await fetch(url, { cache: 'no-store' });
         const data = await r.json();
         const inT = data.inputTokens || 0;
         const outT = data.outputTokens || 0;
         const total = data.totalTokens || inT + outT;
-        if (inT === lastSessionUsage.inputTokens && outT === lastSessionUsage.outputTokens) return;
-        lastSessionUsage = { inputTokens: inT, outputTokens: outT, totalTokens: total };
+        const strIn = formatTokens(inT);
+        const strOut = formatTokens(outT);
+        const strTotal = '(' + formatTokens(total) + ' total)';
+        if (lastDisplayedIn === strIn && lastDisplayedOut === strOut && lastDisplayedTotal === strTotal && !lastDisplayedTotalError) return;
+        lastDisplayedIn = strIn;
+        lastDisplayedOut = strOut;
+        lastDisplayedTotal = strTotal;
+        lastDisplayedTotalError = false;
         const elIn = document.getElementById('footerTokenIn');
         const elOut = document.getElementById('footerTokenOut');
         const elTotal = document.getElementById('footerTokenTotal');
-        if (elIn) elIn.textContent = formatTokens(inT);
-        if (elOut) elOut.textContent = formatTokens(outT);
-        if (elTotal) elTotal.textContent = '(' + formatTokens(total) + ' total)';
-      } catch (_) {}
+        if (elIn) elIn.textContent = strIn;
+        if (elOut) elOut.textContent = strOut;
+        if (elTotal) elTotal.textContent = strTotal;
+      } catch (_) {
+        if (lastDisplayedTotalError) return;
+        lastDisplayedTotalError = true;
+        lastDisplayedTotal = null;
+        const elTotal = document.getElementById('footerTokenTotal');
+        if (elTotal) elTotal.textContent = '(—)';
+      }
     }
+    (function initTokenScopeToggle() {
+      const btnAll = document.getElementById('tokenScopeAll');
+      const btnProject = document.getElementById('tokenScopeProject');
+      if (!btnAll || !btnProject) return;
+      function setScope(scope) {
+        tokenScope = scope;
+        btnAll.classList.toggle('active', scope === 'all');
+        btnProject.classList.toggle('active', scope === 'project');
+        lastDisplayedIn = null;
+        lastDisplayedOut = null;
+        lastDisplayedTotal = null;
+        refreshSessionUsage();
+      }
+      btnAll.addEventListener('click', function() { setScope('all'); });
+      btnProject.addEventListener('click', function() { setScope('project'); });
+    })();
 
     // Refresh functions
     function refreshNow() {
@@ -4125,37 +4497,54 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }
 
-    // Chat functionality (unified /api/message: Mistral analyzes → direct answer / follow-up / handoff)
+    // Chat: unified /api/message → orchestrator (Z AI GLM)
     const chatHistory = document.getElementById('chatHistory');
     const chatInput = document.getElementById('chatInput');
     const sendBtn = document.getElementById('sendBtn');
     const chatStatus = document.getElementById('chatStatus');
     let chatHistoryList = [];
-    let pendingFollowUp = null;  // { original_message, questions } when need_follow_up returned
+    let pendingFollowUp = null;
 
     function appendChat(role, text, isError) {
       chatHistoryList.push({ role, text, isError });
       const div = document.createElement('div');
       div.className = 'terminal-line ' + (isError ? 'error' : role === 'user' ? 'user' : 'info');
-      div.textContent = (role === 'user' ? 'You: ' : 'Orchestrator: ') + text;
+      div.textContent = (role === 'user' ? 'You: ' : 'Orchestrator: ') + (text != null ? String(text) : '');
       chatHistory.appendChild(div);
       chatHistory.scrollTop = chatHistory.scrollHeight;
     }
 
+    var thinkingConsoleInterval = null;
     function showThinking() {
-      const row = document.getElementById('thinkingRow');
+      const showToggle = document.getElementById('showThinking');
+      const consoleEl = document.getElementById('thinkingConsole');
+      if (showToggle && !showToggle.checked) return;
+      if (consoleEl) {
+        consoleEl.textContent = '[' + new Date().toTimeString().slice(0, 8) + '] Orchestrator thinking...';
+        consoleEl.classList.add('active');
+        let dots = 0;
+        thinkingConsoleInterval = setInterval(function() {
+          if (!consoleEl.classList.contains('active')) { clearInterval(thinkingConsoleInterval); return; }
+          dots = (dots + 1) % 4;
+          consoleEl.textContent = '[' + new Date().toTimeString().slice(0, 8) + '] Orchestrator thinking' + '.'.repeat(dots);
+        }, 500);
+      }
+      let row = document.getElementById('thinkingRow');
       if (row) return;
-      const div = document.createElement('div');
-      div.id = 'thinkingRow';
-      div.className = 'terminal-line thinking-row';
-      div.innerHTML = 'Orchestrator: Thinking <span class="dot"></span><span class="dot"></span><span class="dot"></span>';
-      chatHistory.appendChild(div);
+      row = document.createElement('div');
+      row.id = 'thinkingRow';
+      row.className = 'terminal-line thinking-row';
+      row.innerHTML = 'Orchestrator: Thinking <span class="dot"></span><span class="dot"></span><span class="dot"></span>';
+      chatHistory.appendChild(row);
       chatHistory.scrollTop = chatHistory.scrollHeight;
     }
 
     function hideThinking() {
       const row = document.getElementById('thinkingRow');
       if (row) row.remove();
+      const consoleEl = document.getElementById('thinkingConsole');
+      if (consoleEl) { consoleEl.classList.remove('active'); consoleEl.textContent = ''; }
+      if (thinkingConsoleInterval) { clearInterval(thinkingConsoleInterval); thinkingConsoleInterval = null; }
     }
 
     async function sendMessage() {
@@ -4221,7 +4610,7 @@ INDEX_HTML = """<!DOCTYPE html>
             appendChat('assistant', data.response);
           } else if (data.spawned !== undefined || data.capability) {
             const spawned = data.spawned || data.spawn_result;
-            const summary = spawned ? 'Task routed; agent spawned.' : (data.capability ? `Routed (${data.capability}).` : 'Routed.');
+            const summary = spawned ? 'Task routed; agent spawned.' : (data.capability ? 'Routed (' + data.capability + ').' : 'Routed.');
             appendChat('assistant', summary + (data.message ? ' ' + data.message : '') + (data.spawn_error ? ' Spawn error: ' + data.spawn_error : '') + (data.created_project ? ' Project folder: ' + data.created_project : ''));
           } else {
             appendChat('assistant', data.response || data.message || JSON.stringify(data));
@@ -4231,7 +4620,11 @@ INDEX_HTML = """<!DOCTYPE html>
         hideThinking();
         chatStatus.textContent = '';
         chatStatus.classList.remove('thinking');
-        appendChat('assistant', 'Error: ' + e.message, true);
+        var msg = e.message || String(e);
+        if (msg === 'Failed to fetch' || msg.indexOf('fetch') !== -1) {
+          msg = 'Request failed. Ensure the OverClaw gateway is running (port 18800) and ZAI_API_KEY is set in .env. Run: ./scripts/start-overclaw.sh';
+        }
+        appendChat('assistant', 'Error: ' + msg, true);
       }
       sendBtn.disabled = false;
     }
@@ -4320,6 +4713,88 @@ INDEX_HTML = """<!DOCTYPE html>
       if (cancelBtn) cancelBtn.addEventListener('click', closeModal);
       if (saveBtn) saveBtn.addEventListener('click', saveSettings);
       if (modal) modal.addEventListener('click', function(e) { if (e.target === modal) closeModal(); });
+
+      // Nanoclaw setup wizard: open from settings, run steps with console activity
+      (function() {
+        const wizardModal = document.getElementById('nanoclawWizardModal');
+        const wizardConsole = document.getElementById('nanoclawWizardConsole');
+        const wizardRunBtn = document.getElementById('nanoclawWizardRun');
+        const wizardCloseBtn = document.getElementById('nanoclawWizardClose');
+        const wizardOpenBtn = document.getElementById('nanoclawWizardBtn');
+        function ts() { return new Date().toTimeString().slice(0, 8); }
+        function log(line, status) {
+          const div = document.createElement('div');
+          div.className = 'wizard-line' + (status === 'ok' ? ' wizard-ok' : status === 'fail' ? ' wizard-fail' : '');
+          const spanTs = document.createElement('span');
+          spanTs.className = 'wizard-ts';
+          spanTs.textContent = '[' + ts() + '] ';
+          div.appendChild(spanTs);
+          const icon = status === 'ok' ? '\u2713 ' : status === 'fail' ? '\u2717 ' : ' ';
+          div.appendChild(document.createTextNode(icon + (typeof line === 'string' ? line : String(line))));
+          wizardConsole.appendChild(div);
+          wizardConsole.scrollTop = wizardConsole.scrollHeight;
+        }
+        function clearConsole() {
+          wizardConsole.innerHTML = '';
+        }
+        wizardOpenBtn && wizardOpenBtn.addEventListener('click', function() {
+          wizardModal.classList.add('visible');
+          clearConsole();
+          log('Click Run to check gateway, Z AI, and chat.', null);
+        });
+        wizardCloseBtn && wizardCloseBtn.addEventListener('click', function() { wizardModal.classList.remove('visible'); });
+        wizardModal && wizardModal.addEventListener('click', function(e) { if (e.target === wizardModal) wizardModal.classList.remove('visible'); });
+        wizardRunBtn && wizardRunBtn.addEventListener('click', async function() {
+          const btn = wizardRunBtn;
+          btn.disabled = true;
+          clearConsole();
+          log('Step 1: Checking gateway reachability…', null);
+          try {
+            const r = await fetch('/api/gateway/health', { cache: 'no-store' });
+            const data = await r.json().catch(function() { return {}; });
+            const ok = r.ok && (data.status === 'ok' || data.ok === true);
+            if (ok) log('Gateway reachable (port ' + (data.port || '18800') + ')', 'ok');
+            else log('Gateway unreachable. Start with ./scripts/start-overclaw.sh', 'fail');
+          } catch (e) {
+            log('Gateway unreachable: ' + (e.message || e), 'fail');
+          }
+          log('Step 2: Checking orchestrator (Z AI) config…', null);
+          try {
+            const r = await fetch('/api/gateway/status', { cache: 'no-store' });
+            const data = await r.json().catch(function() { return {}; });
+            const orch = data.orchestrator || {};
+            const configured = !!orch.configured;
+            const model = orch.model || '—';
+            if (configured) log('Z AI key set, model: ' + model, 'ok');
+            else log('ZAI_API_KEY not set. Add it to .env and restart the gateway.', 'fail');
+          } catch (e) {
+            log('Could not read gateway status: ' + (e.message || e), 'fail');
+          }
+          log('Step 3: Testing orchestrator chat…', null);
+          try {
+            const r = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'Setup test. Reply OK.' }) });
+            const data = await r.json().catch(function() { return {}; });
+            if (r.ok && (data.response || data.error === undefined)) log('Chat OK: orchestrator responded.', 'ok');
+            else log('Chat failed: ' + (data.error || 'No response'), 'fail');
+          } catch (e) {
+            log('Chat request failed: ' + (e.message || e), 'fail');
+          }
+          log('Step 4: Checking overstory…', null);
+          try {
+            const r = await fetch('/api/gateway/status', { cache: 'no-store' });
+            const data = await r.json().catch(function() { return {}; });
+            const ov = data.overstory || {};
+            const ovOk = ov.status === 'ok' || (ov.data && !ov.error);
+            if (ovOk) log('Overstory status OK.', 'ok');
+            else log('Overstory not ready (optional). Run overstory init if needed.', 'fail');
+          } catch (e) {
+            log('Overstory check skipped: ' + (e.message || e), 'fail');
+          }
+          log('Setup wizard finished.', null);
+          btn.disabled = false;
+        });
+      })();
+
       if (defaultFolderSel) defaultFolderSel.addEventListener('change', function() {
         const v = this.value;
         customPathWrap.style.display = v === '__custom__' ? 'block' : 'none';
@@ -4351,6 +4826,7 @@ INDEX_HTML = """<!DOCTYPE html>
         refreshBunLog();
         refreshTerminal();
         refreshSessionUsage();
+        refreshGatewayHealth();
         refreshTick++;
         if (refreshTick % 3 === 0) refreshAgentTerminals();
         if (document.querySelector('.tab[data-tab="kanban"]') && document.querySelector('.tab[data-tab="kanban"]').classList.contains('active')) refreshKanban();
@@ -4381,6 +4857,1749 @@ INDEX_HTML = """<!DOCTYPE html>
       } catch (_) {}
       refreshNow();
       startRefreshLoop();
+    })();
+
+    // --- CEO Office View: Theme Engine ---
+    (function() {
+      try {
+      if (typeof THREE === 'undefined') { console.warn('[CEO] THREE not loaded'); return; }
+      var ceoModal = document.getElementById('ceoModal');
+      var ceoCanvas = document.getElementById('ceoCanvas');
+      var ceoBtn = document.getElementById('ceoBtn');
+      var ceoClose = document.getElementById('ceoClose');
+      var ceoThemeSel = document.getElementById('ceoTheme');
+      var ceoCredit = document.getElementById('ceoCredit');
+      if (!ceoModal || !ceoCanvas || !ceoBtn || !ceoClose) { console.warn('[CEO] Missing DOM'); return; }
+
+      var scene, camera, renderer;
+      var agentSprites = {}, agentBubbles = {}, agentBadges = {};
+      var previousAgentList = [], terminalCache = {}, inboxCounts = {};
+      var lastPolledAgents = [];
+      var dialogAgent = null, dialogStreamTimer = null;
+      var agentDialogEl = document.getElementById('agentDialog');
+      var mailFlights = [], previousMailLength = 0;
+      var sendHomeQueue = [], sendHomeState = null, leadAgentName = null;
+      var ceoPollTimer = null, ceoAnimId = null, ceoOpen = false;
+      var activeTheme = null, themeState = {};
+      var POLL_MS = 5000, BUBBLE_LINES = 5, CAP_AGENTS = 8;
+      var texCache = {};
+      var agentAnimStates = {};
+
+      var PIXELS_PER_UNIT = 32;
+      var TARGET_H = 480;
+      var FRUSTUM_H = TARGET_H / PIXELS_PER_UNIT;
+
+      function isLead(a) { return a.capability === 'lead' || (a.name && a.name.indexOf('lead-') === 0); }
+
+      // --- Texture loader with cache ---
+      var texLoader = new THREE.TextureLoader();
+      function loadTex(url) {
+        if (texCache[url]) return Promise.resolve(texCache[url]);
+        return new Promise(function(ok, fail) {
+          texLoader.load(url, function(t) {
+            t.magFilter = THREE.NearestFilter;
+            t.minFilter = THREE.NearestMipmapNearestFilter;
+            t.colorSpace = THREE.SRGBColorSpace;
+            texCache[url] = t;
+            ok(t);
+          }, undefined, fail);
+        });
+      }
+
+      // Grid frame: clone texture and set UV for a cell in a grid sheet
+      function gridFrame(tex, col, row, cols, rows) {
+        var t = tex.clone();
+        t.repeat.set(1 / cols, 1 / rows);
+        t.offset.set(col / cols, 1 - (row + 1) / rows);
+        t.minFilter = t.magFilter = THREE.NearestFilter;
+        t.needsUpdate = true;
+        return t;
+      }
+      // Strip frame: horizontal strip, N frames
+      function stripFrame(tex, frame, total) {
+        var t = tex.clone();
+        t.repeat.set(1 / total, 1);
+        t.offset.set(frame / total, 0);
+        t.minFilter = t.magFilter = THREE.NearestFilter;
+        t.needsUpdate = true;
+        return t;
+      }
+
+      function makeSprite(tex, w, h) {
+        var mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+        var s = new THREE.Sprite(mat);
+        s.scale.set(w, h, 1);
+        return s;
+      }
+
+      function scaleSprite(sprite, texture) {
+        sprite.scale.set(texture.image.width / PIXELS_PER_UNIT, texture.image.height / PIXELS_PER_UNIT, 1);
+      }
+
+      function scaleSpriteFromStrip(sprite, texture, frameCount) {
+        if (!texture || !texture.image || !texture.image.width) {
+          sprite.scale.set(1, 1, 1);
+          return;
+        }
+        var fw = frameCount ? texture.image.width / frameCount : texture.image.width;
+        var fh = texture.image.height;
+        if (!fw || !fh) { sprite.scale.set(1, 1, 1); return; }
+        sprite.scale.set(fw / PIXELS_PER_UNIT, fh / PIXELS_PER_UNIT, 1);
+      }
+
+      function SpriteAnimState(totalFrames, fps) {
+        this.frame = 0;
+        this.timer = 0;
+        this.totalFrames = totalFrames;
+        this.fps = fps;
+      }
+
+      function animateStrip(sprite, tex, animState, delta) {
+        animState.timer += delta;
+        if (animState.timer >= 1 / animState.fps) {
+          animState.timer = 0;
+          animState.frame = (animState.frame + 1) % animState.totalFrames;
+          sprite.material.map = stripFrame(tex, animState.frame, animState.totalFrames);
+          sprite.material.map.needsUpdate = true;
+        }
+      }
+
+      function disposeObject(obj) {
+        if (obj.geometry) obj.geometry.dispose();
+        if (obj.material) {
+          if (Array.isArray(obj.material)) {
+            obj.material.forEach(function(m) { if (m.map) m.map.dispose(); m.dispose(); });
+          } else {
+            if (obj.material.map) obj.material.map.dispose();
+            obj.material.dispose();
+          }
+        }
+        if (scene) scene.remove(obj);
+      }
+
+      // --- Bubble (shared) ---
+      function makeBubbleTexture(lines) {
+        var w = 256, h = 120;
+        var padding = 12;
+        var maxTextWidth = w - padding * 2;
+        var lineHeight = 14;
+        var c = document.createElement('canvas'); c.width = w; c.height = h;
+        var ctx = c.getContext('2d');
+        ctx.fillStyle = 'rgba(22,27,34,0.92)'; ctx.strokeStyle = '#30363d'; ctx.lineWidth = 2;
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') ctx.roundRect(4, 4, w - 8, h - 8, 8);
+        else ctx.rect(4, 4, w - 8, h - 8);
+        ctx.fill(); ctx.stroke();
+        ctx.fillStyle = '#e6edf3'; ctx.font = '11px ui-monospace,monospace'; ctx.textAlign = 'left';
+        var text = (lines || []).slice(-BUBBLE_LINES).join('\\n') || '...';
+        if (text.length > 400) text = text.slice(-400);
+        var y = 22;
+        var maxLines = Math.floor((h - y - padding) / lineHeight);
+        function wrapLine(str) {
+          var result = [];
+          var words = str.split(/\\s+/);
+          var line = '';
+          for (var i = 0; i < words.length; i++) {
+            var trial = line ? line + ' ' + words[i] : words[i];
+            if (ctx.measureText(trial).width <= maxTextWidth) {
+              line = trial;
+            } else {
+              if (line) result.push(line);
+              if (ctx.measureText(words[i]).width <= maxTextWidth) {
+                line = words[i];
+              } else {
+                var rest = words[i];
+                while (rest.length) {
+                  var chunk = rest;
+                  while (chunk.length && ctx.measureText(chunk).width > maxTextWidth) chunk = chunk.slice(0, -1);
+                  result.push(chunk);
+                  rest = rest.slice(chunk.length);
+                }
+                line = '';
+              }
+            }
+          }
+          if (line) result.push(line);
+          return result;
+        }
+        function truncateToFit(str) {
+          if (ctx.measureText(str).width <= maxTextWidth) return str;
+          var s = str + '\u2026';
+          while (s.length > 1 && ctx.measureText(s).width > maxTextWidth) s = str.slice(0, s.length - 2) + '\u2026';
+          return s;
+        }
+        var flat = [];
+        text.split('\\n').forEach(function(ln) {
+          var trimmed = ln.trim();
+          if (!trimmed) return;
+          wrapLine(trimmed).forEach(function(sub) { flat.push(sub); });
+        });
+        if (flat.length === 0) flat.push('...');
+        for (var i = 0; i < flat.length && i < maxLines && y < h - padding; i++) {
+          var display = truncateToFit(flat[i]);
+          ctx.fillText(display, padding, y);
+          y += lineHeight;
+        }
+        var tex = new THREE.CanvasTexture(c);
+        tex.minFilter = tex.magFilter = THREE.NearestFilter;
+        return tex;
+      }
+
+      // --- Speech bubbles: summarized task + mail + personality ---
+      function speechLinesForAgent(agent, inboxCount, mailForAgent, otherNames) {
+        var name = (agent && agent.name) ? agent.name : '';
+        var capability = ((agent && agent.capability) || '').toLowerCase();
+        var state = ((agent && agent.state) || '').toLowerCase();
+        var taskShort = (agent && agent.task_short) ? String(agent.task_short).trim() : '';
+        var taskFull = (agent && agent.task_full) ? String(agent.task_full).trim() : taskShort;
+        var isWorking = state.indexOf('work') !== -1 || (agent && agent.state_icon === '●');
+        var isLead = capability === 'lead' || (name && name.indexOf('lead') === 0);
+        var role = isLead ? 'lead' : (capability.indexOf('builder') !== -1 ? 'builder' : (capability.indexOf('scout') !== -1 ? 'scout' : (capability.indexOf('review') !== -1 ? 'reviewer' : 'default')));
+        var lines = [];
+        function hash(s) { var h = 0; for (var i = 0; i < (s || '').length; i++) h = ((h << 5) - h) + s.charCodeAt(i); return h >>> 0; }
+        var personalityIdx = hash(name) % 6;
+        var personalities = [
+          { idle: "Just thinking...", mail: "Ooh, mail!", wait: "I should ask my lead.", task: "On it." },
+          { idle: "Taking a breather.", mail: "Someone wrote me!", wait: "Agent is taking forever to reply.", task: "Got it." },
+          { idle: "Hmm.", mail: "More mail. Great.", wait: "This is hard, I should email my lead.", task: "Working on it." },
+          { idle: "Idle for now.", mail: "Mail from the team!", wait: "Waiting on a reply...", task: "Sure thing." },
+          { idle: "Standing by.", mail: "Inbox says hi.", wait: "Where's that reply?", task: "Let's go." },
+          { idle: "Chillin'.", mail: "Letter time!", wait: "Maybe I'll ping the lead.", task: "On the case." }
+        ];
+        var p = personalities[personalityIdx];
+        function shortenTask(t, maxLen) {
+          if (!t) return '';
+          t = t.replace(/^\\s+/, '').replace(/\\s+$/, '');
+          if (t.length <= (maxLen || 45)) return t;
+          var last = t.lastIndexOf('.', maxLen);
+          if (last > 20) return t.slice(0, last + 1);
+          if (t.lastIndexOf(' ', maxLen) > 15) return t.slice(0, t.lastIndexOf(' ', maxLen)) + '…';
+          return t.slice(0, maxLen - 1) + '…';
+        }
+        if (taskShort) {
+          var q = shortenTask(taskShort, 42);
+          if (q && q.indexOf('?') === -1 && q.length > 10 && !/^(fix|add|implement|write|run)/i.test(q)) q = q.replace(/\\.$/, '') + '?';
+          if (q) lines.push(q);
+        }
+        if (mailForAgent && mailForAgent.length > 0) {
+          var last = mailForAgent[0];
+          var from = (last.from || 'someone').replace(/[-0-9a-f]{4,}$/i, '').trim() || 'someone';
+          var subj = (last.subject || last.body || '').trim().slice(0, 28);
+          if (subj) lines.push("Mail from " + from + ": \\"" + subj + (subj.length >= 28 ? "…" : "") + "\\"");
+          else lines.push("Mail from " + from + "!");
+        } else if (inboxCount > 0) lines.push(p.mail);
+        if (isLead) {
+          if (lines.length === 0) lines.push("Keeping an eye on everyone.");
+        } else if (role === 'reviewer' && isWorking && otherNames && otherNames.length > 0) {
+          var other = otherNames[hash(name + 'x') % otherNames.length];
+          if (other && other !== name) {
+            if (lines.length === 0) lines.push("Reviewing " + other + "'s work.");
+            else if (lines.length === 1) lines.push("Reviewing " + other + "'s work.");
+          }
+        }
+        if (lines.length === 0) {
+          if (isWorking) lines.push(p.task);
+          else lines.push(p.idle);
+        }
+        if (lines.length < 2 && isWorking && !isLead && Math.abs(hash(name + 'w')) % 3 === 0) lines.push(p.wait);
+        return lines.slice(0, 3);
+      }
+
+      // --- Station positions for themed layouts ---
+      var ZOMBIE_POSITIONS = [
+        { x: 0, y: 0.01, z: -1, role: 'lead' },
+        { x: -3, y: 0.01, z: 0, role: 'builder' },
+        { x: 3, y: 0.01, z: 0, role: 'builder' },
+        { x: -6, y: 0.01, z: 1, role: 'scout' },
+        { x: 6, y: 0.01, z: 1, role: 'scout' },
+        { x: -2, y: 0.01, z: 2.5, role: 'reviewer' },
+        { x: 2, y: 0.01, z: 2.5, role: 'default' },
+        { x: 0, y: 0.01, z: 3.5, role: 'default' }
+      ];
+      var SUNNYSIDE_POSITIONS = [
+        { x: 0, y: 0.01, z: -2, role: 'lead' },
+        { x: -4, y: 0.01, z: -0.5, role: 'builder' },
+        { x: 4, y: 0.01, z: -0.5, role: 'builder' },
+        { x: -6, y: 0.01, z: 1.5, role: 'scout' },
+        { x: 6, y: 0.01, z: 1.5, role: 'scout' },
+        { x: -2, y: 0.01, z: 2, role: 'reviewer' },
+        { x: 2, y: 0.01, z: 2, role: 'reviewer' },
+        { x: 0, y: 0.01, z: 3.5, role: 'default' }
+      ];
+
+      function getAgentRole(a) {
+        if (isLead(a)) return 'lead';
+        var c = (a.capability || '').toLowerCase();
+        if (c.indexOf('builder') !== -1) return 'builder';
+        if (c.indexOf('scout') !== -1) return 'scout';
+        if (c.indexOf('review') !== -1) return 'reviewer';
+        return 'default';
+      }
+
+      function assignPositions(agents, positions) {
+        var map = {};
+        var used = {};
+        for (var i = 0; i < agents.length && i < CAP_AGENTS; i++) {
+          var role = getAgentRole(agents[i]);
+          var bestIdx = -1;
+          for (var j = 0; j < positions.length; j++) {
+            if (used[j]) continue;
+            if (positions[j].role === role) { bestIdx = j; break; }
+          }
+          if (bestIdx < 0) {
+            for (var j2 = 0; j2 < positions.length; j2++) { if (!used[j2]) { bestIdx = j2; break; } }
+          }
+          if (bestIdx >= 0) { used[bestIdx] = true; map[agents[i].name] = positions[bestIdx]; }
+        }
+        return map;
+      }
+
+      // =============== ZOMBIE THEME ===============
+      var zombieTheme = {
+        name: 'Zombie Survival',
+        credit: 'Post-Apocalypse pack',
+        bg: 0x0a0e0a,
+        positions: ZOMBIE_POSITIONS,
+        mailColor: 0xffa657,
+        homeX: 12,
+        textures: {},
+        objects: [],
+        zombies: [],
+
+        preload: function() {
+          var base = '/static/pa/';
+          var paths = [
+            'Character/Main/Idle/Character_side_idle-Sheet6.png',
+            'Character/Main/Run/Character_side_run-Sheet6.png',
+            'Character/Main/Punch/Character_side_punch-Sheet4.png',
+            'Character/Bat/Bat_side_idle-and-run-Sheet6.png',
+            'Character/Bat/Bat_side_attack-Sheet4.png',
+            'Character/Guns/Gun/Gun_side_idle-and-run-Sheet6.png',
+            'Character/Guns/Gun/Gun_side_shoot-Sheet3.png',
+            'Character/Main/Pick-up/Character_side_Pick-up-Sheet3.png',
+            'Enemies/Zombie_Small/Zombie_Small_Side_Walk-Sheet6.png',
+            'Enemies/Zombie_Small/Zombie_Small_Side_Idle-Sheet6.png',
+            'Enemies/Zombie_Big/Zombie_Big_Side_Walk-Sheet8.png'
+          ];
+          var self = this;
+          return Promise.all(paths.map(function(p) {
+            return loadTex(base + p).then(function(t) { self.textures[p] = t; }).catch(function() {});
+          })).then(function() { console.log('[CEO:Zombie] Textures loaded'); });
+        },
+
+        initScene: function() {
+          var self = this;
+          self.objects = []; self.zombies = [];
+
+          // Atmosphere: thick fog for post-apocalyptic feel
+          scene.fog = new THREE.FogExp2(0x1a1812, 0.045);
+          scene.background = new THREE.Color(self.bg);
+
+          // Lighting: low sun (warm orange), dim ambient, fire point lights
+          scene.add(new THREE.AmbientLight(0x332211, 0.5));
+          var sun = new THREE.DirectionalLight(0xff8844, 1.0);
+          sun.position.set(-8, 18, 10);
+          sun.castShadow = false;
+          scene.add(sun);
+          var fill = new THREE.DirectionalLight(0x443322, 0.35);
+          fill.position.set(5, 8, -5);
+          scene.add(fill);
+          var fire1 = new THREE.PointLight(0xff5522, 1.2, 12);
+          fire1.position.set(5.5, 0.8, -1.8);
+          scene.add(fire1); self.objects.push(fire1);
+          var fire2 = new THREE.PointLight(0xff4422, 0.9, 10);
+          fire2.position.set(-5.2, 0.7, 2.2);
+          scene.add(fire2); self.objects.push(fire2);
+
+          // Ground: dark cracked earth (larger)
+          var floorGeo = new THREE.PlaneGeometry(36, 22);
+          var floorMat = new THREE.MeshLambertMaterial({ color: 0x1e2618, side: THREE.DoubleSide });
+          var floor = new THREE.Mesh(floorGeo, floorMat);
+          floor.rotation.x = -Math.PI / 2; floor.position.y = -0.02;
+          scene.add(floor); self.objects.push(floor);
+
+          // Main road (cross shape)
+          var pathMat = new THREE.MeshLambertMaterial({ color: 0x3d3d3d, side: THREE.DoubleSide });
+          [[0, 0, 4, 22], [0, 0, 28, 2.2]].forEach(function(r) {
+            var pathGeo = new THREE.PlaneGeometry(r[2], r[3]);
+            var pathMesh = new THREE.Mesh(pathGeo, pathMat);
+            pathMesh.rotation.x = -Math.PI / 2; pathMesh.position.set(r[0], -0.015, r[1]);
+            scene.add(pathMesh); self.objects.push(pathMesh);
+          });
+
+          // Grass/debris patches (darker, varied)
+          var grassMat = new THREE.MeshLambertMaterial({ color: 0x2d3d22, side: THREE.DoubleSide });
+          [[-8, 3], [-4, -4], [6, 4], [9, -3], [-10, -2], [3, -5], [-7, 5]].forEach(function(p) {
+            var gg = new THREE.PlaneGeometry(3 + Math.random() * 2, 2.5 + Math.random());
+            var gm = new THREE.Mesh(gg, grassMat);
+            gm.rotation.x = -Math.PI / 2; gm.position.set(p[0], -0.01, p[1]);
+            scene.add(gm); self.objects.push(gm);
+          });
+
+          // Ruined shelter: posts + broken wall
+          var wallMat = new THREE.MeshLambertMaterial({ color: 0x5c4a32 });
+          [[-2.6, 1.0, -1.6], [2.6, 1.0, -1.6], [-2.6, 1.0, 1.1], [2.6, 1.0, 1.1]].forEach(function(p) {
+            var wg = new THREE.BoxGeometry(0.7, 2.0, 0.7);
+            var w = new THREE.Mesh(wg, wallMat);
+            w.position.set(p[0], p[1], p[2]); scene.add(w); self.objects.push(w);
+          });
+          var roofGeo = new THREE.PlaneGeometry(8.5, 5.5);
+          var roofMat = new THREE.MeshLambertMaterial({ color: 0x3d2e1a, side: THREE.DoubleSide });
+          var roof = new THREE.Mesh(roofGeo, roofMat);
+          roof.rotation.x = -Math.PI / 2; roof.position.set(0, 2.1, -0.2);
+          scene.add(roof); self.objects.push(roof);
+
+          // Barrels + rubble (more clusters)
+          var barrelMat = new THREE.MeshLambertMaterial({ color: 0x6b3510 });
+          [[5.2, 0.6, -2], [5.8, 0.6, -1.4], [5.4, 0.6, -0.9], [-5.2, 0.6, 2.2], [-5.8, 0.6, 2.6], [-5.4, 0.6, 1.8], [0, 0.4, -4.5]].forEach(function(p) {
+            var bg = new THREE.BoxGeometry(0.65, p[1] * 2, 0.65);
+            var b = new THREE.Mesh(bg, barrelMat);
+            b.position.set(p[0], p[1], p[2]); scene.add(b); self.objects.push(b);
+          });
+          var rubbleMat = new THREE.MeshLambertMaterial({ color: 0x4a4a4a });
+          [[-9, 0.3, 1], [-9.5, 0.25, 0.5], [8, 0.35, -2], [8.5, 0.3, -1.5]].forEach(function(p) {
+            var rg = new THREE.BoxGeometry(1.2, p[1], 0.8);
+            var r = new THREE.Mesh(rg, rubbleMat);
+            r.position.set(p[0], p[1], p[2]); scene.add(r); self.objects.push(r);
+          });
+
+          // Fence line (back of scene)
+          var fenceMat = new THREE.MeshLambertMaterial({ color: 0x454545 });
+          for (var fx = -12; fx <= 12; fx += 2.0) {
+            var fg = new THREE.BoxGeometry(1.9, 1.1, 0.15);
+            var f = new THREE.Mesh(fg, fenceMat);
+            f.position.set(fx, 0.5, -5.2); scene.add(f); self.objects.push(f);
+          }
+
+          // Ruined buildings (blocky structures)
+          var buildingMat = new THREE.MeshLambertMaterial({ color: 0x4a4035 });
+          var buildingMat2 = new THREE.MeshLambertMaterial({ color: 0x3d352a });
+          [[-10, 1.2, 4], [11, 1.0, 3], [-11, 0.8, -2], [9, 1.4, -3]].forEach(function(p, i) {
+            var bw = 2.5 + (i % 2) * 1.5, bd = 2 + (i % 2), bh = 2 + Math.random() * 1.5;
+            var bg = new THREE.BoxGeometry(bw, bh, bd);
+            var b = new THREE.Mesh(bg, i % 2 ? buildingMat2 : buildingMat);
+            b.position.set(p[0], p[1], p[2]);
+            scene.add(b); self.objects.push(b);
+          });
+
+          // Broken walls and barriers
+          [[-7, 0.9, 4.5], [7, 0.8, 4], [-8, 0.7, -4], [10, 0.9, -2]].forEach(function(p) {
+            var wg = new THREE.BoxGeometry(2.2, 1.4, 0.4);
+            var w = new THREE.Mesh(wg, wallMat);
+            w.position.set(p[0], p[1], p[2]);
+            scene.add(w); self.objects.push(w);
+          });
+
+          // Crates and pallets
+          [[3, 0.35, 2], [3.6, 0.35, 2.3], [4, 0.35, 1.8], [-4, 0.4, -3], [-4.5, 0.4, -2.8]].forEach(function(p) {
+            var cg = new THREE.BoxGeometry(0.8, 0.7, 0.6);
+            var c = new THREE.Mesh(cg, barrelMat);
+            c.position.set(p[0], p[1], p[2]);
+            scene.add(c); self.objects.push(c);
+          });
+
+          // Zombies: mix of small (walk + idle) and big (walk), at multiple depths
+          var zwTex = self.textures['Enemies/Zombie_Small/Zombie_Small_Side_Walk-Sheet6.png'];
+          var ziTex = self.textures['Enemies/Zombie_Small/Zombie_Small_Side_Idle-Sheet6.png'];
+          var zbTex = self.textures['Enemies/Zombie_Big/Zombie_Big_Side_Walk-Sheet8.png'];
+          var zombieSpecs = [
+            { tex: zwTex, frames: 6, w: 3.0, h: 2.0, x: -8, z: -5.2, vx: 0.4, idle: false },
+            { tex: zbTex, frames: 8, w: 3.2, h: 2.2, x: -3, z: -5.2, vx: 0.25, idle: false },
+            { tex: ziTex, frames: 6, w: 3.0, h: 2.0, x: 2, z: -5.2, vx: 0, idle: true },
+            { tex: zwTex, frames: 6, w: 3.0, h: 2.0, x: 7, z: -5.2, vx: -0.35, idle: false },
+            { tex: zbTex, frames: 8, w: 3.2, h: 2.2, x: -6, z: -3.5, vx: 0.3, idle: false },
+            { tex: zwTex, frames: 6, w: 3.0, h: 2.0, x: 6, z: -3.8, vx: -0.4, idle: false },
+            { tex: ziTex, frames: 6, w: 3.0, h: 2.0, x: 0, z: -4, vx: 0, idle: true },
+            { tex: zbTex, frames: 8, w: 3.2, h: 2.2, x: 9, z: 2, vx: -0.28, idle: false },
+            { tex: zwTex, frames: 6, w: 3.0, h: 2.0, x: -9, z: 3, vx: 0.35, idle: false }
+          ];
+          zombieSpecs.forEach(function(spec) {
+            var zt = spec.tex;
+            if (!zt) return;
+            var zf = stripFrame(zt, 0, spec.frames);
+            var zs = makeSprite(zf, spec.w, spec.h);
+            scaleSpriteFromStrip(zs, zt, spec.frames);
+            zs.position.set(spec.x, 1.0, spec.z);
+            scene.add(zs); self.objects.push(zs);
+            self.zombies.push({
+              sprite: zs, x: spec.x, z: spec.z, vx: spec.vx, origVx: spec.vx,
+              frames: spec.frames, tex: zt, origTex: zt,
+              animState: new SpriteAnimState(spec.frames, 5 + Math.random() * 2),
+              idle: spec.idle, stateTimer: Math.random() * 5, isSmall: (spec.frames === 6 && !spec.idle)
+            });
+          });
+
+          console.log('[CEO:Zombie] Scene built');
+        },
+
+        updateAgents: function(agents, posMap, delta) {
+          var self = this;
+          for (var i = 0; i < agents.length && i < CAP_AGENTS; i++) {
+            var a = agents[i];
+            var pos = posMap[a.name];
+            if (!pos) continue;
+            var role = getAgentRole(a);
+            if (!agentAnimStates[a.name]) {
+              agentAnimStates[a.name] = { actionPhase: false, phaseTimer: 0, animState: new SpriteAnimState(6, 5), currentTex: null, currentFrames: 6 };
+            }
+            var st = agentAnimStates[a.name];
+            st.phaseTimer += delta || 0.016;
+            if (st.phaseTimer > 4) { st.actionPhase = !st.actionPhase; st.phaseTimer = 0; st.animState.frame = 0; st.animState.timer = 0; }
+            var tex, totalFrames;
+            if (role === 'lead') {
+              var idleTex = self.textures['Character/Guns/Gun/Gun_side_idle-and-run-Sheet6.png'];
+              var shootTex = self.textures['Character/Guns/Gun/Gun_side_shoot-Sheet3.png'];
+              if (st.actionPhase && shootTex) { tex = shootTex; totalFrames = 3; }
+              else if (idleTex) { tex = idleTex; totalFrames = 6; }
+            } else if (role === 'builder') {
+              var punchTex = self.textures['Character/Main/Punch/Character_side_punch-Sheet4.png'];
+              var idleTex2 = self.textures['Character/Main/Idle/Character_side_idle-Sheet6.png'];
+              if (st.actionPhase && punchTex) { tex = punchTex; totalFrames = 4; }
+              else if (idleTex2) { tex = idleTex2; totalFrames = 6; }
+            } else if (role === 'scout') {
+              var runTex = self.textures['Character/Main/Run/Character_side_run-Sheet6.png'];
+              if (runTex) { tex = runTex; totalFrames = 6; }
+            } else if (role === 'reviewer') {
+              var batIdleTex = self.textures['Character/Bat/Bat_side_idle-and-run-Sheet6.png'];
+              var batAtkTex = self.textures['Character/Bat/Bat_side_attack-Sheet4.png'];
+              if (st.actionPhase && batAtkTex) { tex = batAtkTex; totalFrames = 4; }
+              else if (batIdleTex) { tex = batIdleTex; totalFrames = 6; }
+            } else {
+              var pickTex = self.textures['Character/Main/Pick-up/Character_side_Pick-up-Sheet3.png'];
+              var idleTex3 = self.textures['Character/Main/Idle/Character_side_idle-Sheet6.png'];
+              if (st.actionPhase && pickTex) { tex = pickTex; totalFrames = 3; }
+              else if (idleTex3) { tex = idleTex3; totalFrames = 6; }
+            }
+            if (!tex) continue;
+            if (st.currentTex !== tex) { st.currentTex = tex; st.currentFrames = totalFrames; st.animState = new SpriteAnimState(totalFrames, 5); }
+            if (!agentSprites[a.name]) {
+              var ft = stripFrame(tex, 0, totalFrames);
+              var s = makeSprite(ft, 3.0, 2.0);
+              scaleSpriteFromStrip(s, tex, totalFrames);
+              s._baseScaleX = s.scale.x; s._baseScaleY = s.scale.y;
+              s.position.set(pos.x, pos.y + 1.0, pos.z);
+              scene.add(s); agentSprites[a.name] = s;
+            } else {
+              animateStrip(agentSprites[a.name], tex, st.animState, delta || 0.016);
+              agentSprites[a.name].position.set(pos.x, pos.y + 1.0, pos.z);
+            }
+          }
+        },
+
+        tickAmbient: function(delta) {
+          var self = this;
+          var ziTex = self.textures['Enemies/Zombie_Small/Zombie_Small_Side_Idle-Sheet6.png'];
+          self.zombies.forEach(function(z) {
+            // Small walking zombies cycle between walk and idle
+            if (z.isSmall && ziTex) {
+              z.stateTimer += delta;
+              if (!z.idle && z.stateTimer > 5 + Math.random() * 3) {
+                z.idle = true; z.stateTimer = 0; z.vx = 0;
+                z.tex = ziTex; z.frames = 6;
+                z.animState = new SpriteAnimState(6, 4);
+              } else if (z.idle && z.stateTimer > 2.5) {
+                z.idle = false; z.stateTimer = 0;
+                z.vx = z.origVx || ((Math.random() > 0.5 ? 1 : -1) * 0.35);
+                z.tex = z.origTex; z.frames = 6;
+                z.animState = new SpriteAnimState(6, 5 + Math.random() * 2);
+              }
+            }
+            if (!z.idle && z.vx !== 0) {
+              z.x += z.vx * delta;
+              if (z.x > 11 || z.x < -11) z.vx = -z.vx;
+              z.sprite.position.x = z.x;
+              if (z.vx < 0) z.sprite.scale.x = -Math.abs(z.sprite.scale.x);
+              else z.sprite.scale.x = Math.abs(z.sprite.scale.x);
+            }
+            animateStrip(z.sprite, z.tex, z.animState, delta);
+          });
+        },
+
+        dispose: function() {
+          var self = this;
+          if (scene.fog) scene.fog = null;
+          self.objects.forEach(function(o) { disposeObject(o); });
+          self.zombies.forEach(function(z) { if (z.sprite) disposeObject(z.sprite); });
+          self.objects = []; self.zombies = [];
+        }
+      };
+
+
+      // =============== TINY WONDER FARM THEME ===============
+      var TINYFARM_POSITIONS = [
+        { x: -1, y: 0.01, z: -2.5, role: 'lead' },
+        { x: -4, y: 0.01, z: -0.5, role: 'builder' },
+        { x: 4, y: 0.01, z: -0.5, role: 'builder' },
+        { x: -6, y: 0.01, z: 1.5, role: 'scout' },
+        { x: 6, y: 0.01, z: 1.5, role: 'scout' },
+        { x: -2, y: 0.01, z: 2, role: 'reviewer' },
+        { x: 2, y: 0.01, z: 2, role: 'reviewer' },
+        { x: 0, y: 0.01, z: 3.5, role: 'default' }
+      ];
+
+      var tinyfarmTheme = {
+        name: 'Tiny Wonder Farm',
+        credit: 'Tiny Wonder Farm by Butterymilk; characters & elements by Daniel Diggle (Sunnyside World)',
+        bg: 0xa5c543,
+        positions: TINYFARM_POSITIONS,
+        mailColor: 0xf4b467,
+        homeX: -12,
+        textures: {},
+        objects: [],
+        plants: [],
+        plantTimer: 0,
+        animals: [],
+        crops: [],
+        enemies: [],
+        windmillSprite: null,
+        windmillAnimState: null,
+        fireSprites: [],
+        enemySpawnTimer: 0,
+        phaseTimer: 0,
+        combatPhase: false,
+
+        _hairForRole: function(role) {
+          var map = { lead: 'spikeyhair', builder: 'bowlhair', scout: 'longhair', reviewer: 'curlyhair', default: 'mophair' };
+          return map[role] || 'base';
+        },
+
+        _actionForRole: function(role, combat) {
+          if (combat) {
+            if (role === 'lead') return { folder: 'ATTACK', suf: 'attack', frames: 10 };
+            if (role === 'builder') return { folder: 'AXE', suf: 'axe', frames: 10 };
+            if (role === 'scout') return { folder: 'RUN', suf: 'run', frames: 8 };
+            if (role === 'reviewer') return { folder: 'ATTACK', suf: 'attack', frames: 10 };
+            return { folder: 'MINING', suf: 'mining', frames: 10 };
+          }
+          if (role === 'lead') return { folder: 'IDLE', suf: 'idle', frames: 9 };
+          if (role === 'builder') return { folder: 'HAMMERING', suf: 'hamering', frames: 23 };
+          if (role === 'scout') return { folder: 'WALKING', suf: 'walk', frames: 8 };
+          if (role === 'reviewer') return { folder: 'WATERING', suf: 'watering', frames: 5 };
+          return { folder: 'DIG', suf: 'dig', frames: 13 };
+        },
+
+        preload: function() {
+          var self = this;
+          var tfPaths = [
+            'characters/walk_idle.png',
+            'characters/walk_idle_old.png',
+            'characters/portrait_male.png',
+            'characters/portrait_female.png',
+            'characters/portrait_male_old.png',
+            'characters/portrait_female_old.png',
+            'objects/farm_objects.png',
+            'objects/plants.png',
+            'objects/furniture.png',
+            'objects/items.png',
+            'tilemaps/spring_farm.png',
+            'tilemaps/bridges.png',
+            'tilemaps/farm_inside.png',
+            'tilemaps/bg_tinyfarm.png'
+          ];
+          var swPaths = [
+            'Elements/Animals/spr_deco_chicken_01_strip4.png',
+            'Elements/Animals/spr_deco_cow_strip4.png',
+            'Elements/Animals/spr_deco_sheep_01_strip4.png',
+            'Elements/Animals/spr_deco_duck_01_strip4.png',
+            'Elements/Animals/spr_deco_pig_01_strip4.png',
+            'Elements/Animals/spr_deco_bird_01_strip4.png',
+            'Elements/Plants/spr_deco_tree_01_strip4.png',
+            'Elements/Plants/spr_deco_tree_02_strip4.png',
+            'Elements/Plants/spr_deco_mushroom_red_01_strip4.png',
+            'Elements/Plants/spr_deco_mushroom_blue_01_strip4.png',
+            'Elements/Other/spr_deco_windmill_strip9.png',
+            'Elements/VFX/Fire/spr_deco_fire_01_strip4.png',
+            'Elements/VFX/Glint/spr_deco_glint_01_strip6.png',
+            'Elements/Crops/sunflower_00.png', 'Elements/Crops/sunflower_01.png',
+            'Elements/Crops/sunflower_02.png', 'Elements/Crops/sunflower_03.png',
+            'Elements/Crops/sunflower_04.png', 'Elements/Crops/sunflower_05.png',
+            'Elements/Crops/cabbage_00.png', 'Elements/Crops/cabbage_01.png',
+            'Elements/Crops/cabbage_02.png', 'Elements/Crops/cabbage_03.png',
+            'Elements/Crops/cabbage_04.png', 'Elements/Crops/cabbage_05.png',
+            'Elements/Crops/carrot_00.png', 'Elements/Crops/carrot_01.png',
+            'Elements/Crops/carrot_02.png', 'Elements/Crops/carrot_03.png',
+            'Elements/Crops/carrot_04.png', 'Elements/Crops/carrot_05.png',
+            'Elements/Crops/seeds_generic.png', 'Elements/Crops/soil_00.png',
+            'Characters/Goblin/PNG/spr_idle_strip9.png',
+            'Characters/Goblin/PNG/spr_walk_strip8.png',
+            'Characters/Goblin/PNG/spr_attack_strip10.png',
+            'Characters/Goblin/PNG/spr_death_strip13.png',
+            'Characters/Skeleton/PNG/skeleton_idle_strip6.png',
+            'Characters/Skeleton/PNG/skeleton_walk_strip8.png',
+            'Characters/Skeleton/PNG/skeleton_attack_strip7.png',
+            'Characters/Skeleton/PNG/skeleton_death_strip10.png'
+          ];
+          var ssHairs = ['base', 'spikeyhair', 'bowlhair', 'longhair', 'curlyhair', 'mophair'];
+          var ssActions = [
+            { folder: 'IDLE', suf: 'idle', frames: 9 },
+            { folder: 'ATTACK', suf: 'attack', frames: 10 },
+            { folder: 'WALKING', suf: 'walk', frames: 8 },
+            { folder: 'WATERING', suf: 'watering', frames: 5 },
+            { folder: 'MINING', suf: 'mining', frames: 10 },
+            { folder: 'AXE', suf: 'axe', frames: 10 },
+            { folder: 'CARRY', suf: 'carry', frames: 8 },
+            { folder: 'DIG', suf: 'dig', frames: 13 },
+            { folder: 'RUN', suf: 'run', frames: 8 },
+            { folder: 'DOING', suf: 'doing', frames: 8 }
+          ];
+          ssHairs.forEach(function(h) {
+            ssActions.forEach(function(a) {
+              swPaths.push('Characters/Human/' + a.folder + '/' + h + '_' + a.suf + '_strip' + a.frames + '.png');
+            });
+            swPaths.push('Characters/Human/HAMMERING/' + h + '_hamering_strip23.png');
+          });
+
+          var p1 = Promise.all(tfPaths.map(function(p) {
+            return loadTex('/static/tf/' + p).then(function(t) { self.textures[p] = t; }).catch(function() {});
+          }));
+          var p2 = Promise.all(swPaths.map(function(p) {
+            return loadTex('/static/sw/' + p).then(function(t) { self.textures['sw:' + p] = t; }).catch(function() {});
+          }));
+          return Promise.all([p1, p2]).then(function() {
+            console.log('[CEO:TinyFarm] Textures loaded (' + Object.keys(self.textures).length + ')');
+          });
+        },
+
+        _regionSprite: function(texKey, px, py, pw, ph, scale) {
+          var tex = this.textures[texKey];
+          if (!tex) return null;
+          var t = tex.clone();
+          t.repeat.set(pw / tex.image.width, ph / tex.image.height);
+          t.offset.set(px / tex.image.width, 1 - (py + ph) / tex.image.height);
+          t.magFilter = THREE.NearestFilter;
+          t.minFilter = THREE.NearestFilter;
+          t.needsUpdate = true;
+          var mat = new THREE.SpriteMaterial({ map: t, transparent: true, depthTest: false });
+          var s = new THREE.Sprite(mat);
+          var sc = scale || 1;
+          s.scale.set(sc * pw / PIXELS_PER_UNIT, sc * ph / PIXELS_PER_UNIT, 1);
+          return s;
+        },
+
+        _addObj: function(s, x, y, z) {
+          if (!s) return;
+          s.position.set(x, y, z);
+          scene.add(s); this.objects.push(s);
+        },
+
+        _swTex: function(key) { return this.textures['sw:' + key]; },
+
+        initScene: function() {
+          var self = this;
+          self.objects = []; self.plants = []; self.plantTimer = 0;
+          self.animals = []; self.crops = []; self.enemies = [];
+          self.fireSprites = []; self.windmillSprite = null;
+          self.windmillAnimState = null; self.enemySpawnTimer = 0;
+          self.phaseTimer = 0; self.combatPhase = false;
+          self.propPositions = [];
+
+          function addProp(x, z) { self.propPositions.push({ x: x, z: z }); }
+
+          // ---- FLOOR ----
+          var bgTex = self.textures['tilemaps/bg_tinyfarm.png'];
+          var floorGeo = new THREE.PlaneGeometry(28, 16);
+          var floorMat;
+          if (bgTex) {
+            bgTex.magFilter = THREE.NearestFilter;
+            bgTex.minFilter = THREE.NearestMipmapNearestFilter;
+            floorMat = new THREE.MeshBasicMaterial({ map: bgTex, side: THREE.DoubleSide });
+          } else {
+            floorMat = new THREE.MeshBasicMaterial({ color: 0xa5c543, side: THREE.DoubleSide });
+          }
+          var floor = new THREE.Mesh(floorGeo, floorMat);
+          floor.rotation.x = -Math.PI / 2; floor.position.y = -0.01;
+          scene.add(floor); self.objects.push(floor);
+
+          // Path/road overlay (tan strip along z:-1..0.5)
+          var pathGeo = new THREE.PlaneGeometry(26, 2.2);
+          var pathMat = new THREE.MeshBasicMaterial({ color: 0xd4a574, side: THREE.DoubleSide });
+          var pathMesh = new THREE.Mesh(pathGeo, pathMat);
+          pathMesh.rotation.x = -Math.PI / 2;
+          pathMesh.position.set(0, 0, -0.25);
+          scene.add(pathMesh); self.objects.push(pathMesh);
+
+          // ==== ZONE 1: HOUSE (x:-5..-1, z:-7.5..-5) ====
+          var house = self._regionSprite('objects/farm_objects.png', 0, 96, 128, 95);
+          self._addObj(house, -3, 1.5, -6.5);
+          addProp(-3, -6.5);
+
+          // Door ON the house front (farm_objects.png ~px 130,130 16x48)
+          var door = self._regionSprite('objects/farm_objects.png', 128, 128, 16, 48, 1.2);
+          self._addObj(door, -3, 0.9, -5.7);
+          addProp(-3, -5.7);
+
+          // Mill structure from farm_inside.png near the house
+          var millTex = self.textures['tilemaps/farm_inside.png'];
+          if (millTex) {
+            var mill = self._regionSprite('tilemaps/farm_inside.png', 0, 0, 96, 80, 1.2);
+            self._addObj(mill, -0.5, 1.5, -6.8);
+          }
+
+          // Furniture grouped around house (all 15 frames, 5x3 grid @16px)
+          var furnTex = self.textures['objects/furniture.png'];
+          if (furnTex) {
+            var furnPlacements = [
+              [0, 0, -2.0, 0.4, -5.6],
+              [1, 0, -4.5, 0.4, -6.0],
+              [2, 0, -1.5, 0.4, -5.5],
+              [3, 0, -4.0, 0.4, -5.5],
+              [4, 0, -1.0, 0.4, -6.3],
+              [0, 1, -4.5, 0.4, -6.5],
+              [1, 1, -3.5, 0.4, -5.3],
+              [2, 1, -2.5, 0.4, -5.3],
+              [3, 1, -0.5, 0.4, -5.5],
+              [4, 1, -5.0, 0.4, -5.8],
+              [0, 2, -5.2, 0.4, -6.2],
+              [1, 2, -1.0, 0.4, -5.5],
+              [2, 2, -4.2, 0.4, -7.0],
+              [3, 2, -2.0, 0.4, -7.0],
+              [4, 2, -3.2, 0.4, -7.0]
+            ];
+            furnPlacements.forEach(function(f) {
+              var ft = gridFrame(furnTex, f[0], f[1], 5, 3);
+              var fs = makeSprite(ft, 0.75, 0.75);
+              fs.position.set(f[2], f[3], f[4]);
+              scene.add(fs); self.objects.push(fs);
+            });
+          }
+
+          // ==== ZONE 2: FARM FIELD (x:-5..3, z:-4.5..-1.5) on tilled soil ====
+          // TF crops from plants.png (16px grid, 5x6) in neat rows
+          var plantsTex = self.textures['objects/plants.png'];
+          if (plantsTex) {
+            for (var row = 0; row < 3; row++) {
+              for (var col = 0; col < 5; col++) {
+                var cx = -4.5 + col * 1.6;
+                var cz = -4.2 + row * 1.2;
+                var pf = gridFrame(plantsTex, col, row, 5, 6);
+                var ps = makeSprite(pf, 0.75, 0.75);
+                ps.position.set(cx, 0.3, cz);
+                scene.add(ps); self.objects.push(ps);
+                self.plants.push({ sprite: ps, col: col, row: row, timer: Math.random() * 20 });
+                addProp(cx, cz);
+              }
+            }
+          }
+
+          // SS crops (sunflower, cabbage, carrot) in alternate rows on the farm
+          var cropTypes = ['sunflower', 'cabbage', 'carrot'];
+          cropTypes.forEach(function(ct, ci) {
+            var stage = Math.floor(Math.random() * 4) + 1;
+            var key = 'sw:Elements/Crops/' + ct + '_0' + stage + '.png';
+            var tex = self.textures[key];
+            if (!tex) return;
+            for (var j = 0; j < 3; j++) {
+              var cx = -3.5 + j * 2.5;
+              var cz = -4.0 + ci * 1.2 - 0.6;
+              var cs = makeSprite(tex, 0.5, 0.5);
+              scaleSprite(cs, tex);
+              cs.position.set(cx, cs.scale.y / 2, cz);
+              scene.add(cs); self.objects.push(cs);
+              self.crops.push({ sprite: cs, type: ct, stage: stage, x: cx, z: cz, timer: Math.random() * 25 });
+              addProp(cx, cz);
+            }
+          });
+
+          // Farm items at field edges (harvest pile near path)
+          var itemsTex = self.textures['objects/items.png'];
+          if (itemsTex) {
+            var itemPlacements = [
+              [0, 0, -5.5, 0.3, -1.8],
+              [1, 0, -4.5, 0.3, -1.6],
+              [2, 0, -3.5, 0.3, -1.8],
+              [3, 0,  3.5, 0.3, -1.8],
+              [4, 0,  4.0, 0.3, -1.6],
+              [0, 1, -5.0, 0.3, -4.8],
+              [1, 1,  3.0, 0.3, -4.8],
+              [2, 1, -4.0, 0.3, -4.6],
+              [3, 1,  2.0, 0.3, -1.6],
+              [4, 1, -2.5, 0.3, -1.6],
+              [0, 2, -5.5, 0.3, -3.2],
+              [1, 2,  3.5, 0.3, -3.2],
+              [2, 2,  4.5, 0.3, -3.4],
+              [3, 2, -1.5, 0.3, -4.8],
+              [4, 2,  1.5, 0.3, -4.6]
+            ];
+            itemPlacements.forEach(function(it) {
+              var itt = gridFrame(itemsTex, it[0], it[1], 5, 3);
+              var its = makeSprite(itt, 0.65, 0.65);
+              its.position.set(it[2], it[3], it[4]);
+              scene.add(its); self.objects.push(its);
+              addProp(it[2], it[4]);
+            });
+          }
+
+          // Sprite fences around farm (continuous: 48px@1.2 = 1.8 units per segment, no gaps)
+          for (var fx = -6; fx <= 3.2; fx += 1.8) {
+            var fTop = self._regionSprite('objects/farm_objects.png', 0, 16, 48, 16, 1.2);
+            self._addObj(fTop, fx, 0.35, -4.8);
+            addProp(fx, -4.8);
+            var fBot = self._regionSprite('objects/farm_objects.png', 0, 16, 48, 16, 1.2);
+            self._addObj(fBot, fx, 0.35, -1.3);
+            addProp(fx, -1.3);
+          }
+          for (var fz = -4.5; fz <= -1.5; fz += 1.0) {
+            var fL = self._regionSprite('objects/farm_objects.png', 0, 0, 16, 48, 1.2);
+            self._addObj(fL, -6.2, 0.6, fz);
+            addProp(-6.2, fz);
+            var fR = self._regionSprite('objects/farm_objects.png', 0, 0, 16, 48, 1.2);
+            self._addObj(fR, 3.8, 0.6, fz);
+            addProp(3.8, fz);
+          }
+
+          // ==== ZONE 3: PATH (z:-1..0.5) ====
+          // SS campfire by the path
+          var fireTex = self._swTex('Elements/VFX/Fire/spr_deco_fire_01_strip4.png');
+          if (fireTex) {
+            var ff = stripFrame(fireTex, 0, 4);
+            var fs = makeSprite(ff, 0.5, 0.5);
+            scaleSpriteFromStrip(fs, fireTex, 4);
+            fs.position.set(3.5, fs.scale.y / 2, -0.3);
+            scene.add(fs); self.objects.push(fs);
+            self.fireSprites.push({ sprite: fs, animState: new SpriteAnimState(4, 8) });
+          }
+
+          // ==== ZONE 4: INFRASTRUCTURE (x:5..8, z:-7..-5) ====
+          // Windmill base (tower) so blades are not floating
+          var baseTex = self.textures['objects/farm_objects.png'];
+          if (baseTex) {
+            var baseSpr = self._regionSprite('objects/farm_objects.png', 64, 64, 64, 32, 2.2);
+            self._addObj(baseSpr, 7, 0.9, -6);
+          } else {
+            var baseGeo = new THREE.PlaneGeometry(2.5, 2);
+            var baseMat = new THREE.MeshBasicMaterial({ color: 0x8b4513, side: THREE.DoubleSide });
+            var baseMesh = new THREE.Mesh(baseGeo, baseMat);
+            baseMesh.rotation.x = -Math.PI / 2;
+            baseMesh.position.set(7, 0.5, -6);
+            scene.add(baseMesh); self.objects.push(baseMesh);
+          }
+          // SS windmill (blades on top of base)
+          var wmTex = self._swTex('Elements/Other/spr_deco_windmill_strip9.png');
+          if (wmTex) {
+            var wmf = stripFrame(wmTex, 0, 9);
+            self.windmillSprite = makeSprite(wmf, 3.5, 3.5);
+            scaleSpriteFromStrip(self.windmillSprite, wmTex, 9);
+            self.windmillSprite.position.set(7, 2.2, -6);
+            scene.add(self.windmillSprite); self.objects.push(self.windmillSprite);
+            self.windmillAnimState = new SpriteAnimState(9, 5);
+          }
+
+          // Neighboring shed (small building)
+          var shed = self._regionSprite('objects/farm_objects.png', 0, 96, 64, 48, 1.0);
+          self._addObj(shed, 10, 0.8, -3);
+          addProp(10, -3);
+
+          // Storage items near windmill
+          if (itemsTex) {
+            [[2, 2, 5.5, 0.3, -5.5], [3, 2, 6.5, 0.3, -5.3], [4, 2, 5.0, 0.3, -5.8]].forEach(function(it) {
+              var itt = gridFrame(itemsTex, it[0], it[1], 5, 3);
+              var its = makeSprite(itt, 0.65, 0.65);
+              its.position.set(it[2], it[3], it[4]);
+              scene.add(its); self.objects.push(its);
+              addProp(it[2], it[4]);
+            });
+          }
+          addProp(7, -6);
+
+          // ==== ZONE 5: WATER (x:-12..-8, z:3..6) ====
+          var bridgeTex = self.textures['tilemaps/bridges.png'];
+          if (bridgeTex) {
+            // Main bridge (48x48 piece)
+            var bt = bridgeTex.clone();
+            bt.repeat.set(48/192, 48/176);
+            bt.offset.set(0/192, 1 - (16+48)/176);
+            bt.magFilter = THREE.NearestFilter; bt.minFilter = THREE.NearestFilter;
+            bt.needsUpdate = true;
+            var bs = makeSprite(bt, 1.8, 1.8);
+            bs.position.set(-9.5, 0.15, 4.0);
+            scene.add(bs); self.objects.push(bs);
+
+            // Larger bridge variant (64x48 piece from middle of sheet)
+            var bt2 = bridgeTex.clone();
+            bt2.repeat.set(64/192, 48/176);
+            bt2.offset.set(80/192, 1 - (16+48)/176);
+            bt2.magFilter = THREE.NearestFilter; bt2.minFilter = THREE.NearestFilter;
+            bt2.needsUpdate = true;
+            var bs2 = makeSprite(bt2, 2.0, 1.5);
+            bs2.position.set(-10.5, 0.12, 5.0);
+            scene.add(bs2); self.objects.push(bs2);
+          }
+
+          // ==== ZONE 6: PASTURE (x:-8..4, z:1..5) ====
+          // SS animals -- spawn into their zones
+          self._spawnAnimals();
+
+          // Bushes from spring_farm.png along pasture edges
+          var sfTex = self.textures['tilemaps/spring_farm.png'];
+          if (sfTex) {
+            // Large bush: ~px(0,48,48,32) from spring_farm
+            var bushPositions = [[-7, 0.5, 1.5], [4, 0.5, 2], [-6, 0.5, 5], [5, 0.5, 4], [-3, 0.5, 5.5], [7, 0.5, 3]];
+            bushPositions.forEach(function(bp) {
+              var bush = self._regionSprite('tilemaps/spring_farm.png', 0, 48, 48, 32, 1.5);
+              self._addObj(bush, bp[0], bp[1], bp[2]);
+            });
+
+            // Grass tufts: ~px(0,96,16,16) scattered on open grass
+            var grassPositions = [[-5, 1], [-2, 3], [1, 2], [3, 4], [-4, 4.5], [2, 1.5], [-7, 3.5], [6, 2.5]];
+            grassPositions.forEach(function(gp) {
+              var grass = self._regionSprite('tilemaps/spring_farm.png', 0, 96, 16, 16, 1.5);
+              self._addObj(grass, gp[0], 0.2, gp[1]);
+            });
+
+            // Stumps: ~px(80,112,16,16) near trees
+            var stumpPositions = [[-9, -4], [10, -2.5], [-10, 3]];
+            stumpPositions.forEach(function(sp) {
+              var stump = self._regionSprite('tilemaps/spring_farm.png', 80, 112, 16, 16, 1.5);
+              self._addObj(stump, sp[0], 0.3, sp[1]);
+            });
+          }
+
+          // ==== ZONE 7: FOREST EDGES (perimeter) ====
+          // TF trees (green + autumn) around edges
+          var edgeTrees = [
+            [-11, -6], [-9, -7], [-12, -3], [-11, 1], [-12, 5], [-10, 7],
+            [9, -7], [11, -5], [12, -2], [11, 1], [12, 4], [10, 7],
+            [-7, -7.5], [-4, -7.5], [3, -7.5], [6, -7.5],
+            [-6, 7], [-2, 7], [3, 7], [7, 7]
+          ];
+          edgeTrees.forEach(function(p, i) {
+            var srcX = (i % 3 === 2) ? 96 : 48;
+            var tree = self._regionSprite('objects/farm_objects.png', srcX, 0, 48, 64);
+            self._addObj(tree, p[0], 1.0, p[1]);
+            addProp(p[0], p[1]);
+          });
+
+          // SS animated trees mixed in
+          var ssTree1 = self._swTex('Elements/Plants/spr_deco_tree_01_strip4.png');
+          var ssTree2 = self._swTex('Elements/Plants/spr_deco_tree_02_strip4.png');
+          if (ssTree1) {
+            [[-8, -6.5], [8, -6], [-9, 4], [9, 5.5]].forEach(function(p) {
+              var tf = stripFrame(ssTree1, 0, 4);
+              var ts = makeSprite(tf, 1.0, 1.06);
+              scaleSpriteFromStrip(ts, ssTree1, 4);
+              ts.position.set(p[0], 0.53, p[1]);
+              scene.add(ts); self.objects.push(ts);
+            });
+          }
+          if (ssTree2) {
+            [[-6, -7], [7, -7], [8, 6]].forEach(function(p) {
+              var tf = stripFrame(ssTree2, 0, 4);
+              var ts = makeSprite(tf, 1.0, 1.06);
+              scaleSpriteFromStrip(ts, ssTree2, 4);
+              ts.position.set(p[0], 0.53, p[1]);
+              scene.add(ts); self.objects.push(ts);
+            });
+          }
+
+          // SS mushrooms near tree bases
+          var mushRed = self._swTex('Elements/Plants/spr_deco_mushroom_red_01_strip4.png');
+          var mushBlue = self._swTex('Elements/Plants/spr_deco_mushroom_blue_01_strip4.png');
+          if (mushRed) {
+            [[-10, -5], [11, -4], [-11, 2], [9, 3]].forEach(function(p) {
+              var mf = stripFrame(mushRed, 0, 4);
+              var ms = makeSprite(mf, 0.5, 0.5);
+              scaleSpriteFromStrip(ms, mushRed, 4);
+              ms.position.set(p[0], ms.scale.y / 2, p[1]);
+              scene.add(ms); self.objects.push(ms);
+            });
+          }
+          if (mushBlue) {
+            [[10, -6], [-12, 4], [12, 5], [-8, -4]].forEach(function(p) {
+              var mf = stripFrame(mushBlue, 0, 4);
+              var ms = makeSprite(mf, 0.5, 0.5);
+              scaleSpriteFromStrip(ms, mushBlue, 4);
+              ms.position.set(p[0], ms.scale.y / 2, p[1]);
+              scene.add(ms); self.objects.push(ms);
+            });
+          }
+
+          // SS glint sparkle near windmill and campfire
+          var glintTex = self._swTex('Elements/VFX/Glint/spr_deco_glint_01_strip6.png');
+          if (glintTex) {
+            [[7.5, 1.2, -5.5], [3.8, 0.6, -0.1]].forEach(function(gp) {
+              var gf = stripFrame(glintTex, 0, 6);
+              var gs = makeSprite(gf, 0.4, 0.4);
+              scaleSpriteFromStrip(gs, glintTex, 6);
+              gs.position.set(gp[0], gp[1], gp[2]);
+              scene.add(gs); self.objects.push(gs);
+              self.fireSprites.push({ sprite: gs, animState: new SpriteAnimState(6, 4), tex: glintTex, isGlint: true });
+            });
+          }
+
+          console.log('[CEO:TinyFarm] Merged scene built');
+        },
+
+        _spawnAnimals: function() {
+          var self = this;
+          var animalDefs = [
+            { key: 'Elements/Animals/spr_deco_chicken_01_strip4.png', type: 'chicken', count: 3, xBase: -4, zBase: 1.5, xRange: 3, zRange: 1.5 },
+            { key: 'Elements/Animals/spr_deco_pig_01_strip4.png', type: 'pig', count: 2, xBase: -6, zBase: 2, xRange: 2, zRange: 1.5 },
+            { key: 'Elements/Animals/spr_deco_cow_strip4.png', type: 'cow', count: 2, xBase: -1, zBase: 3.5, xRange: 4, zRange: 1.5 },
+            { key: 'Elements/Animals/spr_deco_sheep_01_strip4.png', type: 'sheep', count: 2, xBase: 1, zBase: 3.5, xRange: 3, zRange: 1.5 },
+            { key: 'Elements/Animals/spr_deco_duck_01_strip4.png', type: 'duck', count: 2, xBase: -10.5, zBase: 4, xRange: 2, zRange: 1.5 },
+            { key: 'Elements/Animals/spr_deco_bird_01_strip4.png', type: 'bird', count: 2, xBase: -8, zBase: -2, xRange: 16, zRange: 1 }
+          ];
+          animalDefs.forEach(function(ad) {
+            var tex = self._swTex(ad.key);
+            if (!tex) return;
+            for (var i = 0; i < ad.count; i++) {
+              var af = stripFrame(tex, 0, 4);
+              var as = makeSprite(af, 1.0, 1.0);
+              scaleSpriteFromStrip(as, tex, 4);
+              var ax = ad.xBase + Math.random() * ad.xRange;
+              var az = ad.zBase + Math.random() * ad.zRange;
+              as.position.set(ax, as.scale.y / 2, az);
+              scene.add(as); self.objects.push(as);
+              self.animals.push({
+                sprite: as, type: ad.type, x: ax, z: az,
+                vx: (Math.random() - 0.5) * 0.3,
+                tex: tex, animState: new SpriteAnimState(4, 5),
+                xMin: ad.xBase, xMax: ad.xBase + ad.xRange,
+                zMin: ad.zBase, zMax: ad.zBase + ad.zRange
+              });
+            }
+          });
+        },
+
+        _spawnEnemy: function(type) {
+          var self = this;
+          var defs = {
+            goblin: { idle: 'Characters/Goblin/PNG/spr_idle_strip9.png', walk: 'Characters/Goblin/PNG/spr_walk_strip8.png', atk: 'Characters/Goblin/PNG/spr_attack_strip10.png', death: 'Characters/Goblin/PNG/spr_death_strip13.png', wf: 8, af: 10, df: 13, if_: 9 },
+            skeleton: { idle: 'Characters/Skeleton/PNG/skeleton_idle_strip6.png', walk: 'Characters/Skeleton/PNG/skeleton_walk_strip8.png', atk: 'Characters/Skeleton/PNG/skeleton_attack_strip7.png', death: 'Characters/Skeleton/PNG/skeleton_death_strip10.png', wf: 8, af: 7, df: 10, if_: 6 }
+          };
+          var d = defs[type]; if (!d) return;
+          var walkTex = self._swTex(d.walk); if (!walkTex) return;
+          var ef = stripFrame(walkTex, 0, d.wf);
+          var es = makeSprite(ef, 3.0, 2.0);
+          scaleSpriteFromStrip(es, walkTex, d.wf);
+          var startX = Math.random() > 0.5 ? 14 : -14;
+          var startZ = -1 + Math.random() * 2;
+          var targetX = (Math.random() - 0.5) * 6;
+          es.position.set(startX, 1.0, startZ);
+          scene.add(es); self.objects.push(es);
+          self.enemies.push({
+            sprite: es, type: type, x: startX, z: startZ, targetX: targetX,
+            vx: startX > 0 ? -0.6 : 0.6, state: 'walk', hp: 2, deathTimer: 0,
+            walkTex: walkTex, walkFrames: d.wf, walkAnim: new SpriteAnimState(d.wf, 7),
+            atkTex: self._swTex(d.atk), atkFrames: d.af, atkAnim: new SpriteAnimState(d.af, 7),
+            deathTex: self._swTex(d.death), deathFrames: d.df, deathAnim: new SpriteAnimState(d.df, 8),
+            idleTex: self._swTex(d.idle), idleFrames: d.if_
+          });
+        },
+
+        updateAgents: function(agents, posMap, delta) {
+          var self = this;
+          var combat = self.combatPhase;
+          for (var i = 0; i < agents.length && i < CAP_AGENTS; i++) {
+            var a = agents[i];
+            var pos = posMap[a.name];
+            if (!pos) continue;
+            var role = getAgentRole(a);
+            var hair = self._hairForRole(role);
+            var act = self._actionForRole(role, combat);
+            var texKey = 'sw:Characters/Human/' + act.folder + '/' + hair + '_' + act.suf + '_strip' + act.frames + '.png';
+            var tex = self.textures[texKey];
+            if (!tex) {
+              texKey = 'sw:Characters/Human/' + act.folder + '/base_' + act.suf + '_strip' + act.frames + '.png';
+              tex = self.textures[texKey];
+            }
+            if (!tex || !tex.image || !tex.image.width) {
+              var fallback = self.textures['characters/walk_idle.png'];
+              if (!fallback) continue;
+              if (!agentAnimStates[a.name]) {
+                agentAnimStates[a.name] = { animState: new SpriteAnimState(4, 6), currentRow: i % 3, tex: fallback, useFallback: true };
+              }
+              var stf = agentAnimStates[a.name];
+              if (!agentSprites[a.name]) {
+                var ftf = gridFrame(fallback, 0, stf.currentRow, 8, 3);
+                var sf = makeSprite(ftf, 1.5, 1.5);
+                sf._baseScaleX = sf.scale.x; sf._baseScaleY = sf.scale.y;
+                sf.position.set(pos.x, pos.y + 0.8, pos.z);
+                scene.add(sf); agentSprites[a.name] = sf;
+              } else {
+                stf.animState.timer += delta || 0.016;
+                if (stf.animState.timer >= 1 / stf.animState.fps) {
+                  stf.animState.timer = 0;
+                  stf.animState.frame = (stf.animState.frame + 1) % 4;
+                  agentSprites[a.name].material.map = gridFrame(fallback, 4 + stf.animState.frame, stf.currentRow, 8, 3);
+                  agentSprites[a.name].material.map.needsUpdate = true;
+                }
+                agentSprites[a.name].position.x += (pos.x - agentSprites[a.name].position.x) * 0.05;
+                agentSprites[a.name].position.y = pos.y + 0.8;
+                agentSprites[a.name].position.z = pos.z;
+              }
+              continue;
+            }
+
+            if (!agentAnimStates[a.name]) {
+              agentAnimStates[a.name] = { animState: new SpriteAnimState(act.frames, 7), currentTex: tex, currentFrames: act.frames };
+            }
+            var st = agentAnimStates[a.name];
+            if (st.currentTex !== tex) { st.currentTex = tex; st.currentFrames = act.frames; st.animState = new SpriteAnimState(act.frames, 7); }
+
+            if (!agentSprites[a.name]) {
+              var ft = stripFrame(tex, 0, act.frames);
+              var s = makeSprite(ft, 3.0, 2.0);
+              scaleSpriteFromStrip(s, tex, act.frames);
+              s._baseScaleX = s.scale.x; s._baseScaleY = s.scale.y;
+              s.position.set(pos.x, pos.y + 1.0, pos.z);
+              scene.add(s); agentSprites[a.name] = s;
+            } else {
+              animateStrip(agentSprites[a.name], tex, st.animState, delta || 0.016);
+              var targetX = combat ? pos.x + 3 : pos.x;
+              var curX = agentSprites[a.name].position.x;
+              agentSprites[a.name].position.x += (targetX - curX) * 0.05;
+              agentSprites[a.name].position.y = pos.y + 1.0;
+              agentSprites[a.name].position.z = pos.z;
+              if (targetX > curX) agentSprites[a.name].scale.x = Math.abs(agentSprites[a.name].scale.x);
+              else if (targetX < curX) agentSprites[a.name].scale.x = -Math.abs(agentSprites[a.name].scale.x);
+            }
+
+            // Portrait badge above agent
+            var portraitKey = (i % 4 === 0) ? 'characters/portrait_male.png' :
+                             (i % 4 === 1) ? 'characters/portrait_female.png' :
+                             (i % 4 === 2) ? 'characters/portrait_male_old.png' :
+                             'characters/portrait_female_old.png';
+            if (!agentSprites[a.name + '_portrait']) {
+              var pTex = self.textures[portraitKey];
+              if (pTex) {
+                var ps = makeSprite(pTex, 0.6, 0.6);
+                scene.add(ps); agentSprites[a.name + '_portrait'] = ps;
+              }
+            }
+            if (agentSprites[a.name + '_portrait'] && agentSprites[a.name]) {
+              agentSprites[a.name + '_portrait'].position.set(
+                agentSprites[a.name].position.x,
+                agentSprites[a.name].position.y + agentSprites[a.name].scale.y * 0.6,
+                agentSprites[a.name].position.z
+              );
+            }
+
+            if (combat && self.enemies.length && agentSprites[a.name]) {
+              var closest = null, closeDist = 999;
+              self.enemies.forEach(function(e) {
+                if (e.state === 'dead') return;
+                var dx = e.x - agentSprites[a.name].position.x;
+                if (Math.abs(dx) < closeDist) { closeDist = Math.abs(dx); closest = e; }
+              });
+              if (closest && closeDist < 3) {
+                agentSprites[a.name].position.x += (closest.x - agentSprites[a.name].position.x) * 0.02;
+              }
+            }
+          }
+
+          // Scale animals with agent count
+          var tgtChickens = Math.min(5, 3 + Math.floor(agents.length / 3));
+          var curC = self.animals.filter(function(a) { return a.type === 'chicken'; }).length;
+          if (curC < tgtChickens && self._swTex('Elements/Animals/spr_deco_chicken_01_strip4.png')) {
+            var tex = self._swTex('Elements/Animals/spr_deco_chicken_01_strip4.png');
+            var af = stripFrame(tex, 0, 4);
+            var as = makeSprite(af, 1.0, 1.0);
+            scaleSpriteFromStrip(as, tex, 4);
+            var ax = -4 + Math.random() * 3;
+            var az = 1.5 + Math.random() * 1.5;
+            as.position.set(ax, as.scale.y / 2, az);
+            scene.add(as); self.objects.push(as);
+            self.animals.push({ sprite: as, type: 'chicken', x: ax, z: az, vx: (Math.random()-0.5)*0.3, tex: tex, animState: new SpriteAnimState(4, 5), xMin: -4, xMax: -1, zMin: 1.5, zMax: 3 });
+          }
+        },
+
+        tickAmbient: function(delta) {
+          var self = this;
+
+          // Phase cycling: 20s farm, 12s combat
+          self.phaseTimer += delta;
+          if (!self.combatPhase && self.phaseTimer > 20) { self.combatPhase = true; self.phaseTimer = 0; }
+          else if (self.combatPhase && self.phaseTimer > 12) { self.combatPhase = false; self.phaseTimer = 0; }
+
+          // TF crop growth animation
+          var plantsTex = self.textures['objects/plants.png'];
+          if (plantsTex) {
+            self.plants.forEach(function(pl) {
+              pl.timer += delta;
+              if (pl.timer > 20) {
+                pl.timer = 0;
+                pl.row = (pl.row + 1) % 6;
+                pl.sprite.material.map = gridFrame(plantsTex, pl.col, pl.row, 5, 6);
+                pl.sprite.material.map.needsUpdate = true;
+              }
+            });
+          }
+
+          // SS crop growth animation
+          self.crops.forEach(function(cr) {
+            cr.timer += delta;
+            if (cr.timer > 25) {
+              cr.timer = 0;
+              cr.stage = (cr.stage + 1) % 6;
+              var key = 'sw:Elements/Crops/' + cr.type + '_0' + cr.stage + '.png';
+              var t = self.textures[key];
+              if (t) { cr.sprite.material.map = t; cr.sprite.material.map.needsUpdate = true; }
+            }
+          });
+
+          // Animal wandering within zones
+          self.animals.forEach(function(an) {
+            an.x += an.vx * delta;
+            if (an.x < an.xMin || an.x > an.xMax) an.vx = -an.vx;
+            an.sprite.position.x = an.x;
+            if (an.vx < 0) an.sprite.scale.x = -Math.abs(an.sprite.scale.x);
+            else an.sprite.scale.x = Math.abs(an.sprite.scale.x);
+            animateStrip(an.sprite, an.tex, an.animState, delta);
+          });
+
+          // Windmill spin
+          if (self.windmillSprite && self.windmillAnimState) {
+            var wmTex = self._swTex('Elements/Other/spr_deco_windmill_strip9.png');
+            if (wmTex) animateStrip(self.windmillSprite, wmTex, self.windmillAnimState, delta);
+          }
+
+          // Fire + glint animation
+          self.fireSprites.forEach(function(f) {
+            if (f.isGlint) {
+              var gt = f.tex || self._swTex('Elements/VFX/Glint/spr_deco_glint_01_strip6.png');
+              if (gt) animateStrip(f.sprite, gt, f.animState, delta);
+            } else {
+              var ft = self._swTex('Elements/VFX/Fire/spr_deco_fire_01_strip4.png');
+              if (ft) animateStrip(f.sprite, ft, f.animState, delta);
+            }
+          });
+
+          // Combat: spawn enemies
+          if (self.combatPhase) {
+            self.enemySpawnTimer += delta;
+            if (self.enemySpawnTimer > 4 && self.enemies.length < 3) {
+              self.enemySpawnTimer = 0;
+              self._spawnEnemy(Math.random() > 0.5 ? 'goblin' : 'skeleton');
+            }
+          }
+
+          // Enemy AI: respect prop collision, only attack when near an agent
+          var agentXList = [];
+          for (var ak in agentSprites) {
+            if (agentSprites[ak] && agentSprites[ak].position && ak.indexOf('_portrait') === -1)
+              agentXList.push(agentSprites[ak].position.x);
+          }
+          function hitProp(x, z) {
+            var list = self.propPositions || [];
+            for (var pi = 0; pi < list.length; pi++) {
+              var p = list[pi];
+              if (Math.abs(p.x - x) < 0.8 && Math.abs(p.z - z) < 0.8) return true;
+            }
+            return false;
+          }
+          for (var ei = self.enemies.length - 1; ei >= 0; ei--) {
+            var e = self.enemies[ei];
+            if (e.state === 'walk') {
+              var nextX = e.x + e.vx * delta;
+              if (!hitProp(nextX, e.z)) e.x = nextX;
+              else e.vx = -e.vx;
+              e.sprite.position.x = e.x;
+              if (e.vx < 0) e.sprite.scale.x = -Math.abs(e.sprite.scale.x);
+              else e.sprite.scale.x = Math.abs(e.sprite.scale.x);
+              animateStrip(e.sprite, e.walkTex, e.walkAnim, delta);
+              var nearestAgentX = null, nearestDist = 3;
+              for (var ai = 0; ai < agentXList.length; ai++) {
+                var d = Math.abs(agentXList[ai] - e.x);
+                if (d < nearestDist) { nearestDist = d; nearestAgentX = agentXList[ai]; }
+              }
+              if (nearestAgentX !== null && nearestDist < 1.2) e.state = 'attack';
+              else if (Math.abs(e.x - e.targetX) < 0.5) e.targetX = (agentXList.length ? agentXList[0] : e.x + (Math.random() - 0.5) * 4);
+            } else if (e.state === 'attack') {
+              var nearAgent = false;
+              for (var ai = 0; ai < agentXList.length; ai++) {
+                if (Math.abs(agentXList[ai] - e.x) < 1.5) { nearAgent = true; break; }
+              }
+              if (!nearAgent) { e.state = 'walk'; e.targetX = (agentXList.length ? agentXList[0] : e.x); e.vx = (e.targetX > e.x) ? 0.8 : -0.8; }
+              else if (e.atkTex) {
+                var prevFrame = e.atkAnim.frame;
+                animateStrip(e.sprite, e.atkTex, e.atkAnim, delta);
+                if (e.atkAnim.frame < prevFrame) {
+                  e.hp -= 1;
+                  if (e.hp <= 0) { e.state = 'dying'; e.deathAnim.frame = 0; e.deathAnim.timer = 0; }
+                }
+              }
+            } else if (e.state === 'dying') {
+              if (e.deathTex) {
+                var prevDf = e.deathAnim.frame;
+                animateStrip(e.sprite, e.deathTex, e.deathAnim, delta);
+                if (e.deathAnim.frame < prevDf || e.deathAnim.frame >= e.deathFrames - 1) { e.state = 'dead'; e.deathTimer = 0; }
+              } else { e.state = 'dead'; e.deathTimer = 0; }
+            } else if (e.state === 'dead') {
+              e.deathTimer += delta;
+              e.sprite.material.opacity = Math.max(0, 1 - e.deathTimer);
+              if (e.deathTimer > 1.5) {
+                disposeObject(e.sprite);
+                self.enemies.splice(ei, 1);
+              }
+            }
+          }
+        },
+
+        dispose: function() {
+          var self = this;
+          self.objects.forEach(function(o) { disposeObject(o); });
+          self.enemies.forEach(function(e) { disposeObject(e.sprite); });
+          self.objects = []; self.plants = []; self.animals = []; self.crops = []; self.enemies = [];
+          self.propPositions = []; self.windmillSprite = null; self.fireSprites = []; self.windmillAnimState = null;
+          self.combatPhase = false; self.phaseTimer = 0; self.enemySpawnTimer = 0;
+        }
+      };
+
+      var CEO_THEMES = { zombie: zombieTheme, tinyfarm: tinyfarmTheme };
+
+      // =============== SHARED ENGINE ===============
+      function getThemeName() {
+        try { return localStorage.getItem('ceoTheme') || 'tinyfarm'; } catch(e) { return 'tinyfarm'; }
+      }
+      function setThemeName(t) {
+        try { localStorage.setItem('ceoTheme', t); } catch(e) {}
+      }
+
+      function clearAgentSprites() {
+        for (var k in agentSprites) { disposeObject(agentSprites[k]); } agentSprites = {};
+        for (var k2 in agentBubbles) { disposeObject(agentBubbles[k2]); } agentBubbles = {};
+        for (var k3 in agentBadges) { disposeObject(agentBadges[k3].sprite); } agentBadges = {};
+        mailFlights.forEach(function(f) { if (f.mesh) disposeObject(f.mesh); });
+        mailFlights = []; sendHomeQueue = []; sendHomeState = null;
+        agentAnimStates = {};
+      }
+
+      // --- Agent Dialog System ---
+      var raycaster = new THREE.Raycaster();
+
+      function renderPortrait(agentName) {
+        var portraitDiv = document.getElementById('agentDialogPortrait');
+        if (!portraitDiv) return;
+        portraitDiv.innerHTML = '';
+        var sprite = agentSprites[agentName];
+        if (!sprite || !sprite.material || !sprite.material.map) return;
+        var tex = sprite.material.map;
+        var img = tex.image;
+        if (!img) return;
+        var canvas = document.createElement('canvas');
+        canvas.width = 80; canvas.height = 80;
+        var ctx = canvas.getContext('2d');
+        ctx.imageSmoothingEnabled = false;
+        var ox = tex.offset.x * img.width;
+        var oy = (1 - tex.offset.y - tex.repeat.y) * img.height;
+        var sw = tex.repeat.x * img.width;
+        var sh = tex.repeat.y * img.height;
+        ctx.drawImage(img, ox, oy, sw, sh, 0, 0, 80, 80);
+        portraitDiv.appendChild(canvas);
+      }
+
+      function streamText(text, element, speed) {
+        var i = 0;
+        element.textContent = '';
+        if (dialogStreamTimer) { clearInterval(dialogStreamTimer); dialogStreamTimer = null; }
+        dialogStreamTimer = setInterval(function() {
+          if (i < text.length) {
+            element.textContent += text[i];
+            i++;
+          } else {
+            clearInterval(dialogStreamTimer);
+            dialogStreamTimer = null;
+          }
+        }, speed || 30);
+      }
+
+      function openAgentDialog(agentName) {
+        if (!agentDialogEl) return;
+        dialogAgent = agentName;
+        var agent = null;
+        for (var i = 0; i < lastPolledAgents.length; i++) {
+          if (lastPolledAgents[i].name === agentName) { agent = lastPolledAgents[i]; break; }
+        }
+        var role = agent ? getAgentRole(agent) : 'default';
+        var roleBadge = { lead: 'Lead', builder: 'Builder', scout: 'Scout', reviewer: 'Reviewer', 'default': 'Agent' };
+        var nameEl = document.getElementById('agentDialogName');
+        var textEl = document.getElementById('agentDialogText');
+        var displayName = (agentName || '').replace(/[-0-9a-f]{8,}$/i, '').trim() || agentName;
+        if (nameEl) nameEl.innerHTML = displayName + ' <span class="agent-dialog-role">' + (roleBadge[role] || 'Agent') + '</span>';
+        renderPortrait(agentName);
+        var otherNames = lastPolledAgents.map(function(a) { return a.name; });
+        var mailForAgent = [];
+        var speechLines = agent ? speechLinesForAgent(agent, inboxCounts[agentName] || 0, mailForAgent, otherNames.filter(function(n) { return n !== agentName; })) : ['...'];
+        var taskFull = (agent && agent.task_full) ? String(agent.task_full).trim() : '';
+        var fullText = speechLines.join('\\n');
+        if (taskFull && fullText.indexOf(taskFull) === -1) {
+          var shortTask = taskFull.length > 120 ? taskFull.slice(0, 117) + '...' : taskFull;
+          fullText += '\\n\\n' + shortTask;
+        }
+        if (textEl) streamText(fullText, textEl, 25);
+        agentDialogEl.style.display = 'flex';
+      }
+
+      function closeAgentDialog() {
+        if (!agentDialogEl) return;
+        agentDialogEl.style.display = 'none';
+        dialogAgent = null;
+        if (dialogStreamTimer) { clearInterval(dialogStreamTimer); dialogStreamTimer = null; }
+      }
+
+      if (agentDialogEl) {
+        agentDialogEl.addEventListener('click', function(e) { e.stopPropagation(); closeAgentDialog(); });
+      }
+
+      ceoCanvas.addEventListener('click', function(event) {
+        if (!ceoOpen || !camera) return;
+        if (dialogAgent) { closeAgentDialog(); return; }
+        var rect = ceoCanvas.getBoundingClientRect();
+        var mouse = new THREE.Vector2(
+          ((event.clientX - rect.left) / rect.width) * 2 - 1,
+          -((event.clientY - rect.top) / rect.height) * 2 + 1
+        );
+        raycaster.setFromCamera(mouse, camera);
+        var targets = [];
+        for (var k in agentSprites) {
+          if (agentSprites[k] && agentSprites[k].position) targets.push(agentSprites[k]);
+        }
+        var hits = raycaster.intersectObjects(targets);
+        if (hits.length > 0) {
+          var hitSprite = hits[0].object;
+          for (var name in agentSprites) {
+            if (agentSprites[name] === hitSprite) { openAgentDialog(name); break; }
+          }
+        }
+      });
+
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape' && dialogAgent) { closeAgentDialog(); e.stopPropagation(); }
+      });
+
+      function initRenderer() {
+        if (renderer) return;
+        var w = ceoCanvas.clientWidth || 800, h = ceoCanvas.clientHeight || 600;
+        var aspect = w / h;
+        var halfH = FRUSTUM_H / 2;
+        camera = new THREE.OrthographicCamera(-halfH * aspect, halfH * aspect, halfH, -halfH, 0.1, 100);
+        camera.position.set(0, 10, 12);
+        camera.lookAt(0, 0, 0);
+        camera.updateProjectionMatrix();
+        renderer = new THREE.WebGLRenderer({ canvas: ceoCanvas, antialias: false });
+        renderer.setSize(w, h);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      }
+
+      function switchTheme(name) {
+        console.log('[CEO] Switching to', name);
+        if (activeTheme) { activeTheme.dispose(); clearAgentSprites(); }
+        if (!scene) { scene = new THREE.Scene(); }
+        while (scene.children.length) scene.remove(scene.children[0]);
+        agentSprites = {}; agentBubbles = {}; agentBadges = {};
+        var theme = CEO_THEMES[name] || CEO_THEMES.tinyfarm;
+        scene.background = new THREE.Color(theme.bg);
+        activeTheme = theme;
+        ceoCredit.textContent = theme.credit || '';
+        theme.preload().then(function() {
+          theme.initScene();
+        }).catch(function(e) { console.error('[CEO] Theme preload error:', e); });
+      }
+
+      var lastDelta = 0.016;
+      function updateAgentsShared(agents, mailItems) {
+        if (!scene || !activeTheme) return;
+        try {
+          var positions = activeTheme.positions || TINYFARM_POSITIONS;
+          var posMap = assignPositions(agents, positions);
+          activeTheme.updateAgents(agents, posMap, lastDelta);
+          var mailList = mailItems || [];
+          var otherNames = agents.map(function(a) { return a.name; });
+          for (var i = 0; i < agents.length && i < CAP_AGENTS; i++) {
+            var name = agents[i].name;
+            var sprite = agentSprites[name];
+            if (!sprite) continue;
+            var sp = sprite.position;
+            if (!agentBubbles[name]) {
+              var bmat = new THREE.SpriteMaterial({ map: makeBubbleTexture([]), transparent: true, depthTest: false });
+              var b = new THREE.Sprite(bmat); b.scale.set(5, 2.0, 1);
+              scene.add(b); agentBubbles[name] = b;
+              var bc = document.createElement('canvas'); bc.width = 24; bc.height = 24;
+              var btex = new THREE.CanvasTexture(bc); btex.minFilter = btex.magFilter = THREE.NearestFilter;
+              var badge = new THREE.Sprite(new THREE.SpriteMaterial({ map: btex, transparent: true }));
+              badge.scale.set(0.5, 0.5, 1); scene.add(badge);
+              agentBadges[name] = { sprite: badge, canvas: bc };
+            }
+            agentBubbles[name].position.set(sp.x, sp.y + 1.8, sp.z);
+            agentBadges[name].sprite.position.set(sp.x + 0.8, sp.y + 0.9, sp.z);
+            var mailForAgent = mailList.filter(function(m) { return (m.to || '') === name; });
+            var speechLines = speechLinesForAgent(agents[i], inboxCounts[name] || 0, mailForAgent, otherNames.filter(function(n) { return n !== name; }));
+            agentBubbles[name].material.map = makeBubbleTexture(speechLines);
+            agentBubbles[name].material.map.needsUpdate = true;
+            var cnt = inboxCounts[name] || 0;
+            if (cnt > 0) {
+              var bcc = agentBadges[name].canvas, bctx = bcc.getContext('2d');
+              bctx.clearRect(0, 0, 24, 24);
+              bctx.fillStyle = '#f85149'; bctx.beginPath(); bctx.arc(12, 12, 11, 0, Math.PI * 2); bctx.fill();
+              bctx.fillStyle = '#fff'; bctx.font = 'bold 12px sans-serif'; bctx.textAlign = 'center'; bctx.textBaseline = 'middle';
+              bctx.fillText(cnt > 99 ? '99+' : String(cnt), 12, 12);
+              agentBadges[name].sprite.material.map.needsUpdate = true;
+              agentBadges[name].sprite.visible = true;
+            } else { agentBadges[name].sprite.visible = false; }
+          }
+          // Remove gone agents
+          var current = {};
+          agents.forEach(function(a) { current[a.name] = true; });
+          leadAgentName = null;
+          agents.forEach(function(a) { if (isLead(a) && !leadAgentName) leadAgentName = a.name; });
+          for (var key in agentSprites) {
+            if (!current[key]) {
+              disposeObject(agentSprites[key]); delete agentSprites[key];
+              if (agentBubbles[key]) { disposeObject(agentBubbles[key]); delete agentBubbles[key]; }
+              if (agentBadges[key]) { disposeObject(agentBadges[key].sprite); delete agentBadges[key]; }
+              delete agentAnimStates[key];
+            }
+          }
+        } catch (e) { console.error('[CEO] updateAgents error:', e); }
+      }
+
+      // Mail flights
+      function createMailMesh() {
+        var g = new THREE.PlaneGeometry(0.35, 0.25);
+        var mc = (activeTheme && activeTheme.mailColor) ? activeTheme.mailColor : 0xffa657;
+        var m = new THREE.MeshBasicMaterial({ color: mc, side: THREE.DoubleSide });
+        var mesh = new THREE.Mesh(g, m); scene.add(mesh); return mesh;
+      }
+      function tickMailFlights(delta) {
+        for (var i = mailFlights.length - 1; i >= 0; i--) {
+          var f = mailFlights[i]; f.t += delta;
+          if (f.t >= f.duration) { if (f.mesh) scene.remove(f.mesh); mailFlights.splice(i, 1); continue; }
+          var u = Math.min(1, f.t / f.duration); u = u * u * (3 - 2 * u);
+          if (!f.mesh) f.mesh = createMailMesh();
+          f.mesh.position.x = f.from.x + (f.to.x - f.from.x) * u;
+          f.mesh.position.y = f.from.y + (f.to.y - f.from.y) * u + 0.6;
+          f.mesh.position.z = f.from.z + (f.to.z - f.from.z) * u;
+        }
+      }
+      function updateMailFlights(agents, items) {
+        var positions = activeTheme.positions || TINYFARM_POSITIONS;
+        var posMap = assignPositions(agents, positions);
+        (items || []).slice(0, 5).forEach(function(item) {
+          var fp = posMap[item.from], tp = posMap[item.to];
+          if (fp && tp) mailFlights.push({ from: fp, to: tp, t: 0, duration: 1.5, mesh: null });
+        });
+      }
+
+      // Send them home
+      function runSendThemHome(delta) {
+        if (!sendHomeState) { if (sendHomeQueue.length) sendHomeState = { worker: sendHomeQueue.shift(), phase: 'lead', t: 0, duration: 0.8 }; return; }
+        sendHomeState.t += delta;
+        if (sendHomeState.phase === 'lead') {
+          var ls = leadAgentName ? agentSprites[leadAgentName] : null;
+          if (ls) { var u = Math.min(1, sendHomeState.t / sendHomeState.duration); var baseW = ls._baseScaleX || ls.scale.x; var baseH = ls._baseScaleY || ls.scale.y; ls.scale.set(baseW + Math.sin(u * Math.PI) * 0.3, baseH + Math.sin(u * Math.PI) * 0.3, 1); }
+          if (sendHomeState.t >= sendHomeState.duration) {
+            if (ls) { ls.scale.set(ls._baseScaleX || ls.scale.x, ls._baseScaleY || ls.scale.y, 1); }
+            sendHomeState.phase = 'worker'; sendHomeState.t = 0; sendHomeState.duration = 1.5;
+            var ws = agentSprites[sendHomeState.worker];
+            if (ws) sendHomeState.startPos = ws.position.clone();
+          }
+        } else if (sendHomeState.phase === 'worker') {
+          var ws2 = agentSprites[sendHomeState.worker];
+          if (ws2 && sendHomeState.startPos) {
+            var u2 = Math.min(1, sendHomeState.t / sendHomeState.duration);
+            var targetX = (activeTheme && activeTheme.homeX !== undefined) ? activeTheme.homeX : 12;
+            ws2.position.x = sendHomeState.startPos.x + (targetX - sendHomeState.startPos.x) * u2;
+            ws2.material.opacity = 1 - u2;
+          }
+          if (sendHomeState.t >= sendHomeState.duration) {
+            if (ws2) { disposeObject(ws2); delete agentSprites[sendHomeState.worker]; }
+            if (agentBubbles[sendHomeState.worker]) { disposeObject(agentBubbles[sendHomeState.worker]); delete agentBubbles[sendHomeState.worker]; }
+            if (agentBadges[sendHomeState.worker]) { disposeObject(agentBadges[sendHomeState.worker].sprite); delete agentBadges[sendHomeState.worker]; }
+            delete agentAnimStates[sendHomeState.worker];
+            sendHomeState = null;
+          }
+        }
+      }
+
+      // Polling
+      function poll() {
+        if (!ceoOpen) return;
+        Promise.all([
+          fetch('/api/overstory').then(function(r) { return r.json(); }),
+          fetch('/api/mail').then(function(r) { return r.json(); })
+        ]).then(function(res) {
+          var agents = (res[0] || {}).agents || [];
+          var mailItems = (res[1] || {}).mail_items || [];
+          lastPolledAgents = agents;
+          var cur = {}; agents.forEach(function(a) { cur[a.name] = true; });
+          previousAgentList.forEach(function(a) { if (!cur[a.name] && !isLead(a)) sendHomeQueue.push(a.name); });
+          previousAgentList = agents.slice();
+          inboxCounts = {};
+          mailItems.forEach(function(m) { inboxCounts[m.to] = (inboxCounts[m.to] || 0) + 1; });
+          if (mailItems.length > previousMailLength) updateMailFlights(agents, mailItems.slice(0, mailItems.length - previousMailLength));
+          previousMailLength = mailItems.length;
+          var termPs = agents.slice(0, CAP_AGENTS).map(function(a) {
+            return fetch('/api/agents/' + encodeURIComponent(a.name) + '/terminal?lines=' + BUBBLE_LINES)
+              .then(function(r) { return r.json(); }).then(function(d) { terminalCache[a.name] = d.output || ''; }).catch(function() {});
+          });
+          Promise.all(termPs).then(function() { updateAgentsShared(agents, mailItems); });
+        }).catch(function(e) { console.warn('[CEO] poll error:', e); });
+      }
+
+      function resize() {
+        if (!renderer || !ceoCanvas) return;
+        var w = ceoCanvas.clientWidth || 800, h = ceoCanvas.clientHeight || 600;
+        renderer.setSize(w, h);
+        var aspect = w / h;
+        var halfH = FRUSTUM_H / 2;
+        camera.left = -halfH * aspect; camera.right = halfH * aspect;
+        camera.top = halfH; camera.bottom = -halfH;
+        camera.updateProjectionMatrix();
+      }
+
+      var lastTime = 0;
+      function animate(time) {
+        if (!ceoOpen) return;
+        ceoAnimId = requestAnimationFrame(animate);
+        var delta = time - lastTime; lastTime = time;
+        if (delta > 200) delta = 16; delta /= 1000;
+        lastDelta = delta;
+        tickMailFlights(delta);
+        runSendThemHome(delta);
+        if (activeTheme) try { activeTheme.tickAmbient(delta); } catch(e) {}
+        try { if (renderer && scene && camera) renderer.render(scene, camera); } catch(e) {}
+      }
+
+      function openCEO() {
+        console.log('[CEO] Opening');
+        ceoOpen = true;
+        ceoModal.classList.add('visible');
+        ceoModal.setAttribute('aria-hidden', 'false');
+        document.body.style.overflow = 'hidden';
+        try {
+          initRenderer();
+          var tn = getThemeName();
+          if (ceoThemeSel) ceoThemeSel.value = tn;
+          switchTheme(tn);
+          lastTime = performance.now();
+          poll();
+          ceoPollTimer = setInterval(poll, POLL_MS);
+          animate(lastTime);
+        } catch(e) { console.error('[CEO] open error:', e); }
+      }
+      function closeCEO() {
+        console.log('[CEO] Closing');
+        closeAgentDialog();
+        ceoOpen = false;
+        if (ceoPollTimer) { clearInterval(ceoPollTimer); ceoPollTimer = null; }
+        if (ceoAnimId) { cancelAnimationFrame(ceoAnimId); ceoAnimId = null; }
+        ceoModal.classList.remove('visible');
+        ceoModal.setAttribute('aria-hidden', 'true');
+        document.body.style.overflow = '';
+      }
+
+      ceoBtn.addEventListener('click', openCEO);
+      ceoClose.addEventListener('click', closeCEO);
+      window.addEventListener('resize', function() { if (ceoOpen) resize(); });
+      if (ceoThemeSel) ceoThemeSel.addEventListener('change', function() {
+        var v = ceoThemeSel.value;
+        setThemeName(v);
+        if (ceoOpen) switchTheme(v);
+      });
+
+      console.log('[CEO] Theme engine ready');
+      } catch (e) { console.error('[CEO] Setup error:', e); }
     })();
   </script>
 </body>

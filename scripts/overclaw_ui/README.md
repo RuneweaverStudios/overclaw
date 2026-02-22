@@ -6,7 +6,7 @@ Web interface that matches **Overstory's dashboard layout** with **tabbed Chat a
 
 - **Left**: Overstory-style panels (Agents, Mail, Merge queue, Metrics), refreshed every 3s from `overstory status`.
 - **Right**: Tabs
-  - **Chat (Ollama Orchestrator)**: Full chat input and history; sends to gateway `/api/chat`.
+  - **Chat (OpenRouter Orchestrator)**: Full chat input and history; sends to gateway `/api/chat`.
   - **Agent Terminals**: Instructions and commands to attach to each agent's tmux session (e.g. `tmux attach -t overstory-overclaw-lead-cfe688`).
 
 ## Requirements
